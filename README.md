@@ -60,14 +60,14 @@ Open http://localhost:8080 for the real login page.
 
 ## Configuration (environment variables)
 
-| Variable               | App      | Default                             | Description                                              |
-|------------------------|----------|-------------------------------------|----------------------------------------------------------|
-| `PORT`                 | backend  | `1983`                              | Backend listen port                                      |
-| `PORT`                 | login    | `8080`                              | Login page listen port                                   |
-| `PORT`                 | frontend | `1984`                              | Admin listen port                                        |
-| `CORS_ORIGINS`         | backend  | `http://localhost:1984`             | Comma-separated allowed origins                          |
-| `CLAIM_ENRICHMENT_URL` | backend  | *(unset)*                           | Optional upstream claim-enrichment endpoint (unused yet) |
-| `OAUTH_LOGIN_URL`      | frontend | `http://localhost:1983/oauth/login` | URL the "Sign in" link redirects to                      |
+| Variable                  | App      | Default                             | Description                                              |
+|---------------------------|----------|-------------------------------------|----------------------------------------------------------|
+| `WA_PORT`                 | backend  | `1983`                              | Backend listen port                                      |
+| `WA_ADMIN_PORT`           | frontend | `1984`                              | Admin listen port                                        |
+| `WA_LOGIN_PORT`           | login    | `8080`                              | Login page listen port                                   |
+| `WA_CORS_ORIGINS`         | backend  | `http://localhost:1984`             | Comma-separated allowed origins                          |
+| `WA_CLAIM_ENRICHMENT_URL` | backend  | *(unset)*                           | Optional upstream claim-enrichment endpoint (unused yet) |
+| `WA_OAUTH_LOGIN_URL`      | frontend | `http://localhost:1983/oauth/login` | URL the "Sign in" link redirects to                      |
 
 ## Testing
 

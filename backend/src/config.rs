@@ -9,18 +9,18 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let port = env::var("PORT")
+        let port = env::var("WA_PORT")
             .unwrap_or_else(|_| "1983".into())
             .parse()?;
 
-        let cors_origins = env::var("CORS_ORIGINS")
+        let cors_origins = env::var("WA_CORS_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:1984".into())
             .split(',')
             .map(str::trim)
             .map(String::from)
             .collect();
 
-        let claim_enrichment_url = env::var("CLAIM_ENRICHMENT_URL").ok();
+        let claim_enrichment_url = env::var("WA_CLAIM_ENRICHMENT_URL").ok();
 
         Ok(Self {
             port,

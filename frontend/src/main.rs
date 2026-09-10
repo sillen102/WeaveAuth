@@ -8,11 +8,11 @@ use topcoat::{
 
 #[tokio::main]
 async fn main() {
-    // topcoat's own default is 3000; pin the admin tool to 1984 unless PORT is set
-    if std::env::var_os("PORT").is_none() {
-        // SAFETY: single-threaded startup, before topcoat spawns its runtime
-        unsafe { std::env::set_var("PORT", "1984") };
-    }
+    // topcoat's own default is 3000; read WA_ADMIN_PORT and pass it through (default 1984)
+    let admin_port =
+        std::env::var("WA_ADMIN_PORT").unwrap_or_else(|_| "1984".to_string());
+    // SAFETY: single-threaded startup, before topcoat spawns its runtime
+    unsafe { std::env::set_var("PORT", admin_port) };
     topcoat::start(Router::builder().discover().build())
         .await
         .unwrap();
@@ -20,7 +20,7 @@ async fn main() {
 
 #[page("/")]
 async fn login() -> Result<impl View> {
-    let oauth_url = std::env::var("OAUTH_LOGIN_URL")
+    let oauth_url = std::env::var("WA_OAUTH_LOGIN_URL")
         .unwrap_or_else(|_| "http://localhost:1983/oauth/login".to_string());
 
     Ok(view! {
