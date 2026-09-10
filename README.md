@@ -25,7 +25,7 @@ Backend routes:
 | Method | Path                  | Returns                      |
 |--------|-----------------------|------------------------------|
 | GET    | `/health`             | `ok`                         |
-| GET    | `/api/v1/auth/status` | `{ "authenticated": false }` |
+| GET    | `/oauth/login`        | `{ "authenticated": true }`  |
 
 `/oauth/...` routes are reserved for the upcoming OAuth2 flow. The login page's sign-in
 link is hard-coded to the backend `/oauth/login` for now (full-page navigation, no
