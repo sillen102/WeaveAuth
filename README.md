@@ -9,7 +9,7 @@ and a Topcoat admin tool.
 
 Cargo workspace (`backend/` + `frontend/` + `login/`), three binaries:
 
-- **`weaveauth`** (Axum, backend) — `:1983`. API + OAuth2 logic. CORS is env-configurable.
+- **`weaveauth`** (Axum, backend) — `:1983`. API + OAuth2 logic.
 - **`weaveauth-login`** (axum + `ServeDir`, static) — `:8080`. Pure HTML/CSS login page.
 - **`weaveauth-frontend`** (Topcoat, admin tool) — `:1984`. No admin pages implemented yet; its `#[page("/")]` route still renders a transitional login page.
 
@@ -65,7 +65,6 @@ Open http://localhost:8080 for the real login page.
 | `WA_PORT`                 | backend  | `1983`                              | Backend listen port                                      |
 | `WA_ADMIN_PORT`           | frontend | `1984`                              | Admin listen port                                        |
 | `WA_LOGIN_PORT`           | login    | `8080`                              | Login page listen port                                   |
-| `WA_CORS_ORIGINS`         | backend  | `http://localhost:1984`             | Comma-separated allowed origins                          |
 | `WA_CLAIM_ENRICHMENT_URL` | backend  | *(unset)*                           | Optional upstream claim-enrichment endpoint (unused yet) |
 | `WA_OAUTH_LOGIN_URL`      | frontend | `http://localhost:1983/oauth/login` | URL the "Sign in" link redirects to                      |
 

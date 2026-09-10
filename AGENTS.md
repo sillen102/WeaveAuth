@@ -21,9 +21,8 @@ implemented — `/oauth/...` routes and the `reqwest`/`jsonwebtoken` deps are re
 ## Architecture
 
 - Root `Cargo.toml` is a virtual workspace: `members = ["backend", "frontend", "login"]`.
-- `backend/src/lib.rs` — `app()` and `app_with_cors(&[String])` builders. Router with
-  CORS (`AllowOrigin::list`) + `TraceLayer`. **Tests hit these builders directly via
-  `tower::ServiceExt::oneshot`** — do not test via `main.rs`.
+- `backend/src/lib.rs` — `app()` builder. Router with `TraceLayer`. **Tests hit the
+  builder directly via `tower::ServiceExt::oneshot`** — do not test via `main.rs`.
 - `backend/src/config.rs` — `Config::load()` reads `WA_PORT`, `WA_CORS_ORIGINS` (comma-separated),
   `WA_CLAIM_ENRICHMENT_URL` from env with defaults. Extend this struct when new config appears.
 - `backend/src/main.rs` — startup only: config → tracing → `axum::serve` on `0.0.0.0:WA_PORT`.
@@ -54,11 +53,7 @@ implemented — `/oauth/...` routes and the `reqwest`/`jsonwebtoken` deps are re
 - Topcoat 0.8 is early-stage/experimental; `view!` macro code lives in
   `frontend/src/main.rs` — expect breaking changes on upgrade.
 - npm/Vite/Tailwind/React notes are obsolete — Node is gone, do not reintroduce it.
-- CORS only matters if a cross-origin client-side fetch appears; login currently uses
-  browser navigation only.
 - Three ports: backend 1983, login 8080, admin/frontend 1984.
 - Docker must copy `/app/login/static` to the same absolute path the binary was built
   with (the static-dir root is baked from `CARGO_MANIFEST_DIR` at compile time).
 - If a backend route is added, update the route table in `README.md`.
-- `WA_CORS_ORIGINS` empty default is `http://localhost:1984`; `app()` (used by tests and main)
-  allows *any* origin via `app_with_cors(&[])`.
