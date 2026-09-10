@@ -1,0 +1,9 @@
+[package]
+name = "weaveauth-login"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower-http = { version = "0.7", features = ["fs"] }
