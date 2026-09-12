@@ -4,23 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+common = { path = "../common" }
+
 axum = { workspace = true }
-aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "scalar"] }
+aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "axum-form", "scalar"] }
+schemars = { workspace = true, features = ["chrono04"] }
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
-reqwest = { workspace = true }
-jsonwebtoken = "11"
 chrono = { workspace = true, features = ["serde"] }
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
-serde_yaml = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 tower = { workspace = true }

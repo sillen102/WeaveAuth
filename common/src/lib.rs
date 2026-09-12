@@ -11,7 +11,4 @@
     clippy::unimplemented
 )]
 
-pub mod config;
-pub mod server;
-pub(crate) mod model;
-pub(crate) mod storage;
+pub mod docs;

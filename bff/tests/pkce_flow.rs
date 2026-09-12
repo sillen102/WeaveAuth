@@ -16,14 +16,47 @@ fn test_config(backend_url: String) -> Config {
     }
 }
 
-/// Stands in for backend: a real (in-process) /oauth/authorize + /oauth/token,
-/// since bff drives the whole exchange server-to-server and needs a real
-/// redirect response to read `code` out of. Mirrors backend's allowlist check
-/// (only "http://admin.test" / "http://admin.test/" are allowed).
+fn login_form_body(redirect_uri: &str) -> Body {
+    Body::from(format!(
+        "identifier=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
+        urlencoding_encode(redirect_uri)
+    ))
+}
+
+fn login_request(redirect_uri: &str) -> Request<Body> {
+    Request::post("/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(login_form_body(redirect_uri))
+        .unwrap()
+}
+
+/// Minimal `application/x-www-form-urlencoded` value escaping -- just enough
+/// for the URLs these tests send, avoids pulling in a whole crate for it.
+fn urlencoding_encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+/// Stands in for backend: a real (in-process) /oauth/login + /oauth/authorize +
+/// /oauth/token, since bff drives the whole exchange server-to-server and needs
+/// a real redirect response to read `code` out of. Mirrors backend's allowlist
+/// check (only "http://admin.test" / "http://admin.test/" are allowed), accepts
+/// identifier "alice" / password "hunter2" as the only valid user, and requires
+/// /oauth/authorize's `login_session` to match what /oauth/login just handed out
+/// (mirroring backend's real authenticate-before-authorize enforcement).
 async fn stub_backend() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
+        .route(
+            "/oauth/login",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                if body["identifier"] == "alice" && body["password"] == "hunter2" {
+                    Ok(Json(serde_json::json!({"login_session": "stub-session"})))
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }),
+        )
         .route(
             "/oauth/authorize",
             get(
@@ -36,6 +69,9 @@ async fn stub_backend() -> (String, tokio::task::JoinHandle<()>) {
                         q.get("code_challenge_method").map(String::as_str),
                         Some("S256")
                     );
+                    if q.get("login_session").map(String::as_str) != Some("stub-session") {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
                     let redirect_uri = q.get("redirect_uri").unwrap();
                     if redirect_uri != "http://admin.test" && redirect_uri != "http://admin.test/"
                     {
@@ -71,11 +107,7 @@ async fn login_exchanges_code_sets_session_cookie_and_redirects_without_token_in
     let app = app(test_config(backend));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
 
@@ -98,16 +130,66 @@ async fn login_exchanges_code_sets_session_cookie_and_redirects_without_token_in
 }
 
 #[tokio::test]
+async fn login_rejects_wrong_credentials_before_touching_authorize() {
+    // /oauth/authorize panics if hit -- credentials are verified first, per
+    // RFC 6749 4.1.1 (authenticate the resource owner before issuing a code),
+    // so a bad password must never reach it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/oauth/login",
+            post(|| async { StatusCode::UNAUTHORIZED }),
+        )
+        .route(
+            "/oauth/authorize",
+            get(|| async {
+                panic!("authorize must not be reached before login succeeds");
+                #[allow(unreachable_code)]
+                StatusCode::OK
+            }),
+        );
+    let _h = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let app = app(test_config(format!("http://{addr}")));
+
+    let resp = app
+        .oneshot(
+            Request::post("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "identifier=alice&password=wrong&redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // A plain form POST can't show an inline error via JS, so wrong
+    // credentials bounce back to `next` (the login page) instead of a bare 401.
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=1"));
+}
+
+#[tokio::test]
 async fn login_requires_redirect_uri() {
     let (backend, _h) = stub_backend().await;
     let app = app(test_config(backend));
 
     let resp = app
-        .oneshot(Request::get("/login").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::post("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("identifier=alice&password=hunter2"))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // A missing required form field is a body-parsing failure, distinct from
+    // the semantic 400s below (bad redirect_uri, wrong credentials).
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -118,11 +200,7 @@ async fn login_forwards_redirect_uri_to_backend_and_rejects_when_backend_does() 
     let app = app(test_config(backend));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fevil.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://evil.test/"))
         .await
         .unwrap();
 
@@ -137,11 +215,7 @@ async fn login_rejects_redirect_uri_backend_does_not_allowlist_even_when_it_poin
     let app = app(test_config(backend));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fbff.test%2Fdownstream")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://bff.test/downstream"))
         .await
         .unwrap();
 
@@ -153,19 +227,32 @@ async fn login_returns_bad_gateway_when_backend_is_unreachable_or_broken() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new().route(
-        "/oauth/authorize",
-        get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        "/oauth/login",
+        post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
     );
     let _h = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
     let app = app(test_config(format!("http://{addr}")));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn login_returns_bad_gateway_when_login_response_is_not_valid_json() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new().route("/oauth/login", post(|| async { StatusCode::OK }));
+    let _h = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let app = app(test_config(format!("http://{addr}")));
+
+    let resp = app
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
 
@@ -177,6 +264,10 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
+        .route(
+            "/oauth/login",
+            post(|| async { Json(serde_json::json!({"login_session": "stub-session"})) }),
+        )
         .route(
             "/oauth/authorize",
             get(
@@ -197,11 +288,7 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() {
     let app = app(test_config(format!("http://{addr}")));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
 
@@ -214,11 +301,7 @@ async fn login_never_redirects_the_browser_to_backend() {
     let app = app(test_config(backend.clone()));
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
 

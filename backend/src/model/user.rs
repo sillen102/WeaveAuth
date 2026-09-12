@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct User {
     pub id: Uuid,
     pub identifier: String,
@@ -11,6 +11,7 @@ pub(crate) struct User {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
 impl User {
     pub(crate) fn default() -> Self {
         Self {

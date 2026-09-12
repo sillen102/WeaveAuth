@@ -12,38 +12,20 @@ fn test_config() -> Config {
 }
 
 #[tokio::test]
-async fn login_redirects_to_bff() {
+async fn config_js_exposes_bff_url() {
     let app = app(test_config());
 
     let resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::get("/config.js").body(Body::empty()).unwrap())
         .await
         .unwrap();
 
-    assert!(resp.status().is_redirection());
-    let loc = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap();
-    assert!(loc.starts_with("http://bff.test/login?"));
-    assert!(loc.contains("redirect_uri=http%3A%2F%2Fadmin.test%2F"));
-}
-
-#[tokio::test]
-async fn login_requires_redirect_uri() {
-    let app = app(test_config());
-
-    let resp = app
-        .oneshot(Request::get("/login").body(Body::empty()).unwrap())
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("window.BFF_URL = \"http://bff.test\";"));
 }
 
 #[tokio::test]
@@ -60,8 +42,25 @@ async fn serves_static_index_page_at_root() {
         .await
         .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("Sign in"));
-    assert!(body.contains("id=\"sign-in\""));
+    assert!(body.contains("id=\"login-form\""));
+    assert!(body.contains("id=\"register-link\""));
+}
+
+#[tokio::test]
+async fn serves_static_register_page() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(Request::get("/register.html").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("id=\"register-form\""));
 }
 
 #[tokio::test]

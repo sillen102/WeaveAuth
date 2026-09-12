@@ -1,4 +1,5 @@
 pub(crate) use controller::auth_authorize;
+pub(crate) use controller::auth_authorize_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -8,34 +9,46 @@ mod controller {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use rand::RngExt;
+    use schemars::JsonSchema;
     use serde::Deserialize;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
-    use crate::storage::PkceStorage;
+    use crate::storage::{LoginSessionStorage, PkceStorage};
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, JsonSchema)]
     pub(crate) struct AuthorizeRequest {
-        redirect_uri: String,
-        code_challenge: String,
-        code_challenge_method: CodeChallengeMethod,
+        pub(super) redirect_uri: String,
+        pub(super) code_challenge: String,
+        pub(super) code_challenge_method: CodeChallengeMethod,
         #[serde(default)]
-        state: Option<String>,
+        pub(super) state: Option<String>,
+        /// Single-use token from `/oauth/login` -- proves the resource owner was
+        /// already authenticated (RFC 6749 4.1.1); without one, no code is issued.
+        pub(super) login_session: String,
     }
 
     // OpenAPI documentation for this route.
-    pub(crate) fn doc(op: TransformOperation) -> TransformOperation {
+    pub(crate) fn auth_authorize_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("authorize")
             .summary("Issue an authorization code")
-            .description("Binds a single-use auth_code to the given PKCE code_challenge")
+            .description(
+                "Requires a login_session from /oauth/login proving the user is authenticated, \
+                 then binds a single-use auth_code to the given PKCE code_challenge",
+            )
     }
 
     pub(crate) async fn auth_authorize(
         State(mut state): State<AppState>,
         Query(req): Query<AuthorizeRequest>,
     ) -> Result<Redirect, StatusCode> {
-        // TODO: require an authenticated session before issuing a code (see README TODO ledger).
+        state
+            .login_sessions
+            .take_session(&req.login_session)
+            .await
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
         if !state
             .redirect_uri_allowlist
             .iter()
@@ -63,5 +76,174 @@ mod controller {
             None => format!("{}?code={}", req.redirect_uri, auth_code),
         };
         Ok(Redirect::to(&location))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller::*;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Redirect};
+    use std::sync::Arc;
+
+    use crate::model::pkce::CodeChallengeMethod;
+    use crate::server::AppState;
+    use crate::storage::{LoginSessionStorage, PkceStorage};
+
+    async fn state_with_allowlist(allowlist: &[&str]) -> (AppState, String) {
+        let mut login_sessions = crate::storage::in_memory::InMemoryLoginSessionStorage::new(60);
+        let login_session = login_sessions
+            .create_session(uuid::Uuid::new_v4())
+            .await;
+        let state = AppState {
+            pkce: crate::storage::in_memory::InMemoryPkceStorage::new(300),
+            users: crate::storage::in_memory::InMemoryUserStorage::new(),
+            login_sessions,
+            redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
+        };
+        (state, login_session)
+    }
+
+    fn location_of(redirect: Redirect) -> String {
+        let response = redirect.into_response();
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn issues_code_for_allowed_redirect_uri() {
+        let (state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+
+        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+
+        let location = location_of(redirect);
+        assert!(location.starts_with("http://redirect.test?code="));
+    }
+
+    #[tokio::test]
+    async fn forwards_state_param_when_present() {
+        let (state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: Some("xyz".to_string()),
+            login_session,
+        };
+
+        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+
+        assert!(location_of(redirect).ends_with("&state=xyz"));
+    }
+
+    #[tokio::test]
+    async fn omits_state_param_when_absent() {
+        let (state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+
+        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+
+        assert!(!location_of(redirect).contains("state="));
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_uri_not_in_allowlist() {
+        let (state, login_session) = state_with_allowlist(&["http://allowed.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://evil.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+
+        let result = auth_authorize(State(state), Query(req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_unknown_login_session() {
+        let (state, _login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session: "not-a-real-session".to_string(),
+        };
+
+        let result = auth_authorize(State(state), Query(req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_login_session_that_was_already_used() {
+        let (state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session: login_session.clone(),
+        };
+        let _ = auth_authorize(State(state.clone()), Query(req)).await.unwrap();
+
+        let replay_req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+        let result = auth_authorize(State(state), Query(replay_req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn saves_code_challenge_bound_to_redirect_uri() {
+        let (mut state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "my_challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+
+        let redirect = auth_authorize(State(state.clone()), Query(req)).await.unwrap();
+        let location = location_of(redirect);
+        let code = location.split("code=").nth(1).unwrap();
+
+        let saved = state.pkce.take_code_challenge(code).await;
+        assert_eq!(
+            saved,
+            Some((
+                "my_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string()
+            ))
+        );
     }
 }

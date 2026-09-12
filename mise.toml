@@ -4,6 +4,7 @@ monorepo_root = true
 config_roots = [
     "backend",
     "bff",
+    "common",
     "login",
     "testing/downstream-service",
     "testing/user-service",
@@ -12,10 +13,19 @@ config_roots = [
 [tools]
 rust = "1.98"
 
+[tasks.build]
+depends = [
+    { task = "//backend:build" },
+    { task = "//bff:build" },
+    { task = "//common:build" },
+    { task = "//login:build" },
+]
+
 [tasks.test]
 depends = [
     { task = "//backend:test" },
     { task = "//bff:test" },
+    { task = "//common:test" },
     { task = "//login:test" },
 ]
 
@@ -24,6 +34,7 @@ description = "Run linters for all services and common code"
 depends = [
     { task = "//backend:lint" },
     { task = "//bff:lint" },
+    { task = "//common:lint" },
     { task = "//login:lint" },
 ]
 

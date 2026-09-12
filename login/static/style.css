@@ -42,3 +42,56 @@ body {
 .btn:hover {
   background-color: #1d4ed8;
 }
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  text-align: left;
+  margin-bottom: 1rem;
+}
+
+label {
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+input {
+  margin-top: 0.25rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.4rem;
+  border: 1px solid #334155;
+  background-color: #0f172a;
+  color: #f8fafc;
+  font-size: 1rem;
+}
+
+input:focus {
+  outline: 2px solid #2563eb;
+}
+
+.error {
+  color: #f87171;
+  font-size: 0.85rem;
+  margin: 0 0 1rem;
+}
+
+.error:empty {
+  display: none;
+}
+
+.secondary {
+  color: #94a3b8;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.secondary a {
+  color: #60a5fa;
+}

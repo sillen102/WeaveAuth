@@ -1,60 +1,47 @@
+use crate::model::pkce::CodeChallengeMethod;
+use crate::model::user::User;
+use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use chrono::{DateTime, Utc};
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use crate::model::pkce::CodeChallengeMethod;
-use crate::model::session::Session;
-use crate::model::user::User;
-use crate::storage::{PkceStorage, SessionStorage, UserStorage};
 
-pub(crate) struct InMemorySessionStorage {
-    sessions: HashMap<String, Session>,
-}
-
-impl InMemorySessionStorage {
-    pub fn new() -> Self {
-        Self {
-            sessions: HashMap::new(),
-        }
-    }
-}
-
-impl SessionStorage for InMemorySessionStorage {
-    async fn save_session(&mut self, session: Session) {
-        self.sessions.insert(session.cookie.clone(), session);
-    }
-
-    async fn get_session(&self, cookie: &str) -> Option<&Session> {
-        self.sessions.get(cookie)
-    }
-}
-
+#[derive(Clone)]
 pub(crate) struct InMemoryUserStorage {
-    users: HashMap<Uuid, User>,
+    users: Arc<Mutex<HashMap<Uuid, User>>>,
 }
 
 impl InMemoryUserStorage {
     pub fn new() -> Self {
         Self {
-            users: HashMap::new(),
+            users: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl UserStorage for InMemoryUserStorage {
     async fn save_user(&mut self, user: User) {
-        self.users.insert(user.id, user);
+        self.users.lock().await.insert(user.id, user);
     }
 
-    async fn get_user(&self, id: Uuid) -> Option<&User> {
-        self.users.get(&id)
+    async fn get_user_by_identifier(&self, identifier: &str) -> Option<User> {
+        self.users
+            .lock()
+            .await
+            .values()
+            .find(|u| u.identifier == identifier)
+            .cloned()
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct InMemoryPkceStorage {
-    code_challenges: Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String)>>>,
+    code_challenges:
+        Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String)>>>,
     ttl_secs: i64,
 }
 
@@ -75,14 +62,23 @@ impl PkceStorage for InMemoryPkceStorage {
         code_challenge_method: CodeChallengeMethod,
         redirect_uri: String,
     ) {
-        self.code_challenges
-            .lock()
-            .await
-            .insert(auth_code, (code_challenge, code_challenge_method, Utc::now(), redirect_uri));
+        self.code_challenges.lock().await.insert(
+            auth_code,
+            (
+                code_challenge,
+                code_challenge_method,
+                Utc::now(),
+                redirect_uri,
+            ),
+        );
     }
 
-    async fn take_code_challenge(&mut self, auth_code: &str) -> Option<(String, CodeChallengeMethod, String)> {
-        let (challenge, method, issued_at, redirect_uri) = self.code_challenges.lock().await.remove(auth_code)?;
+    async fn take_code_challenge(
+        &mut self,
+        auth_code: &str,
+    ) -> Option<(String, CodeChallengeMethod, String)> {
+        let (challenge, method, issued_at, redirect_uri) =
+            self.code_challenges.lock().await.remove(auth_code)?;
         if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
             return None;
         }
@@ -90,62 +86,73 @@ impl PkceStorage for InMemoryPkceStorage {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct InMemoryLoginSessionStorage {
+    sessions: Arc<Mutex<HashMap<String, (Uuid, DateTime<Utc>)>>>,
+    ttl_secs: i64,
+}
+
+impl InMemoryLoginSessionStorage {
+    pub fn new(ttl_secs: i64) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
+        }
+    }
+}
+
+impl LoginSessionStorage for InMemoryLoginSessionStorage {
+    async fn create_session(&mut self, user_id: Uuid) -> String {
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill(&mut token_bytes);
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
+        self.sessions
+            .lock()
+            .await
+            .insert(token.clone(), (user_id, Utc::now()));
+        token
+    }
+
+    async fn take_session(&mut self, token: &str) -> Option<Uuid> {
+        let (user_id, issued_at) = self.sessions.lock().await.remove(token)?;
+        if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
+            return None;
+        }
+        Some(user_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
     use crate::model::pkce::CodeChallengeMethod;
-    use crate::model::session::Session;
     use crate::model::user::User;
-    use crate::storage::in_memory::{InMemoryPkceStorage, InMemorySessionStorage, InMemoryUserStorage};
-    use crate::storage::{PkceStorage, SessionStorage, UserStorage};
-
-    #[tokio::test]
-    async fn test_save_session() {
-        let mut storage = InMemorySessionStorage::new();
-        let user_id = Uuid::new_v4();
-        let session = Session::new(user_id);
-        let cookie = session.cookie.clone();
-        storage.save_session(session).await;
-        let retrieved_session = storage.get_session(&cookie).await;
-        assert!(retrieved_session.is_some());
-        assert_eq!(retrieved_session.unwrap().user_id, user_id);
-    }
-
-    #[tokio::test]
-    async fn test_get_session() {
-        let storage = InMemorySessionStorage::new();
-        let session = storage.get_session("test_cookie").await;
-        assert!(session.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_session_returns_session() {
-        let mut storage = InMemorySessionStorage::new();
-        let user_id = Uuid::new_v4();
-        let session = Session::new(user_id);
-        let cookie = session.cookie.clone();
-        storage.sessions.insert(cookie.clone(), session);
-        let retrieved_session = storage.get_session(&cookie).await;
-        assert!(retrieved_session.is_some());
-        assert_eq!(retrieved_session.unwrap().user_id, user_id);
-    }
+    use crate::storage::in_memory::{
+        InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
+    };
+    use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
 
     #[tokio::test]
     async fn test_save_user() {
         let mut storage = InMemoryUserStorage::new();
-        let user = User::default();
+        let mut user = User::default();
+        user.identifier = "carol".to_string();
         let user_id = user.id;
         storage.save_user(user).await;
-        let retrieved_user = storage.get_user(user_id).await;
-        assert!(retrieved_user.is_some());
-        assert_eq!(retrieved_user.unwrap().id, user_id);
+        let retrieved_user = storage.get_user_by_identifier("carol").await;
+        assert_eq!(retrieved_user.map(|u| u.id), Some(user_id));
     }
 
     #[tokio::test]
-    async fn test_get_user() {
-        let storage = InMemoryUserStorage::new();
-        let user = storage.get_user(Uuid::new_v4()).await;
-        assert!(user.is_none());
+    async fn test_get_user_by_identifier() {
+        let mut storage = InMemoryUserStorage::new();
+        let mut user = User::default();
+        user.identifier = "alice".to_string();
+        storage.save_user(user).await;
+
+        let found = storage.get_user_by_identifier("alice").await;
+        assert_eq!(found.map(|u| u.identifier), Some("alice".to_string()));
+        assert!(storage.get_user_by_identifier("bob").await.is_none());
     }
 
     #[tokio::test]
@@ -208,5 +215,37 @@ mod tests {
             .await;
         let challenge = storage.take_code_challenge("test_code").await;
         assert!(challenge.is_none());
+    }
+
+    #[tokio::test]
+    async fn login_session_round_trips_to_the_user_that_created_it() {
+        let mut storage = InMemoryLoginSessionStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let token = storage.create_session(user_id).await;
+
+        assert_eq!(storage.take_session(&token).await, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn login_session_is_single_use() {
+        let mut storage = InMemoryLoginSessionStorage::new(60);
+        let token = storage.create_session(Uuid::new_v4()).await;
+
+        storage.take_session(&token).await;
+        assert_eq!(storage.take_session(&token).await, None);
+    }
+
+    #[tokio::test]
+    async fn login_session_rejects_unknown_token() {
+        let mut storage = InMemoryLoginSessionStorage::new(60);
+        assert_eq!(storage.take_session("no-such-token").await, None);
+    }
+
+    #[tokio::test]
+    async fn login_session_rejects_expired_entries() {
+        let mut storage = InMemoryLoginSessionStorage::new(-1);
+        let token = storage.create_session(Uuid::new_v4()).await;
+
+        assert_eq!(storage.take_session(&token).await, None);
     }
 }

@@ -1,10 +1,10 @@
 use std::env;
 
-use axum::extract::{Query, State};
-use axum::response::Redirect;
+use axum::extract::State;
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use serde::Deserialize;
 use tower_http::services::ServeDir;
 
 const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
@@ -29,25 +29,21 @@ impl Config {
 pub fn app(config: Config) -> Router {
     let files = ServeDir::new(STATIC_DIR);
     Router::new()
-        .route("/login", get(start_login))
+        .route("/config.js", get(config_js))
         .nest_service("/static", files.clone())
         .fallback_service(files)
         .with_state(config)
 }
 
-#[derive(Deserialize)]
-struct LoginQuery {
-    redirect_uri: String,
-}
-
-async fn start_login(State(config): State<Config>, Query(query): Query<LoginQuery>) -> Redirect {
-    let redirect_uri = query.redirect_uri;
-
-    let qs = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("redirect_uri", &redirect_uri)
-        .finish();
-
-    Redirect::to(&format!("{}/login?{}", config.bff_url, qs))
+/// Exposes `bff_url` to the static login/register pages, so their forms can
+/// submit straight to bff's absolute URL (a real cross-origin navigation --
+/// not a fetch, so this needs no CORS) without the deployer-replaceable HTML
+/// files having to know it themselves.
+async fn config_js(State(config): State<Config>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        format!("window.BFF_URL = {:?};\n", config.bff_url),
+    )
 }
 
 #[cfg(test)]

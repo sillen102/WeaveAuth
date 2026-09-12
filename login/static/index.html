@@ -10,15 +10,39 @@
   <main class="card">
     <h1>WeaveAuth</h1>
     <p>Sign in with your account to continue.</p>
-    <a class="btn" id="sign-in" href="/login?redirect_uri=http%3A%2F%2Flocalhost%3A8081%2F">Sign in</a>
+    <p class="error" id="error"></p>
+    <form id="login-form" method="post">
+      <div>
+        <label for="identifier">Username</label>
+        <input type="text" id="identifier" name="identifier" autocomplete="username" required>
+      </div>
+      <div>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+      </div>
+      <input type="hidden" name="redirect_uri" id="redirect_uri">
+      <input type="hidden" name="next" id="next">
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+    <p class="secondary">
+      No account yet? <a id="register-link" href="register.html">Create one</a>
+    </p>
   </main>
+  <script src="/config.js"></script>
   <script>
-    // Forward this page's own redirect_uri (if any) into the sign-in link,
-    // so a caller linking to /?redirect_uri=... gets sent back there after login.
-    var redirectUri = new URLSearchParams(window.location.search).get("redirect_uri");
-    if (redirectUri) {
-      var link = document.getElementById("sign-in");
-      link.href = "/login?redirect_uri=" + encodeURIComponent(redirectUri);
+    // Forward this page's own redirect_uri (if any) into the form and the
+    // register link, so a caller linking to /?redirect_uri=... gets sent back
+    // there after signing in (or after registering, then signing in).
+    var redirectUri = new URLSearchParams(window.location.search).get("redirect_uri") || (window.location.origin + "/");
+    var ownUrl = window.location.origin + window.location.pathname + "?redirect_uri=" + encodeURIComponent(redirectUri);
+    document.getElementById("redirect_uri").value = redirectUri;
+    document.getElementById("next").value = ownUrl;
+    document.getElementById("login-form").action = window.BFF_URL + "/login";
+    document.getElementById("register-link").href =
+      "register.html?redirect_uri=" + encodeURIComponent(redirectUri);
+
+    if (new URLSearchParams(window.location.search).get("error")) {
+      document.getElementById("error").textContent = "Incorrect username or password.";
     }
   </script>
 </body>
