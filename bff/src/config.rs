@@ -20,6 +20,12 @@ pub struct Config {
     /// token swapped in as `Authorization: Bearer <token>`, replacing the cookie.
     /// Only configurable via the YAML file — there's no sane env-var shape for a list.
     pub routes: Vec<RouteConfig>,
+    /// Origins allowed to POST to `/login` and `/register` (checked against the
+    /// request's `Origin` header, falling back to `Referer`) -- these are plain
+    /// cross-origin form POSTs by design, so without this check any site could
+    /// auto-submit one and log a victim into an attacker-controlled account
+    /// ("login CSRF").
+    pub trusted_origins: Vec<String>,
 }
 
 /// Optional YAML overlay, read before env vars are applied. Path is
@@ -32,6 +38,7 @@ struct FileConfig {
     session_cookie_name: Option<String>,
     #[serde(default)]
     routes: Vec<RouteConfig>,
+    trusted_origins: Option<Vec<String>>,
 }
 
 fn load_file_config() -> Result<FileConfig, anyhow::Error> {
@@ -63,6 +70,16 @@ impl Config {
             .ok()
             .or(file.session_cookie_name)
             .unwrap_or_else(|| "wa_session".into());
+        let trusted_origins = env::var("WA_TRUSTED_ORIGINS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .or(file.trusted_origins)
+            .unwrap_or_else(|| vec!["http://localhost:8081".to_string()]);
 
         Ok(Self {
             port,
@@ -70,6 +87,7 @@ impl Config {
             backend_url,
             session_cookie_name,
             routes: file.routes,
+            trusted_origins,
         })
     }
 }
@@ -111,6 +129,7 @@ mod tests {
         "WA_BFF_URL",
         "WA_BACKEND_URL",
         "WA_SESSION_COOKIE_NAME",
+        "WA_TRUSTED_ORIGINS",
         "WA_CONFIG_FILE",
     ];
 
@@ -143,6 +162,7 @@ mod tests {
         assert_eq!(config.backend_url, "http://localhost:1983");
         assert_eq!(config.session_cookie_name, "wa_session");
         assert!(config.routes.is_empty());
+        assert_eq!(config.trusted_origins, vec!["http://localhost:8081".to_string()]);
     }
 
     #[test]
@@ -158,6 +178,8 @@ session_cookie_name: "file_cookie"
 routes:
   - path_prefix: /api
     upstream_url: http://upstream.file.test
+trusted_origins:
+  - "http://file-login.test"
 "#,
         );
         let _guard = EnvGuard::set(&[("WA_CONFIG_FILE", path.to_str().unwrap())]);
@@ -173,6 +195,10 @@ routes:
                 path_prefix: "/api".to_string(),
                 upstream_url: "http://upstream.file.test".to_string(),
             }]
+        );
+        assert_eq!(
+            config.trusted_origins,
+            vec!["http://file-login.test".to_string()]
         );
 
         std::fs::remove_file(path).unwrap();
@@ -218,5 +244,32 @@ routes:
         let config = Config::load().unwrap();
         assert_eq!(config.session_cookie_name, "custom_cookie");
         assert!(config.routes.is_empty());
+    }
+
+    #[test]
+    fn trusted_origins_env_overrides_file_and_splits_trims_and_drops_empties() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clear = clear_env();
+        let path = temp_yaml(
+            r#"
+trusted_origins:
+  - "http://file-login.test"
+"#,
+        );
+        let _guard = EnvGuard::set(&[
+            ("WA_CONFIG_FILE", path.to_str().unwrap()),
+            (
+                "WA_TRUSTED_ORIGINS",
+                "http://a.test , http://b.test,,",
+            ),
+        ]);
+
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.trusted_origins,
+            vec!["http://a.test".to_string(), "http://b.test".to_string()]
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 }

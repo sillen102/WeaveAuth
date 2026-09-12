@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::State;
 use axum::Form;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::model::session::SessionData;
+use crate::server::origin_check::require_trusted_origin;
 use crate::server::AppState;
 use crate::storage::SessionStorage;
 
@@ -78,8 +79,11 @@ struct TokenResponse {
 /// there's no open-redirect exposure in sending the real value through.
 pub(crate) async fn start_login(
     State(mut state): State<AppState>,
+    headers: HeaderMap,
     Form(req): Form<LoginRequest>,
 ) -> Result<Response, StatusCode> {
+    require_trusted_origin(&headers, &state.config.trusted_origins)?;
+
     let redirect_uri = req.redirect_uri;
 
     let verify_resp = state

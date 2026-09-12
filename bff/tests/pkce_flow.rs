@@ -13,6 +13,7 @@ fn test_config(backend_url: String) -> Config {
         backend_url,
         session_cookie_name: "wa_session".into(),
         routes: vec![],
+        trusted_origins: vec!["http://login.test".into()],
     }
 }
 
@@ -26,6 +27,7 @@ fn login_form_body(redirect_uri: &str) -> Body {
 fn login_request(redirect_uri: &str) -> Request<Body> {
     Request::post("/login")
         .header("content-type", "application/x-www-form-urlencoded")
+        .header("origin", "http://login.test")
         .body(login_form_body(redirect_uri))
         .unwrap()
 }
@@ -158,6 +160,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() {
         .oneshot(
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
                 .body(Body::from(
                     "identifier=alice&password=wrong&redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
                 ))
@@ -182,6 +185,7 @@ async fn login_requires_redirect_uri() {
         .oneshot(
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
                 .body(Body::from("identifier=alice&password=hunter2"))
                 .unwrap(),
         )
@@ -294,6 +298,39 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn login_rejects_an_untrusted_origin_before_touching_backend() {
+    // /oauth/login panics if hit -- the origin check must reject this before
+    // any backend call, or a hostile site could log a victim into an
+    // attacker-controlled account ("login CSRF").
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/oauth/login",
+        post(|| async {
+            panic!("backend must not be called for an untrusted origin");
+            #[allow(unreachable_code)]
+            StatusCode::OK
+        }),
+    );
+    let _h = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let app = app(test_config(format!("http://{addr}")));
+
+    let resp = app
+        .oneshot(
+            Request::post("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://evil.test")
+                .body(login_form_body("http://admin.test/"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

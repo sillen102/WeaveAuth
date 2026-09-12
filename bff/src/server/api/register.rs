@@ -1,9 +1,10 @@
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Form;
 use serde::{Deserialize, Serialize};
 
+use crate::server::origin_check::require_trusted_origin;
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -27,8 +28,11 @@ struct BackendRegisterRequest<'a> {
 /// dance.
 pub(crate) async fn start_register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(req): Form<RegisterRequest>,
 ) -> Result<Response, StatusCode> {
+    require_trusted_origin(&headers, &state.config.trusted_origins)?;
+
     let resp = state
         .http_client
         .post(format!("{}/register", state.config.backend_url))
