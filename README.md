@@ -104,12 +104,6 @@ Backend routes:
 
 Open items, in priority order (highest first):
 
-- [ ] **Username enumeration via login timing.** `login.rs`: an unknown `identifier`
-      returns `401` immediately; a known one with a wrong password only fails after a
-      full Argon2 hash (~50-200ms by design). That gap lets an attacker distinguish
-      valid from invalid usernames by response time. Fix: always run a hash on the
-      "unknown user" path too (verify against a fixed dummy hash) so both branches
-      cost the same.
 - [ ] **No uniqueness check on `identifier` at registration.** `register.rs` inserts a
       new `User` keyed by a fresh `Uuid` with no check for an existing row with the
       same `identifier` first. Two registrations for "alice" coexist in the
@@ -166,6 +160,11 @@ Done:
       `SessionData` carries it through to its own session store. A valid token can
       now be attributed to the user who authenticated for it — this was the
       prerequisite for JWKS/JWT work (a JWT can now get a real `sub` claim).
+- [x] **Username enumeration via login timing fixed.** `login.rs` now always
+      hashes: an unknown `identifier` verifies against a fixed dummy Argon2 hash
+      (`DUMMY_PASSWORD_HASH`, generated once and cached) instead of returning
+      immediately, so an unknown identifier costs the same as a known one with a
+      wrong password. Response timing no longer distinguishes the two.
 
 ## Prerequisites
 

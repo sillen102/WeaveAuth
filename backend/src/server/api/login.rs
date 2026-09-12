@@ -3,16 +3,33 @@ pub(crate) use controller::login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::password_hash::PasswordHash;
-    use argon2::{Argon2, PasswordVerifier};
+    use argon2::password_hash::rand_core::OsRng;
+    use argon2::password_hash::{PasswordHash, SaltString};
+    use argon2::{PasswordHasher, PasswordVerifier};
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+    use std::sync::LazyLock;
 
+    use crate::crypto::ARGON2;
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, UserStorage};
+
+    /// A valid Argon2 hash of a fixed, made-up password -- verified against on the
+    /// "unknown identifier" path so it costs the same as the real
+    /// hash-and-compare below, instead of returning instantly. Without this, an
+    /// attacker can enumerate valid usernames purely from response timing (a
+    /// known identifier with a wrong password pays for a full Argon2 hash before
+    /// failing; an unknown one previously failed immediately).
+    static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        ARGON2
+            .hash_password(b"not-a-real-password", &salt)
+            .expect("hashing a fixed password never fails")
+            .to_string()
+    });
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
@@ -43,16 +60,27 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, StatusCode> {
-        let user = state
-            .users
-            .get_user_by_identifier(&req.identifier)
-            .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let user = state.users.get_user_by_identifier(&req.identifier).await;
 
-        let hash = PasswordHash::new(&user.password).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Argon2::default()
-            .verify_password(req.password.as_bytes(), &hash)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        // Always hash, even for an unknown identifier (against a fixed dummy hash)
+        // -- see DUMMY_PASSWORD_HASH. Both branches pay the same Argon2 cost, so
+        // response timing can't be used to enumerate valid identifiers. Run it via
+        // spawn_blocking: Argon2 is deliberately CPU-heavy, synchronous work, and
+        // doing it inline would block this tokio worker thread from servicing any
+        // other task while it hashes.
+        let hash_str = user
+            .as_ref()
+            .map_or_else(|| DUMMY_PASSWORD_HASH.clone(), |u| u.password.clone());
+        let password = req.password;
+        let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
+            let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
+            Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let user = user.filter(|_| verified).ok_or(StatusCode::UNAUTHORIZED)?;
 
         let login_session = state.login_sessions.create_session(user.id).await;
         Ok(Json(LoginResponse { login_session }))
@@ -70,14 +98,16 @@ mod tests {
     use crate::storage::UserStorage;
     use argon2::password_hash::rand_core::OsRng;
     use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
+    use argon2::PasswordHasher;
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
     use std::sync::Arc;
 
+    use crate::crypto::ARGON2;
+
     async fn state_with_user(identifier: &str, password: &str) -> AppState {
         let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
+        let hash = ARGON2
             .hash_password(password.as_bytes(), &salt)
             .unwrap()
             .to_string();
@@ -136,5 +166,29 @@ mod tests {
         let result = login(State(state), Json(req)).await;
 
         assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn unknown_identifier_pays_the_same_argon2_cost_as_a_known_one() {
+        // Regression guard for the username-enumeration timing hole: an unknown
+        // identifier must still run a full Argon2 hash, not return instantly.
+        // We don't assert a tight ratio against the known-identifier path (flaky
+        // under load); an absolute floor is enough to catch a short-circuit.
+        let state = state_with_user("alice", "hunter2").await;
+        let req = LoginRequest {
+            identifier: "no-such-user".to_string(),
+            password: "whatever".to_string(),
+        };
+
+        let started = std::time::Instant::now();
+        let result = login(State(state), Json(req)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert!(
+            elapsed > std::time::Duration::from_millis(1),
+            "unknown-identifier login returned in {elapsed:?} -- looks like it short-circuited \
+             before hashing, which reopens the username-enumeration timing hole"
+        );
     }
 }
