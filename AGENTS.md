@@ -47,6 +47,7 @@ implemented — `/oauth/...` routes and the `reqwest`/`jsonwebtoken` deps are re
 - Config uses env vars only — no config files. New env vars → add field to
   `Config` (backend) + a row in `README.md`.
 - `&str`-typed errors/JSON via `axum::Json<serde_json::Value>` are the current pattern.
+- Custom environment variables are prefixed with `WA_`.
 
 ## Gotchas
 

@@ -20,8 +20,9 @@ async fn main() {
 
 #[page("/")]
 async fn login() -> Result<impl View> {
-    let oauth_url = std::env::var("WA_OAUTH_LOGIN_URL")
-        .unwrap_or_else(|_| "http://localhost:1983/oauth/login".to_string());
+    let oauth_url = std::env::var("WA_OAUTH_LOGIN_URL").unwrap_or_else(|_| {
+        "http://localhost:8080/login?redirect_uri=http%3A%2F%2Flocalhost%3A1984%2F".to_string()
+    });
 
     Ok(view! {
         <!DOCTYPE html>
