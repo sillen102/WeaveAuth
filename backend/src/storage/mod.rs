@@ -1,18 +1,25 @@
-use uuid::Uuid;
-use crate::model::pkce::CodeChallengeMethod;
-use crate::model::session::Session;
-use crate::model::user::User;
-
 pub(crate) mod in_memory;
 
-pub(crate) trait SessionStorage {
-    async fn save_session(&mut self, session: Session);
-    async fn get_session(&self, cookie: &str) -> Option<&Session>;
-}
+use crate::model::pkce::CodeChallengeMethod;
+use crate::model::user::User;
+use uuid::Uuid;
 
 pub(crate) trait UserStorage {
     async fn save_user(&mut self, user: User);
-    async fn get_user(&self, user_id: Uuid) -> Option<&User>;
+    async fn get_user_by_identifier(&self, identifier: &str) -> Option<User>;
+}
+
+/// A short-lived, single-use proof that `/oauth/login` already authenticated
+/// this user -- `/oauth/authorize` requires one of these before it will issue
+/// a code, which is what makes "authenticate before authorize" a real,
+/// server-enforced ordering rather than something callers have to get right
+/// themselves (RFC 6749 4.1.1: the authorization server authenticates the
+/// resource owner before issuing a code).
+pub(crate) trait LoginSessionStorage {
+    async fn create_session(&mut self, user_id: Uuid) -> String;
+    /// Consumes the session token; returns the user id if it existed and
+    /// hasn't expired.
+    async fn take_session(&mut self, token: &str) -> Option<Uuid>;
 }
 
 pub(crate) trait PkceStorage {

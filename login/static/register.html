@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WeaveAuth - Create account</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="card">
+    <h1>Create an account</h1>
+    <p>Choose a username and password to get started.</p>
+    <p class="error" id="error"></p>
+    <form id="register-form" method="post">
+      <div>
+        <label for="identifier">Username</label>
+        <input type="text" id="identifier" name="identifier" autocomplete="username" required>
+      </div>
+      <div>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="new-password" required minlength="8">
+      </div>
+      <input type="hidden" name="next" id="next">
+      <button class="btn" type="submit">Create account</button>
+    </form>
+    <p class="secondary">
+      Already have an account? <a id="login-link" href="index.html">Sign in</a>
+    </p>
+  </main>
+  <script src="/config.js"></script>
+  <script>
+    // Preserve the original redirect_uri through registration, so "Sign in"
+    // (and the bounce back after a successful registration) still lands the
+    // caller where they started.
+    var redirectUri = new URLSearchParams(window.location.search).get("redirect_uri") || (window.location.origin + "/");
+    var loginUrl = "index.html?redirect_uri=" + encodeURIComponent(redirectUri);
+    document.getElementById("login-link").href = loginUrl;
+    document.getElementById("next").value = window.location.origin + "/" + loginUrl;
+    document.getElementById("register-form").action = window.BFF_URL + "/register";
+
+    if (new URLSearchParams(window.location.search).get("error")) {
+      document.getElementById("error").textContent = "That username is already taken.";
+    }
+  </script>
+</body>
+</html>

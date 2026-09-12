@@ -1,4 +1,5 @@
 pub(crate) use controller::issue_token;
+pub(crate) use controller::issue_token_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -9,26 +10,27 @@ mod controller {
     use base64::Engine;
     use chrono::{DateTime, Duration, Utc};
     use rand::RngExt;
+    use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
 
     use crate::server::AppState;
     use crate::storage::PkceStorage;
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, JsonSchema)]
     pub(crate) struct TokenRequest {
-        code: String,
-        code_verifier: String,
-        redirect_uri: String,
+        pub(super) code: String,
+        pub(super) code_verifier: String,
+        pub(super) redirect_uri: String,
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, JsonSchema)]
     #[serde(rename_all = "PascalCase")]
     pub(crate) enum TokenType {
         Bearer,
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, JsonSchema)]
     pub(crate) struct TokenResponse {
         access_token: String,
         refresh_token: String,
@@ -37,7 +39,7 @@ mod controller {
     }
 
     // OpenAPI documentation for this route.
-    pub(crate) fn doc(op: TransformOperation) -> TransformOperation {
+    pub(crate) fn issue_token_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("token")
             .summary("Exchange an authorization code for tokens")
@@ -81,5 +83,148 @@ mod controller {
             token_type: TokenType::Bearer,
             expires_at: Utc::now() + Duration::minutes(15),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller::*;
+    use axum::extract::{Form, State};
+    use axum::http::StatusCode;
+
+    use crate::model::pkce::CodeChallengeMethod;
+    use crate::server::AppState;
+    use crate::storage::in_memory::InMemoryPkceStorage;
+    use crate::storage::PkceStorage;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    fn state() -> AppState {
+        AppState {
+            pkce: InMemoryPkceStorage::new(300),
+            users: crate::storage::in_memory::InMemoryUserStorage::new(),
+            login_sessions: crate::storage::in_memory::InMemoryLoginSessionStorage::new(60),
+            redirect_uri_allowlist: Arc::new(vec![]),
+        }
+    }
+
+    fn challenge_for(verifier: &str) -> String {
+        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn exchanges_valid_code_for_tokens() {
+        let mut state = state();
+        let verifier = "correct-verifier";
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
+        let req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: verifier.to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+
+        let result = issue_token(State(state), Form(req)).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_code() {
+        let req = TokenRequest {
+            code: "never-issued".to_string(),
+            code_verifier: "whatever".to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+
+        let result = issue_token(State(state()), Form(req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_redirect_uri() {
+        let mut state = state();
+        let verifier = "correct-verifier";
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
+        let req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: verifier.to_string(),
+            redirect_uri: "http://other.test".to_string(),
+        };
+
+        let result = issue_token(State(state), Form(req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_code_verifier() {
+        let mut state = state();
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
+        let req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: "wrong-verifier".to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+
+        let result = issue_token(State(state), Form(req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn code_is_single_use() {
+        let mut state = state();
+        let verifier = "correct-verifier";
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
+        let first_req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: verifier.to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+        let _ = issue_token(State(state.clone()), Form(first_req)).await.unwrap();
+
+        let second_req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: verifier.to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+        let result = issue_token(State(state), Form(second_req)).await;
+
+        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
     }
 }

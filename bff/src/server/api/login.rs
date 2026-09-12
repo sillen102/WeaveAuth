@@ -1,5 +1,6 @@
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::State;
+use axum::Form;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,8 +20,19 @@ fn b64url(bytes: &[u8]) -> String {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct LoginQuery {
+pub(crate) struct LoginRequest {
+    identifier: String,
+    password: String,
     redirect_uri: String,
+    /// Where to bounce the browser back to on wrong credentials -- the login
+    /// page's own URL, supplied by its form, not user-typed input.
+    next: String,
+}
+
+#[derive(Serialize)]
+struct VerifyLoginRequest<'a> {
+    identifier: &'a str,
+    password: &'a str,
 }
 
 #[derive(Serialize)]
@@ -36,17 +48,27 @@ struct TokenExchangeRequest<'a> {
 }
 
 #[derive(Deserialize)]
+struct LoginSessionResponse {
+    login_session: String,
+}
+
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: String,
     expires_at: DateTime<Utc>,
 }
 
-/// Drives the whole authorization-code + PKCE exchange server-to-server in one
-/// request, so the browser only ever talks to bff and never sees backend. This
-/// relies on backend's `/oauth/authorize` having no interactive step (anonymous
-/// stub); real user authentication requiring a browser-visible step would need
-/// this to be revisited (see README TODO ledger).
+/// Verifies the submitted credentials against backend's `/oauth/login`, then
+/// drives the whole authorization-code + PKCE exchange server-to-server in
+/// one request, so the browser only ever talks to bff and never sees backend
+/// (it POSTs its login form straight to bff's absolute URL, so the session
+/// cookie below ends up scoped to bff's origin, not the login page's).
+///
+/// Per RFC 6749 4.1.1, authenticating the resource owner happens before a
+/// code is issued: `/oauth/login`'s response carries a single-use
+/// `login_session` that `/oauth/authorize` requires, so backend itself
+/// enforces this order for any caller -- not just bff.
 ///
 /// The `redirect_uri` a caller passes here (the final browser destination) is
 /// sent as-is to backend's `/oauth/authorize`, which allowlist-checks it and
@@ -55,9 +77,38 @@ struct TokenResponse {
 /// there's no open-redirect exposure in sending the real value through.
 pub(crate) async fn start_login(
     State(mut state): State<AppState>,
-    Query(query): Query<LoginQuery>,
+    Form(req): Form<LoginRequest>,
 ) -> Result<Response, StatusCode> {
-    let redirect_uri = query.redirect_uri;
+    let redirect_uri = req.redirect_uri;
+
+    let verify_resp = state
+        .http_client
+        .post(format!("{}/oauth/login", state.config.backend_url))
+        .json(&VerifyLoginRequest {
+            identifier: &req.identifier,
+            password: &req.password,
+        })
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if verify_resp.status() == StatusCode::UNAUTHORIZED {
+        // A plain form POST, not a fetch -- so a friendly bounce back to the
+        // login page (rather than a bare 401 body) is what the browser shows.
+        let sep = if req.next.contains('?') { '&' } else { '?' };
+        return Ok((
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, format!("{}{sep}error=1", req.next))],
+        )
+            .into_response());
+    }
+    if !verify_resp.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let login_session = verify_resp
+        .json::<LoginSessionResponse>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .login_session;
 
     let mut verifier_bytes = [0u8; 32];
     rand::rng().fill(&mut verifier_bytes);
@@ -69,6 +120,7 @@ pub(crate) async fn start_login(
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
+        .append_pair("login_session", &login_session)
         .finish();
 
     let authorize_resp = state

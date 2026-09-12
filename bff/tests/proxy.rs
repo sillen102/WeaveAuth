@@ -7,6 +7,16 @@ use tower::ServiceExt;
 use weaveauth_bff::config::{Config, RouteConfig};
 use weaveauth_bff::server::app;
 
+fn login_request(redirect_uri: &str) -> Request<Body> {
+    Request::post("/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "identifier=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
+            url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>()
+        )))
+        .unwrap()
+}
+
 fn test_config(backend_url: String, routes: Vec<RouteConfig>) -> Config {
     Config {
         port: 8080,
@@ -21,6 +31,10 @@ async fn stub_backend() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
+        .route(
+            "/oauth/login",
+            post(|| async { Json(serde_json::json!({"login_session": "stub-session"})) }),
+        )
         .route(
             "/oauth/authorize",
             get(
@@ -82,11 +96,7 @@ async fn proxies_authenticated_request_swapping_cookie_for_bearer_token() {
 
     let login_resp = app
         .clone()
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
     let set_cookie = login_resp
@@ -160,11 +170,7 @@ async fn unknown_session_cookie_is_unauthorized() {
 
 async fn seeded_cookie(app: Router, backend: &str) -> String {
     let login_resp = app
-        .oneshot(
-            Request::get("/login?redirect_uri=http%3A%2F%2Fadmin.test%2F")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(login_request("http://admin.test/"))
         .await
         .unwrap();
     let _ = backend; // kept for call-site clarity

@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::server::router::router;
-use crate::storage::in_memory::InMemoryPkceStorage;
+use crate::storage::in_memory::{
+    InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
+};
 use std::sync::Arc;
 
 mod api;
@@ -9,6 +11,8 @@ pub mod router;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pkce: InMemoryPkceStorage,
+    pub(crate) users: InMemoryUserStorage,
+    pub(crate) login_sessions: InMemoryLoginSessionStorage,
     pub(crate) redirect_uri_allowlist: Arc<Vec<String>>,
 }
 
@@ -16,6 +20,8 @@ impl AppState {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
+            users: InMemoryUserStorage::new(),
+            login_sessions: InMemoryLoginSessionStorage::new(config.login_session_ttl_secs),
             redirect_uri_allowlist: Arc::new(config.redirect_uri_allowlist.clone()),
         }
     }

@@ -12,97 +12,172 @@ Cargo workspace (`backend/` + `bff/` + `login/`), three binaries:
 
 - **`weaveauth`** (Axum, backend) — `:1983`. API + OAuth2/PKCE authorization server
   logic. **Not exposed publicly** — only `bff` and `login` are internet-facing.
-- **`weaveauth-bff`** (Axum, BFF) — `:8080`. The real OAuth client: drives the entire
-  authorization-code + PKCE exchange with backend server-to-server on a single
-  `/login` request — the browser never sees backend at all, only bff's one 303 back
-  to the caller with a `Set-Cookie`. Owns the session store.
+- **`weaveauth-bff`** (Axum, BFF) — `:8080`. The real OAuth client: verifies user
+  credentials and drives the entire authorization-code + PKCE exchange with backend
+  server-to-server on a single `/login` request — the browser never sees backend at
+  all, only bff's one 303 back to the caller with a `Set-Cookie`. Owns the session
+  store.
   Also acts as a reverse proxy for any other route: requests matching a
   configured `path_prefix` are forwarded to `upstream_url` with the session cookie
   swapped for an `Authorization: Bearer <access_token>` header (see Configuration
   below).
 - **`weaveauth-login`** (axum + `ServeDir`, static UI) — `:8081`. Optional, thin,
-  replaceable: serves the login page and a `/login` redirect straight into the bff's
-  `/login`.
+  replaceable: serves the login page, the registration page, and `/config.js` (injects
+  `window.BFF_URL` so those static pages know where to POST). Both HTML files are
+  plain, deployer-replaceable static assets — no templating, no build step.
 
 Login (authorization-code + PKCE) flow — the browser only ever talks to `login` and
 `bff`; backend is never in the browser's network tab:
 
-1. Browser hits `login`'s page, or any frontend links straight to the bff's
-   `GET /login?redirect_uri=<back-to-caller>`.
-2. `login` (if used) just redirects into the bff's `/login`.
-3. `bff` generates a `code_verifier`, derives `code_challenge` (S256), and — entirely
+1. Browser hits `login`'s page (`index.html`), which renders a real username/password
+   form (its `action` is set client-side to `{WA_BFF_URL}/login`, read from
+   `/config.js`) plus a link to `register.html` (same pattern, posts to
+   `{WA_BFF_URL}/register`).
+2. Submitting the login form does a **plain cross-origin form POST straight to bff**
+   (not a `fetch`) — this is what lets bff's `Set-Cookie` response end up scoped to
+   bff's own origin, and needs no CORS since it's a real browser navigation, not a
+   script-read response.
+3. `bff` first calls backend's `POST /oauth/login` with the submitted
+   identifier/password. Backend hashes-and-compares (Argon2) against `UserStorage` and,
+   on success, returns a short-lived, single-use `login_session` token. Wrong
+   credentials → bff 303s the browser back to the login page with `?error=1` (the page
+   shows an inline message) — `/oauth/authorize` is never even called.
+4. `bff` generates a `code_verifier`, derives `code_challenge` (S256), and — entirely
    server-to-server via its own HTTP client — `GET`s the backend's `/oauth/authorize`
-   with the caller's `redirect_uri` passed through unchanged.
-4. Backend is the **single source of truth** for the allowlist: it validates
-   `redirect_uri` against `WA_REDIRECT_URI_ALLOWLIST`/`config.yaml` and refuses to
-   store a PKCE challenge or issue a code for anything not on it (`400`) — bff cannot
-   get a token for a `redirect_uri` backend doesn't recognize, full stop. On success,
-   backend stores the challenge keyed by a single-use, TTL'd auth code and responds
-   (to bff, not the browser) with a 303 whose `Location` carries the `code`. bff reads
-   `code` straight out of that header — it never actually navigates there.
-5. Still within the same request, `bff` POSTs `code` + `code_verifier` to the backend
+   with the caller's `redirect_uri` and the `login_session` from step 3.
+5. Backend's `/oauth/authorize` first consumes `login_session` (`401` if missing,
+   unknown, expired, or already used — this is what makes "authenticate before
+   authorize" a real, server-enforced ordering per RFC 6749 §4.1.1, rather than
+   something every caller has to get right on its own). It then checks `redirect_uri`
+   against `WA_REDIRECT_URI_ALLOWLIST`/`config.yaml` — the **single source of truth**
+   for that allowlist — and refuses to issue a code for anything not on it (`400`). On
+   success, backend stores the challenge keyed by a single-use, TTL'd auth code and
+   responds (to bff, not the browser) with a 303 whose `Location` carries the `code`.
+   bff reads `code` straight out of that header — it never actually navigates there.
+6. Still within the same request, `bff` POSTs `code` + `code_verifier` to the backend
    `POST /oauth/token` (server-to-server), verifies success, mints a session, stores it
    in its session store, and *only now* replies to the browser: one 303 straight to the
    original `redirect_uri` with a `Set-Cookie: wa_session=...; HttpOnly` header — no
    token in the URL, and no browser-visible hop through backend at any point.
 
-This collapses what classic OAuth does in two browser-visible round trips into one,
-which only works because backend's `/oauth/authorize` has no interactive step today
-(anonymous stub, see TODO ledger item 5). If real user authentication requiring a
-browser-visible step lands on backend, this needs revisiting.
+Registration follows the same shape: `register.html` posts identifier/password
+straight to bff's `POST /register`, which forwards to backend's `POST /register`
+(Argon2-hashes the password, saves the user) and 303s the browser back to `next` (the
+login page, supplied by the form) — `?error=1` appended on failure, e.g. a taken
+identifier.
+
+Because `/oauth/login` and `/oauth/authorize` are separate, independently callable
+endpoints, the `login_session` requirement on `/oauth/authorize` is what prevents a
+future direct caller (e.g. an SPA built straight against backend, bypassing bff) from
+skipping authentication by calling things in the wrong order — the ordering is enforced
+by backend's own state, not by convention.
 
 bff routes:
 
-| Method | Path                         | Returns                                                                                                                                                              |
-|--------|------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`                    | `ok`                                                                                                                                                                 |
-| GET    | `/login?redirect_uri=<uri>`  | Drives the whole PKCE exchange server-to-server, sets session cookie, 303 → `redirect_uri`; `400` if `redirect_uri` is missing                                       |
-| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches |
+| Method | Path                         | Returns                                                                                                                                                                                                                      |
+|--------|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`                    | `ok`                                                                                                                                                                                                                         |
+| POST   | `/login`                     | Form `{identifier, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `422` if a required field is missing |
+| POST   | `/register`                  | Form `{identifier, password, next}`. Forwards to backend, 303 → `next` (success) or `next?error=1` (failure, e.g. taken identifier)                                                                                          |
+| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches                                                         |
 
 login routes:
 
-| Method | Path        | Returns                                |
-|--------|-------------|----------------------------------------|
-| GET    | `/`         | Login page (`login/static/index.html`) |
-| GET    | `/login?redirect_uri=<uri>` | 303 → bff `/login`; `400` if `redirect_uri` is missing |
-| GET    | `/static/*` | Static assets (`login/static/`)        |
+| Method | Path             | Returns                                                              |
+|--------|------------------|----------------------------------------------------------------------|
+| GET    | `/`              | Login page (`login/static/index.html`)                               |
+| GET    | `/register.html` | Registration page (`login/static/register.html`)                     |
+| GET    | `/config.js`     | `window.BFF_URL = "...";` — lets the static pages know where to POST |
+| GET    | `/static/*`      | Static assets (`login/static/`)                                      |
 
 Backend routes:
 
-| Method | Path               | Returns                                                                                                                              |
-|--------|--------------------|--------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`          | `ok`                                                                                                                                 |
-| GET    | `/oauth/login`     | `{ "authenticated": true }` (legacy stub)                                                                                            |
-| GET    | `/oauth/authorize` | 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400`                                                 |
-| POST   | `/oauth/token`     | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }` |
+| Method | Path               | Returns                                                                                                                                               |
+|--------|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`          | `ok`                                                                                                                                                  |
+| POST   | `/oauth/login`     | Verifies identifier/password (Argon2) against `UserStorage`; `{ login_session }` on success, `401` otherwise                                          |
+| POST   | `/register`        | Hashes the password (Argon2) and saves a new user; `201`, or `400` if the identifier is taken                                                         |
+| GET    | `/oauth/authorize` | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400` |
+| POST   | `/oauth/token`     | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`                  |
 
 ## TODO ledger
 
-1. ~~**PKCE verification**~~ — done: backend stores `code_challenge` at
-   `/oauth/authorize` and checks `code_verifier` against it at `/oauth/token`.
-2. ~~**`redirect_uri` allowlist**~~ — done, backend-only: bff forwards whatever
-   `redirect_uri` a caller passes to `/login` straight through to backend's
-   `/oauth/authorize` as-is; backend is the single place that allowlists it, and
-   refuses to issue a code (so bff can't hand out a token) for anything not listed.
-   Deliberately not duplicated in bff — one allowlist, one place it can drift.
-3. ~~**Token delivery**~~ — done: bff sets an HttpOnly session cookie instead of a
-   query-string access token.
-4. ~~**State/code single-use + expiry**~~ — done: backend's PKCE store enforces
-   single-use + TTL (bff no longer needs its own pending-auth store — the whole
-   exchange with backend happens inside one request, see the login flow above).
-5. **Real user authentication** — `/oauth/authorize` is still anonymous; no login
-   credential check happens before a code is issued. `backend/src/model/user.rs` and
-   `InMemoryUserStorage` exist but are unwired. Deferred.
-6. **Client authentication** — the bff's token-exchange request already carries
-   `client_id`/`client_secret` fields (currently always `None`); wiring real client
-   credentials into the backend's `/oauth/token` is future work for defense in depth
-   alongside PKCE.
-7. **Cookie `Secure` attribute** — bff's session cookie has no `Secure` flag yet (local
-   HTTP dev); needed before any real HTTPS deployment.
+Open items, in priority order (highest first):
+
+- [ ] **Access tokens carry no user identity — fix before JWKS/JWT work.**
+      `/oauth/authorize` consumes `login_session` (which resolves to a `user_id`) but
+      discards the returned id (`state.login_sessions.take_session(...).ok_or(...)?;`
+      in `authorize.rs`, result unused); the PKCE record it saves right after carries
+      `code_challenge`/`method`/`redirect_uri` only. `token.rs`'s `TokenResponse` has
+      no `sub`/`user_id` field, and bff's own `SessionData`
+      (`bff/src/model/session.rs`) is just `{access_token, refresh_token,
+      expires_at}`. So real authentication happens, and its result — *which* user — is
+      thrown away one line later and never reaches the code, the token, or bff's
+      session. Once JWTs are issued from `/oauth/token`, this is the difference
+      between a token with a real `sub` claim and an anonymous capability token any
+      resource server can't attribute to a user. Fix: thread the `user_id` from
+      `take_session` through the PKCE record (or a short-lived auth-code→user
+      mapping) so `/oauth/token` can put it in the response (and eventually the JWT).
+- [ ] **Username enumeration via login timing.** `login.rs`: an unknown `identifier`
+      returns `401` immediately; a known one with a wrong password only fails after a
+      full Argon2 hash (~50-200ms by design). That gap lets an attacker distinguish
+      valid from invalid usernames by response time. Fix: always run a hash on the
+      "unknown user" path too (verify against a fixed dummy hash) so both branches
+      cost the same.
+- [ ] **No uniqueness check on `identifier` at registration.** `register.rs` inserts a
+      new `User` keyed by a fresh `Uuid` with no check for an existing row with the
+      same `identifier` first. Two registrations for "alice" coexist in the
+      `HashMap`, and `get_user_by_identifier`'s `.values().find(...)`
+      (`storage/in_memory.rs`) returns whichever one hash-iteration hits first —
+      undefined which account "alice" actually is. Needs a real uniqueness check (or
+      a `HashMap<String, Uuid>` index) before `save_user`.
+- [ ] **Login/register CSRF.** `POST /login` and `POST /register` are plain
+      cross-origin form POSTs by design (that's what keeps bff's `Set-Cookie` scoped
+      to its own origin without CORS), but neither checks `Origin`/`Referer` against
+      known login-page origins and neither carries an anti-CSRF token. Any site can
+      auto-submit a form to `bff/login` with the attacker's own credentials and hand
+      the victim's browser a session logged in as the attacker ("login CSRF") — used
+      to trick a victim into entering sensitive data into what they believe is their
+      own account.
+- [ ] **No rate limiting.** `/oauth/login`, `/register`, `/oauth/token` have no
+      attempt throttling. Argon2 raises the cost per guess but doesn't stop
+      distributed brute-forcing or registration spam.
+- [ ] **No server-side password policy.** `minlength="8"` on `register.html` is
+      client-side only; `register.rs` accepts any length, including empty, via a
+      direct API call.
+- [ ] **Client authentication** — the bff's token-exchange request already carries
+      `client_id`/`client_secret` fields (currently always `None`); wiring real
+      client credentials into the backend's `/oauth/token` is future work for
+      defense in depth alongside PKCE.
+- [ ] **Cookie `Secure` attribute** — bff's session cookie has no `Secure` flag yet
+      (local HTTP dev); needed before any real HTTPS deployment.
+
+Done:
+
+- [x] **PKCE verification** — backend stores `code_challenge` at `/oauth/authorize`
+      and checks `code_verifier` against it at `/oauth/token`.
+- [x] **`redirect_uri` allowlist** — backend-only: bff forwards whatever
+      `redirect_uri` a caller passes to `/login` straight through to backend's
+      `/oauth/authorize` as-is; backend is the single place that allowlists it, and
+      refuses to issue a code (so bff can't hand out a token) for anything not
+      listed. Deliberately not duplicated in bff — one allowlist, one place it can
+      drift.
+- [x] **Token delivery** — bff sets an HttpOnly session cookie instead of a
+      query-string access token.
+- [x] **State/code single-use + expiry** — backend's PKCE store enforces single-use
+      + TTL (bff no longer needs its own pending-auth store — the whole exchange
+      with backend happens inside one request, see the login flow above).
+- [x] **Real user authentication** — `POST /oauth/login` verifies
+      identifier/password (Argon2) against `UserStorage` and returns a single-use
+      `login_session` that `/oauth/authorize` requires before it will issue a code,
+      so authentication is enforced server-side regardless of caller order (see the
+      first open item above for what this doesn't yet do: propagate *which* user).
+      `POST /register` creates users. `login`'s static pages have real
+      login/register forms.
 
 ## Prerequisites
 
-- Rust (stable) — `cargo` on PATH. No Node required.
+- Rust (stable) — `cargo` on PATH.
 
 ## Development
 
@@ -155,11 +230,12 @@ matches) is forwarded to `upstream_url` with that prefix stripped, `Cookie` drop
 `Authorization: Bearer <access_token>` set from the session looked up via the request's
 `wa_session` cookie. No session → `401`; no matching route → `404`.
 
-The `redirect_uri` a caller passes to bff's `/login` is not separately allowlisted by
-bff — it's forwarded as-is to backend's `/oauth/authorize`, and backend's
-`WA_REDIRECT_URI_ALLOWLIST` / `config.yaml` is the only place it's checked (see the
-login flow above). `backend/config.yaml`'s allowlist therefore needs to list every
-real destination callers of `/login` are allowed to land on, e.g. `login`'s own page:
+The `redirect_uri` a caller's login form submits to bff's `/login` is not separately
+allowlisted by bff — it's forwarded as-is to backend's `/oauth/authorize`, and
+backend's `WA_REDIRECT_URI_ALLOWLIST` / `config.yaml` is the only place it's checked
+(see the login flow above). `backend/config.yaml`'s allowlist therefore needs to list
+every real destination callers of `/login` are allowed to land on, e.g. `login`'s own
+page:
 
 ```yaml
 redirect_uri_allowlist:
@@ -179,18 +255,19 @@ exercising bff's proxy):
   saves the JSON body in memory under a generated `id` and returns it (`201`). `cargo
   run` in that directory, `$PORT` default `10002`.
 
-| Variable                    | App          | Default                         | Description                                                                                                                             |
-|-----------------------------|--------------|---------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| `WA_CONFIG_FILE`            | backend, bff | `config.yaml` (relative to cwd) | Path to the optional YAML config overlay                                                                                                |
-| `WA_PORT`                   | backend      | `1983`                          | Backend listen port                                                                                                                     |
-| `WA_REDIRECT_URI_ALLOWLIST` | backend      | `http://localhost:8081/`        | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login` |
-| `WA_PKCE_CODE_TTL_SECS`     | backend      | `300`                           | How long an issued auth code stays redeemable                                                                                           |
-| `WA_LOGIN_PORT`             | login        | `8081`                          | Login page listen port                                                                                                                  |
-| `WA_BFF_PORT`               | bff          | `8080`                          | bff listen port                                                                                                                         |
-| `WA_BFF_URL`                | bff, login   | `http://localhost:8080`         | Public base URL of the bff, used by login to redirect into it                                                                           |
-| `WA_BACKEND_URL`            | bff          | `http://localhost:1983`         | Backend base URL the bff exchanges codes against                                                                                        |
-| `WA_SESSION_COOKIE_NAME`    | bff          | `wa_session`                    | Name of the HttpOnly session cookie set after login                                                                                     |
-| `WA_CLAIM_ENRICHMENT_URL`   | backend      | *(unset)*                       | Optional upstream claim-enrichment endpoint (unused yet)                                                                                |
+| Variable                    | App          | Default                         | Description                                                                                                                                 |
+|-----------------------------|--------------|---------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `WA_CONFIG_FILE`            | backend, bff | `config.yaml` (relative to cwd) | Path to the optional YAML config overlay                                                                                                    |
+| `WA_PORT`                   | backend      | `1983`                          | Backend listen port                                                                                                                         |
+| `WA_REDIRECT_URI_ALLOWLIST` | backend      | `http://localhost:8081/`        | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`     |
+| `WA_PKCE_CODE_TTL_SECS`     | backend      | `300`                           | How long an issued auth code stays redeemable                                                                                               |
+| `WA_LOGIN_SESSION_TTL_SECS` | backend      | `60`                            | How long a `/oauth/login` session token stays valid for the follow-up `/oauth/authorize` call — just a server-to-server hop, so short-lived |
+| `WA_LOGIN_PORT`             | login        | `8081`                          | Login page listen port                                                                                                                      |
+| `WA_BFF_PORT`               | bff          | `8080`                          | bff listen port                                                                                                                             |
+| `WA_BFF_URL`                | bff, login   | `http://localhost:8080`         | Public base URL of the bff, used by login to redirect into it                                                                               |
+| `WA_BACKEND_URL`            | bff          | `http://localhost:1983`         | Backend base URL the bff exchanges codes against                                                                                            |
+| `WA_SESSION_COOKIE_NAME`    | bff          | `wa_session`                    | Name of the HttpOnly session cookie set after login                                                                                         |
+| `WA_CLAIM_ENRICHMENT_URL`   | backend      | *(unset)*                       | Optional upstream claim-enrichment endpoint (unused yet)                                                                                    |
 
 ## Testing
 
@@ -202,18 +279,22 @@ Runs the full workspace test suite (backend, bff, login — `testing/downstream-
 and `testing/user-service` are excluded, being standalone fixtures, not workspace
 members):
 
-- `backend`: unit tests inline per module (`model/*`, `storage/in_memory.rs`,
-  `config.rs` — env/YAML precedence via a small `EnvGuard` + shared `Mutex` since
-  `Config::load()` touches process env) plus `backend/tests/api_test.rs` (black-box,
-  via `weaveauth::server::app`) covering `/health`, the legacy `/oauth/login` stub, and
-  `/oauth/authorize` + `/oauth/token`'s allowlist/PKCE/single-use/TTL behavior.
+- `backend`: unit tests inline per module (`model/*`, `storage/in_memory.rs` —
+  including `InMemoryLoginSessionStorage`'s single-use/expiry behavior, `config.rs` —
+  env/YAML precedence via a small `EnvGuard` + shared `Mutex` since `Config::load()`
+  touches process env) plus `backend/tests/api_test.rs` (black-box, via
+  `weaveauth::server::app`) covering `/health`, `/register` + `/oauth/login` +
+  `/oauth/authorize` + `/oauth/token`'s full authenticate-then-authorize round trip,
+  and allowlist/PKCE/single-use/TTL behavior.
 - `bff`: unit tests inline (`config.rs`, `storage/in_memory.rs`, and `proxy.rs`'s pure
   `is_hop_by_hop`/`extract_cookie` helpers) plus `bff/tests/pkce_flow.rs` (the full
-  server-to-server login exchange, its failure modes, and that backend is never
-  browser-visible) and `bff/tests/proxy.rs` (bearer-swap, prefix matching, query/body
-  forwarding, auth failures).
+  server-to-server login exchange including credential verification, its failure
+  modes, and that backend is never browser-visible), `bff/tests/register.rs`
+  (registration forwarding + its `next`/`?error=1` redirect), and `bff/tests/proxy.rs`
+  (bearer-swap, prefix matching, query/body forwarding, auth failures).
 - `login`: unit tests inline (`Config::load()`) plus `login/tests/redirect_test.rs`
-  (the `/login` redirect and that static assets still serve correctly).
+  (`/config.js`, and that both the login and registration static pages, plus other
+  static assets, still serve correctly).
 
 ## Docker
 
