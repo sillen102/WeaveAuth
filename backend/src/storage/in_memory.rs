@@ -24,8 +24,13 @@ impl InMemoryUserStorage {
 }
 
 impl UserStorage for InMemoryUserStorage {
-    async fn save_user(&mut self, user: User) {
-        self.users.lock().await.insert(user.id, user);
+    async fn create_user(&mut self, user: User) -> bool {
+        let mut users = self.users.lock().await;
+        if users.values().any(|u| u.identifier == user.identifier) {
+            return false;
+        }
+        users.insert(user.id, user);
+        true
     }
 
     async fn get_user_by_identifier(&self, identifier: &str) -> Option<User> {
@@ -135,14 +140,31 @@ mod tests {
     use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
 
     #[tokio::test]
-    async fn test_save_user() {
+    async fn test_create_user() {
         let mut storage = InMemoryUserStorage::new();
         let mut user = User::default();
         user.identifier = "carol".to_string();
         let user_id = user.id;
-        storage.save_user(user).await;
+        assert!(storage.create_user(user).await);
         let retrieved_user = storage.get_user_by_identifier("carol").await;
         assert_eq!(retrieved_user.map(|u| u.id), Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn test_create_user_rejects_a_taken_identifier() {
+        let mut storage = InMemoryUserStorage::new();
+        let mut first = User::default();
+        first.identifier = "carol".to_string();
+        let first_id = first.id;
+        assert!(storage.create_user(first).await);
+
+        let mut second = User::default();
+        second.identifier = "carol".to_string();
+        assert!(!storage.create_user(second).await);
+
+        // The original registration is untouched -- no shadowing, no overwrite.
+        let retrieved = storage.get_user_by_identifier("carol").await;
+        assert_eq!(retrieved.map(|u| u.id), Some(first_id));
     }
 
     #[tokio::test]
@@ -150,7 +172,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let mut user = User::default();
         user.identifier = "alice".to_string();
-        storage.save_user(user).await;
+        storage.create_user(user).await;
 
         let found = storage.get_user_by_identifier("alice").await;
         assert_eq!(found.map(|u| u.identifier), Some("alice".to_string()));

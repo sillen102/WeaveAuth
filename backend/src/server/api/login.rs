@@ -114,7 +114,7 @@ mod tests {
 
         let mut users = InMemoryUserStorage::new();
         users
-            .save_user(User {
+            .create_user(User {
                 identifier: identifier.to_string(),
                 password: hash,
                 ..User::default()
