@@ -3,11 +3,23 @@ use std::fs;
 
 use serde::Deserialize;
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RouteConfig {
+    pub path_prefix: String,
+    pub upstream_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
-    pub redirect_uri_allowlist: Vec<String>,
-    pub pkce_code_ttl_secs: i64,
+    pub bff_url: String,
+    pub backend_url: String,
+    pub session_cookie_name: String,
+    /// Proxy routes: incoming requests whose path starts with `path_prefix` are
+    /// forwarded to `upstream_url` (prefix stripped) with the session's access
+    /// token swapped in as `Authorization: Bearer <token>`, replacing the cookie.
+    /// Only configurable via the YAML file — there's no sane env-var shape for a list.
+    pub routes: Vec<RouteConfig>,
 }
 
 /// Optional YAML overlay, read before env vars are applied. Path is
@@ -15,8 +27,11 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct FileConfig {
     port: Option<u16>,
-    redirect_uri_allowlist: Option<Vec<String>>,
-    pkce_code_ttl_secs: Option<i64>,
+    bff_url: Option<String>,
+    backend_url: Option<String>,
+    session_cookie_name: Option<String>,
+    #[serde(default)]
+    routes: Vec<RouteConfig>,
 }
 
 fn load_file_config() -> Result<FileConfig, anyhow::Error> {
@@ -31,33 +46,30 @@ impl Config {
     pub fn load() -> Result<Self, anyhow::Error> {
         let file = load_file_config()?;
 
-        let port = env::var("WA_PORT")
+        let port = env::var("WA_BFF_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .or(file.port)
-            .unwrap_or(1983);
-
-        let redirect_uri_allowlist = env::var("WA_REDIRECT_URI_ALLOWLIST")
+            .unwrap_or(8080);
+        let bff_url = env::var("WA_BFF_URL")
             .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .or(file.redirect_uri_allowlist)
-            .unwrap_or_else(|| vec!["http://localhost:8081/".to_string()]);
-
-        let pkce_code_ttl_secs = env::var("WA_PKCE_CODE_TTL_SECS")
+            .or(file.bff_url)
+            .unwrap_or_else(|| "http://localhost:8080".into());
+        let backend_url = env::var("WA_BACKEND_URL")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .or(file.pkce_code_ttl_secs)
-            .unwrap_or(300);
+            .or(file.backend_url)
+            .unwrap_or_else(|| "http://localhost:1983".into());
+        let session_cookie_name = env::var("WA_SESSION_COOKIE_NAME")
+            .ok()
+            .or(file.session_cookie_name)
+            .unwrap_or_else(|| "wa_session".into());
 
         Ok(Self {
             port,
-            redirect_uri_allowlist,
-            pkce_code_ttl_secs,
+            bff_url,
+            backend_url,
+            session_cookie_name,
+            routes: file.routes,
         })
     }
 }
@@ -95,9 +107,10 @@ mod tests {
     }
 
     const ALL_KEYS: &[&str] = &[
-        "WA_PORT",
-        "WA_REDIRECT_URI_ALLOWLIST",
-        "WA_PKCE_CODE_TTL_SECS",
+        "WA_BFF_PORT",
+        "WA_BFF_URL",
+        "WA_BACKEND_URL",
+        "WA_SESSION_COOKIE_NAME",
         "WA_CONFIG_FILE",
     ];
 
@@ -110,7 +123,7 @@ mod tests {
 
     fn temp_yaml(contents: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "weaveauth-backend-config-test-{}-{}.yaml",
+            "weaveauth-bff-config-test-{}-{}.yaml",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -125,12 +138,11 @@ mod tests {
         let _guard = EnvGuard::set(&[("WA_CONFIG_FILE", "/nonexistent/path.yaml")]);
 
         let config = Config::load().unwrap();
-        assert_eq!(config.port, 1983);
-        assert_eq!(
-            config.redirect_uri_allowlist,
-            vec!["http://localhost:8081/".to_string()]
-        );
-        assert_eq!(config.pkce_code_ttl_secs, 300);
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.bff_url, "http://localhost:8080");
+        assert_eq!(config.backend_url, "http://localhost:1983");
+        assert_eq!(config.session_cookie_name, "wa_session");
+        assert!(config.routes.is_empty());
     }
 
     #[test]
@@ -138,59 +150,73 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _clear = clear_env();
         let path = temp_yaml(
-            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\n",
+            r#"
+port: 9999
+bff_url: "http://file.test:9999"
+backend_url: "http://backend.file.test"
+session_cookie_name: "file_cookie"
+routes:
+  - path_prefix: /api
+    upstream_url: http://upstream.file.test
+"#,
         );
         let _guard = EnvGuard::set(&[("WA_CONFIG_FILE", path.to_str().unwrap())]);
 
         let config = Config::load().unwrap();
         assert_eq!(config.port, 9999);
+        assert_eq!(config.bff_url, "http://file.test:9999");
+        assert_eq!(config.backend_url, "http://backend.file.test");
+        assert_eq!(config.session_cookie_name, "file_cookie");
         assert_eq!(
-            config.redirect_uri_allowlist,
-            vec!["http://file.test/callback".to_string()]
+            config.routes,
+            vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                upstream_url: "http://upstream.file.test".to_string(),
+            }]
         );
-        assert_eq!(config.pkce_code_ttl_secs, 42);
 
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn env_vars_override_file_values() {
+    fn env_vars_override_file_scalars_but_routes_stay_file_only() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _clear = clear_env();
         let path = temp_yaml(
-            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\n",
+            r#"
+port: 9999
+bff_url: "http://file.test:9999"
+routes:
+  - path_prefix: /api
+    upstream_url: http://upstream.file.test
+"#,
         );
         let _guard = EnvGuard::set(&[
             ("WA_CONFIG_FILE", path.to_str().unwrap()),
-            ("WA_PORT", "7000"),
-            ("WA_REDIRECT_URI_ALLOWLIST", "http://env.test/callback"),
-            ("WA_PKCE_CODE_TTL_SECS", "11"),
+            ("WA_BFF_PORT", "7000"),
+            ("WA_BFF_URL", "http://env.test:7000"),
         ]);
 
         let config = Config::load().unwrap();
         assert_eq!(config.port, 7000);
-        assert_eq!(
-            config.redirect_uri_allowlist,
-            vec!["http://env.test/callback".to_string()]
-        );
-        assert_eq!(config.pkce_code_ttl_secs, 11);
+        assert_eq!(config.bff_url, "http://env.test:7000");
+        // No env var shape for routes -- the file's list always wins.
+        assert_eq!(config.routes.len(), 1);
 
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn redirect_uri_allowlist_env_splits_trims_and_drops_empties() {
+    fn missing_file_falls_back_to_defaults_even_with_other_env_set() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _clear = clear_env();
         let _guard = EnvGuard::set(&[
             ("WA_CONFIG_FILE", "/nonexistent/path.yaml"),
-            ("WA_REDIRECT_URI_ALLOWLIST", "http://a.test , http://b.test,,"),
+            ("WA_SESSION_COOKIE_NAME", "custom_cookie"),
         ]);
 
         let config = Config::load().unwrap();
-        assert_eq!(
-            config.redirect_uri_allowlist,
-            vec!["http://a.test".to_string(), "http://b.test".to_string()]
-        );
+        assert_eq!(config.session_cookie_name, "custom_cookie");
+        assert!(config.routes.is_empty());
     }
 }

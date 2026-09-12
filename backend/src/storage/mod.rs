@@ -16,6 +16,15 @@ pub(crate) trait UserStorage {
 }
 
 pub(crate) trait PkceStorage {
-    async fn save_code_challenge(&mut self, auth_code: String, code_challenge: String, code_challenge_method: CodeChallengeMethod);
-    async fn take_code_challenge(&mut self, code: &str) -> Option<(String, CodeChallengeMethod)>;
+    async fn save_code_challenge(
+        &mut self,
+        auth_code: String,
+        code_challenge: String,
+        code_challenge_method: CodeChallengeMethod,
+        redirect_uri: String,
+    );
+    /// Removes and returns the (challenge, method, redirect_uri) bound to this
+    /// code -- the caller must additionally check that `redirect_uri` matches
+    /// the one presented at token-exchange time (RFC 6749 4.1.3).
+    async fn take_code_challenge(&mut self, code: &str) -> Option<(String, CodeChallengeMethod, String)>;
 }
