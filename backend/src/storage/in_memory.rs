@@ -41,7 +41,7 @@ impl UserStorage for InMemoryUserStorage {
 #[derive(Clone)]
 pub(crate) struct InMemoryPkceStorage {
     code_challenges:
-        Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String)>>>,
+        Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String, Uuid)>>>,
     ttl_secs: i64,
 }
 
@@ -61,6 +61,7 @@ impl PkceStorage for InMemoryPkceStorage {
         code_challenge: String,
         code_challenge_method: CodeChallengeMethod,
         redirect_uri: String,
+        user_id: Uuid,
     ) {
         self.code_challenges.lock().await.insert(
             auth_code,
@@ -69,6 +70,7 @@ impl PkceStorage for InMemoryPkceStorage {
                 code_challenge_method,
                 Utc::now(),
                 redirect_uri,
+                user_id,
             ),
         );
     }
@@ -76,13 +78,13 @@ impl PkceStorage for InMemoryPkceStorage {
     async fn take_code_challenge(
         &mut self,
         auth_code: &str,
-    ) -> Option<(String, CodeChallengeMethod, String)> {
-        let (challenge, method, issued_at, redirect_uri) =
+    ) -> Option<(String, CodeChallengeMethod, String, Uuid)> {
+        let (challenge, method, issued_at, redirect_uri, user_id) =
             self.code_challenges.lock().await.remove(auth_code)?;
         if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
             return None;
         }
-        Some((challenge, method, redirect_uri))
+        Some((challenge, method, redirect_uri, user_id))
     }
 }
 
@@ -165,12 +167,14 @@ mod tests {
     #[tokio::test]
     async fn test_save_code_challenge() {
         let mut storage = InMemoryPkceStorage::new(300);
+        let user_id = Uuid::new_v4();
         storage
             .save_code_challenge(
                 "test_code".to_string(),
                 "test_challenge".to_string(),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                user_id,
             )
             .await;
         let challenge = storage.take_code_challenge("test_code").await;
@@ -179,7 +183,8 @@ mod tests {
             Some((
                 "test_challenge".to_string(),
                 CodeChallengeMethod::S256,
-                "http://redirect.test".to_string()
+                "http://redirect.test".to_string(),
+                user_id,
             ))
         );
     }
@@ -193,6 +198,7 @@ mod tests {
                 "test_challenge".to_string(),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                Uuid::new_v4(),
             )
             .await;
         storage.take_code_challenge("test_code").await;
@@ -211,6 +217,7 @@ mod tests {
                 "test_challenge".to_string(),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                Uuid::new_v4(),
             )
             .await;
         let challenge = storage.take_code_challenge("test_code").await;

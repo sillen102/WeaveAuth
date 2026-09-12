@@ -43,7 +43,7 @@ mod controller {
         State(mut state): State<AppState>,
         Query(req): Query<AuthorizeRequest>,
     ) -> Result<Redirect, StatusCode> {
-        state
+        let user_id = state
             .login_sessions
             .take_session(&req.login_session)
             .await
@@ -68,6 +68,7 @@ mod controller {
                 req.code_challenge,
                 req.code_challenge_method,
                 req.redirect_uri.clone(),
+                user_id,
             )
             .await;
 
@@ -92,17 +93,21 @@ mod tests {
     use crate::storage::{LoginSessionStorage, PkceStorage};
 
     async fn state_with_allowlist(allowlist: &[&str]) -> (AppState, String) {
+        let (state, login_session, _user_id) = state_with_allowlist_and_user(allowlist).await;
+        (state, login_session)
+    }
+
+    async fn state_with_allowlist_and_user(allowlist: &[&str]) -> (AppState, String, uuid::Uuid) {
         let mut login_sessions = crate::storage::in_memory::InMemoryLoginSessionStorage::new(60);
-        let login_session = login_sessions
-            .create_session(uuid::Uuid::new_v4())
-            .await;
+        let user_id = uuid::Uuid::new_v4();
+        let login_session = login_sessions.create_session(user_id).await;
         let state = AppState {
             pkce: crate::storage::in_memory::InMemoryPkceStorage::new(300),
             users: crate::storage::in_memory::InMemoryUserStorage::new(),
             login_sessions,
             redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
         };
-        (state, login_session)
+        (state, login_session, user_id)
     }
 
     fn location_of(redirect: Redirect) -> String {
@@ -223,7 +228,8 @@ mod tests {
 
     #[tokio::test]
     async fn saves_code_challenge_bound_to_redirect_uri() {
-        let (mut state, login_session) = state_with_allowlist(&["http://redirect.test"]).await;
+        let (mut state, login_session, user_id) =
+            state_with_allowlist_and_user(&["http://redirect.test"]).await;
         let req = AuthorizeRequest {
             redirect_uri: "http://redirect.test".to_string(),
             code_challenge: "my_challenge".to_string(),
@@ -242,7 +248,8 @@ mod tests {
             Some((
                 "my_challenge".to_string(),
                 CodeChallengeMethod::S256,
-                "http://redirect.test".to_string()
+                "http://redirect.test".to_string(),
+                user_id,
             ))
         );
     }

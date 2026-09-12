@@ -29,9 +29,16 @@ pub(crate) trait PkceStorage {
         code_challenge: String,
         code_challenge_method: CodeChallengeMethod,
         redirect_uri: String,
+        user_id: Uuid,
     );
-    /// Removes and returns the (challenge, method, redirect_uri) bound to this
-    /// code -- the caller must additionally check that `redirect_uri` matches
-    /// the one presented at token-exchange time (RFC 6749 4.1.3).
-    async fn take_code_challenge(&mut self, code: &str) -> Option<(String, CodeChallengeMethod, String)>;
+    /// Removes and returns the (challenge, method, redirect_uri, user_id) bound to
+    /// this code -- the caller must additionally check that `redirect_uri` matches
+    /// the one presented at token-exchange time (RFC 6749 4.1.3). `user_id` is who
+    /// `/oauth/login` authenticated before this code was issued (see
+    /// `LoginSessionStorage`); `/oauth/token` carries it into the token response so
+    /// the authenticated identity survives the exchange instead of being dropped.
+    async fn take_code_challenge(
+        &mut self,
+        code: &str,
+    ) -> Option<(String, CodeChallengeMethod, String, Uuid)>;
 }

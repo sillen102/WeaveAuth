@@ -39,6 +39,7 @@ mod tests {
             access_token: token.to_string(),
             refresh_token: format!("{token}-refresh"),
             expires_at: Utc::now(),
+            user_id: uuid::Uuid::new_v4(),
         }
     }
 

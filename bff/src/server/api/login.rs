@@ -57,6 +57,7 @@ struct TokenResponse {
     access_token: String,
     refresh_token: String,
     expires_at: DateTime<Utc>,
+    user_id: Uuid,
 }
 
 /// Verifies the submitted credentials against backend's `/oauth/login`, then
@@ -178,6 +179,7 @@ pub(crate) async fn start_login(
                 access_token: token.access_token,
                 refresh_token: token.refresh_token,
                 expires_at: token.expires_at,
+                user_id: token.user_id,
             },
         )
         .await;
