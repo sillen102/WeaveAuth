@@ -96,7 +96,7 @@ Backend routes:
 |--------|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GET    | `/health`          | `ok`                                                                                                                                                  |
 | POST   | `/oauth/login`     | Verifies identifier/password (Argon2) against `UserStorage`; `{ login_session }` on success, `401` otherwise                                          |
-| POST   | `/register`        | Hashes the password (Argon2) and saves a new user; `201`, or `400` if the identifier is taken                                                         |
+| POST   | `/register`        | Hashes the password (Argon2) and saves a new user; `201`, or `409` if the identifier is taken                                                         |
 | GET    | `/oauth/authorize` | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400` |
 | POST   | `/oauth/token`     | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`                  |
 
@@ -104,13 +104,6 @@ Backend routes:
 
 Open items, in priority order (highest first):
 
-- [ ] **No uniqueness check on `identifier` at registration.** `register.rs` inserts a
-      new `User` keyed by a fresh `Uuid` with no check for an existing row with the
-      same `identifier` first. Two registrations for "alice" coexist in the
-      `HashMap`, and `get_user_by_identifier`'s `.values().find(...)`
-      (`storage/in_memory.rs`) returns whichever one hash-iteration hits first —
-      undefined which account "alice" actually is. Needs a real uniqueness check (or
-      a `HashMap<String, Uuid>` index) before `save_user`.
 - [ ] **Login/register CSRF.** `POST /login` and `POST /register` are plain
       cross-origin form POSTs by design (that's what keeps bff's `Set-Cookie` scoped
       to its own origin without CORS), but neither checks `Origin`/`Referer` against
@@ -164,7 +157,14 @@ Done:
       hashes: an unknown `identifier` verifies against a fixed dummy Argon2 hash
       (`DUMMY_PASSWORD_HASH`, generated once and cached) instead of returning
       immediately, so an unknown identifier costs the same as a known one with a
-      wrong password. Response timing no longer distinguishes the two.
+      wrong password. Response timing no longer distinguishes the two. Both this
+      and the token-identity fix's Argon2 calls run inside `spawn_blocking` (CPU-
+      heavy synchronous work off the tokio worker thread), via one shared,
+      lazily-built `Argon2` instance (`crate::crypto::ARGON2`).
+- [x] **Uniqueness check on `identifier` at registration.** `UserStorage::create_user`
+      now checks-and-inserts atomically under one lock (`InMemoryUserStorage`), so a
+      second registration for a taken `identifier` is rejected (`409`) instead of
+      silently coexisting with the first under an undefined "which one wins" order.
 
 ## Prerequisites
 

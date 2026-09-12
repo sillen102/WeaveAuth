@@ -5,7 +5,11 @@ use crate::model::user::User;
 use uuid::Uuid;
 
 pub(crate) trait UserStorage {
-    async fn save_user(&mut self, user: User);
+    /// Saves `user` unless its `identifier` is already taken, in which case
+    /// nothing is saved and `false` is returned. The check and the insert must
+    /// happen atomically (one lock acquisition) so two concurrent registrations
+    /// for the same identifier can't both pass the check before either inserts.
+    async fn create_user(&mut self, user: User) -> bool;
     async fn get_user_by_identifier(&self, identifier: &str) -> Option<User>;
 }
 

@@ -30,7 +30,10 @@ mod controller {
         op.tag("Auth")
             .id("register")
             .summary("Register a new user")
-            .description("Creates a user with a password hashed via Argon2")
+            .description(
+                "Creates a user with a password hashed via Argon2; 409 if the identifier is \
+                 already taken",
+            )
     }
 
     pub(crate) async fn register(
@@ -52,9 +55,9 @@ mod controller {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let now = Utc::now();
-        state
+        let saved = state
             .users
-            .save_user(User {
+            .create_user(User {
                 id: Uuid::new_v4(),
                 identifier: req.identifier,
                 password: password_hash,
@@ -62,6 +65,10 @@ mod controller {
                 updated_at: now,
             })
             .await;
+
+        if !saved {
+            return Err(StatusCode::CONFLICT);
+        }
 
         Ok(StatusCode::CREATED)
     }
@@ -96,5 +103,24 @@ mod tests {
         let result = register(State(state.clone()), Json(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_taken_identifier() {
+        let state = state();
+        let first = RegisterRequest {
+            identifier: "alice".to_string(),
+            password: "hunter2".to_string(),
+        };
+        let second = RegisterRequest {
+            identifier: "alice".to_string(),
+            password: "different-password".to_string(),
+        };
+
+        let first_result = register(State(state.clone()), Json(first)).await;
+        let second_result = register(State(state), Json(second)).await;
+
+        assert_eq!(first_result, Ok(StatusCode::CREATED));
+        assert_eq!(second_result, Err(StatusCode::CONFLICT));
     }
 }
