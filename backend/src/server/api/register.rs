@@ -4,7 +4,7 @@ pub(crate) use controller::register_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
+    use argon2::PasswordHasher;
     use rand_core::OsRng;
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -14,6 +14,7 @@ mod controller {
     use serde::Deserialize;
     use uuid::Uuid;
 
+    use crate::crypto::ARGON2;
     use crate::model::user::User;
     use crate::server::AppState;
     use crate::storage::UserStorage;
@@ -36,11 +37,19 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<RegisterRequest>,
     ) -> Result<StatusCode, StatusCode> {
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default()
-            .hash_password(req.password.as_bytes(), &salt)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .to_string();
+        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking keeps
+        // it off this tokio worker thread so it doesn't stall other tasks while
+        // hashing.
+        let password = req.password;
+        let password_hash = tokio::task::spawn_blocking(move || {
+            let salt = SaltString::generate(&mut OsRng);
+            ARGON2
+                .hash_password(password.as_bytes(), &salt)
+                .map(|h| h.to_string())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let now = Utc::now();
         state
