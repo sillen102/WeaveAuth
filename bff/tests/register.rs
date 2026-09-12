@@ -13,6 +13,7 @@ fn test_config(backend_url: String) -> Config {
         backend_url,
         session_cookie_name: "wa_session".into(),
         routes: vec![],
+        trusted_origins: vec!["http://login.test".into()],
     }
 }
 
@@ -37,6 +38,7 @@ async fn stub_backend() -> (String, tokio::task::JoinHandle<()>) {
 fn register_request(identifier: &str, next: &str) -> Request<Body> {
     Request::post("/register")
         .header("content-type", "application/x-www-form-urlencoded")
+        .header("origin", "http://login.test")
         .body(Body::from(format!(
             "identifier={identifier}&password=hunter2&next={}",
             url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
@@ -72,6 +74,26 @@ async fn appends_error_query_param_when_backend_rejects() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/register.html?error=1"));
+}
+
+#[tokio::test]
+async fn rejects_an_untrusted_origin() {
+    let app = app(test_config("http://127.0.0.1:1".into()));
+
+    let resp = app
+        .oneshot(
+            Request::post("/register")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://evil.test")
+                .body(Body::from(
+                    "identifier=alice&password=hunter2&next=http%3A%2F%2Flogin.test%2F",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

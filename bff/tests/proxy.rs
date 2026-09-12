@@ -10,6 +10,7 @@ use weaveauth_bff::server::app;
 fn login_request(redirect_uri: &str) -> Request<Body> {
     Request::post("/login")
         .header("content-type", "application/x-www-form-urlencoded")
+        .header("origin", "http://login.test")
         .body(Body::from(format!(
             "identifier=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
             url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>()
@@ -24,6 +25,7 @@ fn test_config(backend_url: String, routes: Vec<RouteConfig>) -> Config {
         backend_url,
         session_cookie_name: "wa_session".into(),
         routes,
+        trusted_origins: vec!["http://login.test".into()],
     }
 }
 
