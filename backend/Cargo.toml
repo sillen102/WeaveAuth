@@ -4,15 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.8"
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.7", features = ["trace"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", features = ["json"] }
+axum = { workspace = true }
+aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "scalar"] }
+tokio = { workspace = true, features = ["full"] }
+tower-http = { workspace = true, features = ["trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+reqwest = { workspace = true }
 jsonwebtoken = "11"
+chrono = { workspace = true, features = ["serde"] }
+sha2 = "0.11"
+base64 = "0.23"
+rand = "0.10"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true }
