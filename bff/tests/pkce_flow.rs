@@ -94,6 +94,7 @@ async fn stub_backend() -> (String, tokio::task::JoinHandle<()>) {
                     "refresh_token": "test-refresh-token",
                     "token_type": "Bearer",
                     "expires_at": chrono::Utc::now() + chrono::Duration::minutes(15),
+                    "user_id": uuid::Uuid::new_v4(),
                 }))
             }),
         );

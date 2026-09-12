@@ -104,20 +104,6 @@ Backend routes:
 
 Open items, in priority order (highest first):
 
-- [ ] **Access tokens carry no user identity — fix before JWKS/JWT work.**
-      `/oauth/authorize` consumes `login_session` (which resolves to a `user_id`) but
-      discards the returned id (`state.login_sessions.take_session(...).ok_or(...)?;`
-      in `authorize.rs`, result unused); the PKCE record it saves right after carries
-      `code_challenge`/`method`/`redirect_uri` only. `token.rs`'s `TokenResponse` has
-      no `sub`/`user_id` field, and bff's own `SessionData`
-      (`bff/src/model/session.rs`) is just `{access_token, refresh_token,
-      expires_at}`. So real authentication happens, and its result — *which* user — is
-      thrown away one line later and never reaches the code, the token, or bff's
-      session. Once JWTs are issued from `/oauth/token`, this is the difference
-      between a token with a real `sub` claim and an anonymous capability token any
-      resource server can't attribute to a user. Fix: thread the `user_id` from
-      `take_session` through the PKCE record (or a short-lived auth-code→user
-      mapping) so `/oauth/token` can put it in the response (and eventually the JWT).
 - [ ] **Username enumeration via login timing.** `login.rs`: an unknown `identifier`
       returns `401` immediately; a known one with a wrong password only fails after a
       full Argon2 hash (~50-200ms by design). That gap lets an attacker distinguish
@@ -170,10 +156,16 @@ Done:
 - [x] **Real user authentication** — `POST /oauth/login` verifies
       identifier/password (Argon2) against `UserStorage` and returns a single-use
       `login_session` that `/oauth/authorize` requires before it will issue a code,
-      so authentication is enforced server-side regardless of caller order (see the
-      first open item above for what this doesn't yet do: propagate *which* user).
+      so authentication is enforced server-side regardless of caller order.
       `POST /register` creates users. `login`'s static pages have real
       login/register forms.
+- [x] **Access tokens now carry user identity.** `/oauth/authorize` threads the
+      `user_id` `take_session` resolves into the PKCE record (`PkceStorage` now
+      stores/returns it alongside `code_challenge`/`method`/`redirect_uri`);
+      `/oauth/token`'s `TokenResponse` carries it as `user_id`, and bff's
+      `SessionData` carries it through to its own session store. A valid token can
+      now be attributed to the user who authenticated for it — this was the
+      prerequisite for JWKS/JWT work (a JWT can now get a real `sub` claim).
 
 ## Prerequisites
 

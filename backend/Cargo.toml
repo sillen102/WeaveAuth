@@ -8,7 +8,7 @@ common = { path = "../common" }
 
 axum = { workspace = true }
 aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "axum-form", "scalar"] }
-schemars = { workspace = true, features = ["chrono04"] }
+schemars = { workspace = true, features = ["chrono04", "uuid1"] }
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true }

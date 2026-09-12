@@ -13,6 +13,7 @@ mod controller {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
+    use uuid::Uuid;
 
     use crate::server::AppState;
     use crate::storage::PkceStorage;
@@ -36,6 +37,9 @@ mod controller {
         refresh_token: String,
         token_type: TokenType,
         expires_at: DateTime<Utc>,
+        /// The user this token was issued to -- carried through from the
+        /// `login_session` `/oauth/login` created, via the auth code.
+        pub(super) user_id: Uuid,
     }
 
     // OpenAPI documentation for this route.
@@ -53,7 +57,7 @@ mod controller {
         State(mut state): State<AppState>,
         Form(req): Form<TokenRequest>,
     ) -> Result<Json<TokenResponse>, StatusCode> {
-        let (challenge, _method, issued_redirect_uri) = state
+        let (challenge, _method, issued_redirect_uri, user_id) = state
             .pkce
             .take_code_challenge(&req.code)
             .await
@@ -82,6 +86,7 @@ mod controller {
             refresh_token,
             token_type: TokenType::Bearer,
             expires_at: Utc::now() + Duration::minutes(15),
+            user_id,
         }))
     }
 }
@@ -91,6 +96,7 @@ mod tests {
     use super::controller::*;
     use axum::extract::{Form, State};
     use axum::http::StatusCode;
+    use axum::Json;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
@@ -125,6 +131,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                uuid::Uuid::new_v4(),
             )
             .await;
         let req = TokenRequest {
@@ -136,6 +143,32 @@ mod tests {
         let result = issue_token(State(state), Form(req)).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_response_carries_the_user_id_the_code_was_issued_to() {
+        let mut state = state();
+        let verifier = "correct-verifier";
+        let user_id = uuid::Uuid::new_v4();
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = TokenRequest {
+            code: "code1".to_string(),
+            code_verifier: verifier.to_string(),
+            redirect_uri: "http://redirect.test".to_string(),
+        };
+
+        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+
+        assert_eq!(body.user_id, user_id);
     }
 
     #[tokio::test]
@@ -162,6 +195,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                uuid::Uuid::new_v4(),
             )
             .await;
         let req = TokenRequest {
@@ -185,6 +219,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                uuid::Uuid::new_v4(),
             )
             .await;
         let req = TokenRequest {
@@ -209,6 +244,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
+                uuid::Uuid::new_v4(),
             )
             .await;
         let first_req = TokenRequest {
