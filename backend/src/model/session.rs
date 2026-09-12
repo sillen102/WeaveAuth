@@ -23,3 +23,19 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_sets_user_id_and_leaves_tokens_empty() {
+        let user_id = Uuid::new_v4();
+        let session = Session::new(user_id);
+
+        assert_eq!(session.user_id, user_id);
+        assert_eq!(session.cookie, "");
+        assert_eq!(session.access_token, "");
+        assert_eq!(session.refresh_token, "");
+    }
+}

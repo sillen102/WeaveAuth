@@ -1,2 +1,50 @@
+monorepo_root = true
+
+[monorepo]
+config_roots = [
+    "backend",
+    "bff",
+    "login",
+    "testing/downstream-service",
+    "testing/user-service",
+]
+
 [tools]
 rust = "1.98"
+
+[tasks.test]
+depends = [
+    { task = "//backend:test" },
+    { task = "//bff:test" },
+    { task = "//login:test" },
+]
+
+[tasks.lint]
+description = "Run linters for all services and common code"
+depends = [
+    { task = "//backend:lint" },
+    { task = "//bff:lint" },
+    { task = "//login:lint" },
+]
+
+[tasks.services]
+description = "Run all services"
+depends = [
+    { task = "//backend:dev" },
+    { task = "//bff:dev" },
+    { task = "//login:dev" },
+]
+
+[tasks.test-apps]
+description = "Run applications in testing folder, meant for local testing only"
+depends = [
+    { task = "//testing/downstream-service:dev" },
+    { task = "//testing/user-service:dev" },
+]
+
+[tasks.all]
+description = "Run all applications, including testing apps"
+depends = [
+    { task = "services" },
+    { task = "test-apps" },
+]

@@ -24,4 +24,18 @@ impl User {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_has_empty_identifier_and_password() {
+        let user = User::default();
+        assert_eq!(user.identifier, "");
+        assert_eq!(user.password, "");
+    }
+
+    #[test]
+    fn default_generates_a_fresh_id_each_time() {
+        assert_ne!(User::default().id, User::default().id);
+    }
+}

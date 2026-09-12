@@ -1,0 +1,3 @@
+redirect_uri_allowlist:
+  - http://localhost:8080/downstream
+pkce_code_ttl_secs: 300

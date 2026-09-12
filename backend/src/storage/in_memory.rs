@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use crate::model::pkce::CodeChallengeMethod;
@@ -53,24 +54,39 @@ impl UserStorage for InMemoryUserStorage {
 
 #[derive(Clone)]
 pub(crate) struct InMemoryPkceStorage {
-    code_challenges: Arc<Mutex<HashMap<String, (String, CodeChallengeMethod)>>>,
+    code_challenges: Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String)>>>,
+    ttl_secs: i64,
 }
 
 impl InMemoryPkceStorage {
-    pub fn new() -> Self {
+    pub fn new(ttl_secs: i64) -> Self {
         Self {
             code_challenges: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
         }
     }
 }
 
 impl PkceStorage for InMemoryPkceStorage {
-    async fn save_code_challenge(&mut self, auth_code: String, code_challenge: String, code_challenge_method: CodeChallengeMethod) {
-        self.code_challenges.lock().await.insert(auth_code, (code_challenge, code_challenge_method));
+    async fn save_code_challenge(
+        &mut self,
+        auth_code: String,
+        code_challenge: String,
+        code_challenge_method: CodeChallengeMethod,
+        redirect_uri: String,
+    ) {
+        self.code_challenges
+            .lock()
+            .await
+            .insert(auth_code, (code_challenge, code_challenge_method, Utc::now(), redirect_uri));
     }
 
-    async fn take_code_challenge(&mut self, auth_code: &str) -> Option<(String, CodeChallengeMethod)> {
-        self.code_challenges.lock().await.remove(auth_code)
+    async fn take_code_challenge(&mut self, auth_code: &str) -> Option<(String, CodeChallengeMethod, String)> {
+        let (challenge, method, issued_at, redirect_uri) = self.code_challenges.lock().await.remove(auth_code)?;
+        if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
+            return None;
+        }
+        Some((challenge, method, redirect_uri))
     }
 }
 
@@ -134,24 +150,62 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_code_challenge() {
-        let mut storage = InMemoryPkceStorage::new();
+        let mut storage = InMemoryPkceStorage::new(300);
         let challenge = storage.take_code_challenge("test_code").await;
         assert!(challenge.is_none());
     }
 
     #[tokio::test]
     async fn test_save_code_challenge() {
-        let mut storage = InMemoryPkceStorage::new();
-        storage.save_code_challenge("test_code".to_string(), "test_challenge".to_string(), CodeChallengeMethod::S256).await;
+        let mut storage = InMemoryPkceStorage::new(300);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
         let challenge = storage.take_code_challenge("test_code").await;
-        assert_eq!(challenge, Some(("test_challenge".to_string(), CodeChallengeMethod::S256)));
+        assert_eq!(
+            challenge,
+            Some((
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string()
+            ))
+        );
     }
 
     #[tokio::test]
     async fn test_take_code_challenge_is_single_use() {
-        let mut storage = InMemoryPkceStorage::new();
-        storage.save_code_challenge("test_code".to_string(), "test_challenge".to_string(), CodeChallengeMethod::S256).await;
+        let mut storage = InMemoryPkceStorage::new(300);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
         storage.take_code_challenge("test_code").await;
+        let challenge = storage.take_code_challenge("test_code").await;
+        assert!(challenge.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_take_code_challenge_rejects_expired_entries() {
+        // A negative TTL means "expired the instant it's issued" -- avoids
+        // sleeping in the test to exercise the expiry branch.
+        let mut storage = InMemoryPkceStorage::new(-1);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+            )
+            .await;
         let challenge = storage.take_code_challenge("test_code").await;
         assert!(challenge.is_none());
     }

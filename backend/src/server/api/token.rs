@@ -19,6 +19,7 @@ mod controller {
     pub(crate) struct TokenRequest {
         code: String,
         code_verifier: String,
+        redirect_uri: String,
     }
 
     #[derive(Serialize)]
@@ -40,18 +41,28 @@ mod controller {
         op.tag("Auth")
             .id("token")
             .summary("Exchange an authorization code for tokens")
-            .description("Verifies code_verifier against the code_challenge stored at /oauth/authorize")
+            .description(
+                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
+                 and that redirect_uri matches the one the code was issued for",
+            )
     }
 
     pub(crate) async fn issue_token(
         State(mut state): State<AppState>,
         Form(req): Form<TokenRequest>,
     ) -> Result<Json<TokenResponse>, StatusCode> {
-        let (challenge, _method) = state
+        let (challenge, _method, issued_redirect_uri) = state
             .pkce
             .take_code_challenge(&req.code)
             .await
             .ok_or(StatusCode::BAD_REQUEST)?;
+
+        // Binds the code to the redirect_uri it was issued for (RFC 6749 4.1.3) --
+        // without this, a code obtained for one redirect_uri could be redeemed
+        // while claiming a different one.
+        if req.redirect_uri != issued_redirect_uri {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(req.code_verifier.as_bytes()));
         if computed != challenge {
@@ -72,6 +83,3 @@ mod controller {
         }))
     }
 }
-
-#[cfg(test)]
-mod tests {}

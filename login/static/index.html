@@ -10,7 +10,16 @@
   <main class="card">
     <h1>WeaveAuth</h1>
     <p>Sign in with your account to continue.</p>
-    <a class="btn" href="http://localhost:1983/oauth/login">Sign in</a>
+    <a class="btn" id="sign-in" href="/login?redirect_uri=http%3A%2F%2Flocalhost%3A8081%2F">Sign in</a>
   </main>
+  <script>
+    // Forward this page's own redirect_uri (if any) into the sign-in link,
+    // so a caller linking to /?redirect_uri=... gets sent back there after login.
+    var redirectUri = new URLSearchParams(window.location.search).get("redirect_uri");
+    if (redirectUri) {
+      var link = document.getElementById("sign-in");
+      link.href = "/login?redirect_uri=" + encodeURIComponent(redirectUri);
+    }
+  </script>
 </body>
 </html>

@@ -1,0 +1,15 @@
+[tasks.dev]
+description = "Run development in dev mode"
+run = "cargo run"
+
+[tasks.build]
+description = "Build the project"
+run = "cargo build"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.lint]
+description = "Run linters"
+run = "cargo clippy --all-targets -- -D warnings"

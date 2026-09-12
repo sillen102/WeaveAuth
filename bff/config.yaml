@@ -1,0 +1,7 @@
+session_cookie_name: wa_session
+# Requests whose path starts with `path_prefix` are proxied to `upstream_url`
+# (prefix stripped), with the session's access token swapped in as
+# `Authorization: Bearer <token>`, replacing the session cookie.
+routes:
+  - path_prefix: /downstream
+    upstream_url: http://localhost:10001

@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
 weaveauth &
+weaveauth-bff &
 weaveauth-login &
-weaveauth-frontend &
 wait

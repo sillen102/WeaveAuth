@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "frontend", "login"]
+members = ["backend", "bff", "login"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -16,3 +16,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 uuid = "1"
 chrono = "0.4"
+serde_yaml = "0.9"
+url = "2"
