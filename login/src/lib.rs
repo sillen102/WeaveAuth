@@ -1,28 +1,71 @@
-use std::env;
+#![forbid(unsafe_code)]
+#![deny(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::unwrap_in_result,
+    clippy::unnecessary_unwrap,
+    clippy::redundant_clone,
+    clippy::todo,
+    clippy::unimplemented
+)]
 
+use std::env;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use figment::providers::{Env, Serialized};
+use figment::Figment;
+use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
 const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
     pub bff_url: String,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            port: 8081,
+            bff_url: "http://localhost:8080".to_string(),
+        }
+    }
+}
+
 impl Config {
+    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` env vars, falling back
+    /// to defaults for anything unset.
     pub fn load() -> Self {
-        let port = env::var("WA_LOGIN_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(8081);
-        let bff_url = env::var("WA_BFF_URL").unwrap_or_else(|_| "http://localhost:8080".into());
-        Self { port, bff_url }
+        let defaults = Config::default();
+
+        let mut config: Config = Figment::from(Serialized::defaults(defaults.clone()))
+            // `WA_LOGIN_PORT` needs parse-or-fallback semantics (an invalid
+            // value should keep the default rather than fail the whole
+            // config), so it's applied by hand below instead.
+            .merge(
+                Env::raw()
+                    .map(|k| match k.as_str() {
+                        "WA_BFF_URL" => "bff_url".into(),
+                        _ => "_ignored".into(),
+                    })
+                    .ignore(&["_ignored"]),
+            )
+            .extract()
+            .unwrap_or(defaults);
+
+        if let Some(port) = env::var("WA_LOGIN_PORT").ok().and_then(|p| p.parse().ok()) {
+            config.port = port;
+        }
+
+        config
     }
 }
 
@@ -49,74 +92,38 @@ async fn config_js(State(config): State<Config>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// `Config::load()` reads process-global env vars, so tests that touch them
-    /// must not run concurrently with each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        keys: Vec<&'static str>,
-    }
-
-    impl EnvGuard {
-        fn set(pairs: &[(&'static str, &str)]) -> Self {
-            for (k, v) in pairs {
-                unsafe { env::set_var(k, v) };
-            }
-            Self {
-                keys: pairs.iter().map(|(k, _)| *k).collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for k in &self.keys {
-                unsafe { env::remove_var(k) };
-            }
-        }
-    }
-
-    const ALL_KEYS: &[&str] = &["WA_LOGIN_PORT", "WA_BFF_URL"];
-
-    fn clear_env() -> EnvGuard {
-        for k in ALL_KEYS {
-            unsafe { env::remove_var(k) };
-        }
-        EnvGuard { keys: vec![] }
-    }
+    use figment::Jail;
 
     #[test]
     fn defaults_when_no_env_set() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _clear = clear_env();
-
-        let config = Config::load();
-        assert_eq!(config.port, 8081);
-        assert_eq!(config.bff_url, "http://localhost:8080");
+        Jail::expect_with(|_jail| {
+            let config = Config::load();
+            assert_eq!(config.port, 8081);
+            assert_eq!(config.bff_url, "http://localhost:8080");
+            Ok(())
+        });
     }
 
     #[test]
     fn env_vars_override_defaults() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _clear = clear_env();
-        let _guard = EnvGuard::set(&[
-            ("WA_LOGIN_PORT", "9999"),
-            ("WA_BFF_URL", "http://bff.env.test"),
-        ]);
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_LOGIN_PORT", "9999");
+            jail.set_env("WA_BFF_URL", "http://bff.env.test");
 
-        let config = Config::load();
-        assert_eq!(config.port, 9999);
-        assert_eq!(config.bff_url, "http://bff.env.test");
+            let config = Config::load();
+            assert_eq!(config.port, 9999);
+            assert_eq!(config.bff_url, "http://bff.env.test");
+            Ok(())
+        });
     }
 
     #[test]
     fn invalid_port_falls_back_to_default() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _clear = clear_env();
-        let _guard = EnvGuard::set(&[("WA_LOGIN_PORT", "not-a-port")]);
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_LOGIN_PORT", "not-a-port");
 
-        assert_eq!(Config::load().port, 8081);
+            assert_eq!(Config::load().port, 8081);
+            Ok(())
+        });
     }
 }

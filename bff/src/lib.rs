@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![deny(
     dead_code,
     clippy::unwrap_used,
