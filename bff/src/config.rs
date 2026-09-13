@@ -26,6 +26,12 @@ pub struct Config {
     /// auto-submit one and log a victim into an attacker-controlled account
     /// ("login CSRF").
     pub trusted_origins: Vec<String>,
+    /// Max `/login` or `/register` attempts a single client IP gets within
+    /// `rate_limit_window_secs`, independently for each endpoint -- Argon2 raises
+    /// the cost of a single guess, but doesn't stop a flood of guesses or
+    /// registration spam on its own.
+    pub rate_limit_max_attempts: u32,
+    pub rate_limit_window_secs: u64,
 }
 
 /// Optional YAML overlay, read before env vars are applied. Path is
@@ -39,6 +45,8 @@ struct FileConfig {
     #[serde(default)]
     routes: Vec<RouteConfig>,
     trusted_origins: Option<Vec<String>>,
+    rate_limit_max_attempts: Option<u32>,
+    rate_limit_window_secs: Option<u64>,
 }
 
 fn load_file_config() -> Result<FileConfig, anyhow::Error> {
@@ -80,6 +88,16 @@ impl Config {
             })
             .or(file.trusted_origins)
             .unwrap_or_else(|| vec!["http://localhost:8081".to_string()]);
+        let rate_limit_max_attempts = env::var("WA_RATE_LIMIT_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.rate_limit_max_attempts)
+            .unwrap_or(10);
+        let rate_limit_window_secs = env::var("WA_RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.rate_limit_window_secs)
+            .unwrap_or(60);
 
         Ok(Self {
             port,
@@ -88,6 +106,8 @@ impl Config {
             session_cookie_name,
             routes: file.routes,
             trusted_origins,
+            rate_limit_max_attempts,
+            rate_limit_window_secs,
         })
     }
 }
@@ -130,6 +150,8 @@ mod tests {
         "WA_BACKEND_URL",
         "WA_SESSION_COOKIE_NAME",
         "WA_TRUSTED_ORIGINS",
+        "WA_RATE_LIMIT_MAX_ATTEMPTS",
+        "WA_RATE_LIMIT_WINDOW_SECS",
         "WA_CONFIG_FILE",
     ];
 
@@ -163,6 +185,8 @@ mod tests {
         assert_eq!(config.session_cookie_name, "wa_session");
         assert!(config.routes.is_empty());
         assert_eq!(config.trusted_origins, vec!["http://localhost:8081".to_string()]);
+        assert_eq!(config.rate_limit_max_attempts, 10);
+        assert_eq!(config.rate_limit_window_secs, 60);
     }
 
     #[test]
@@ -180,6 +204,8 @@ routes:
     upstream_url: http://upstream.file.test
 trusted_origins:
   - "http://file-login.test"
+rate_limit_max_attempts: 5
+rate_limit_window_secs: 30
 "#,
         );
         let _guard = EnvGuard::set(&[("WA_CONFIG_FILE", path.to_str().unwrap())]);
@@ -200,6 +226,8 @@ trusted_origins:
             config.trusted_origins,
             vec!["http://file-login.test".to_string()]
         );
+        assert_eq!(config.rate_limit_max_attempts, 5);
+        assert_eq!(config.rate_limit_window_secs, 30);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -269,6 +297,29 @@ trusted_origins:
             config.trusted_origins,
             vec!["http://a.test".to_string(), "http://b.test".to_string()]
         );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_env_vars_override_file_values() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clear = clear_env();
+        let path = temp_yaml(
+            r#"
+rate_limit_max_attempts: 5
+rate_limit_window_secs: 30
+"#,
+        );
+        let _guard = EnvGuard::set(&[
+            ("WA_CONFIG_FILE", path.to_str().unwrap()),
+            ("WA_RATE_LIMIT_MAX_ATTEMPTS", "3"),
+            ("WA_RATE_LIMIT_WINDOW_SECS", "15"),
+        ]);
+
+        let config = Config::load().unwrap();
+        assert_eq!(config.rate_limit_max_attempts, 3);
+        assert_eq!(config.rate_limit_window_secs, 15);
 
         std::fs::remove_file(path).unwrap();
     }

@@ -1,7 +1,9 @@
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
+use std::net::SocketAddr;
 use tower::ServiceExt;
 use weaveauth_bff::config::Config;
 use weaveauth_bff::server::app;
@@ -14,7 +16,18 @@ fn test_config(backend_url: String) -> Config {
         session_cookie_name: "wa_session".into(),
         routes: vec![],
         trusted_origins: vec!["http://login.test".into()],
+        rate_limit_max_attempts: 1000,
+        rate_limit_window_secs: 60,
     }
+}
+
+/// The rate limiter keys on `ConnectInfo<SocketAddr>`, which `axum::serve`
+/// only populates via `into_make_service_with_connect_info` -- these tests
+/// call the router directly via `oneshot`, so it has to be inserted by hand.
+fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    req
 }
 
 fn login_form_body(redirect_uri: &str) -> Body {
@@ -25,11 +38,13 @@ fn login_form_body(redirect_uri: &str) -> Body {
 }
 
 fn login_request(redirect_uri: &str) -> Request<Body> {
-    Request::post("/login")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("origin", "http://login.test")
-        .body(login_form_body(redirect_uri))
-        .unwrap()
+    with_test_peer(
+        Request::post("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "http://login.test")
+            .body(login_form_body(redirect_uri))
+            .unwrap(),
+    )
 }
 
 /// Minimal `application/x-www-form-urlencoded` value escaping -- just enough
@@ -157,7 +172,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() {
     let app = app(test_config(format!("http://{addr}")));
 
     let resp = app
-        .oneshot(
+        .oneshot(with_test_peer(
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
@@ -165,7 +180,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() {
                     "identifier=alice&password=wrong&redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -182,13 +197,13 @@ async fn login_requires_redirect_uri() {
     let app = app(test_config(backend));
 
     let resp = app
-        .oneshot(
+        .oneshot(with_test_peer(
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
                 .body(Body::from("identifier=alice&password=hunter2"))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -320,13 +335,13 @@ async fn login_rejects_an_untrusted_origin_before_touching_backend() {
     let app = app(test_config(format!("http://{addr}")));
 
     let resp = app
-        .oneshot(
+        .oneshot(with_test_peer(
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://evil.test")
                 .body(login_form_body("http://admin.test/"))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 

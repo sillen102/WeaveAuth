@@ -34,7 +34,13 @@ pub async fn app_start(config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, app(config)).await?;
+    // with_connect_info: the rate limiter keys on the real client IP
+    // (extract::ConnectInfo), not a spoofable header.
+    axum::serve(
+        listener,
+        app(config).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

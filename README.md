@@ -72,14 +72,18 @@ future direct caller (e.g. an SPA built straight against backend, bypassing bff)
 skipping authentication by calling things in the wrong order — the ordering is enforced
 by backend's own state, not by convention.
 
-bff routes:
+bff routes. Two independent per-IP rate-limit buckets (`tower_governor`, see TODO
+ledger) sit in front: one shared by `/login` + `/register`, one shared by every
+proxied route — hammering one side can't burn the other's budget. `/health` is
+exempt (a cheap liveness check infra commonly polls, shouldn't get caught in either
+bucket):
 
-| Method | Path                         | Returns                                                                                                                                                                                                                      |
-|--------|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`                    | `ok`                                                                                                                                                                                                                         |
-| POST   | `/login`                     | Form `{identifier, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `422` if a required field is missing |
-| POST   | `/register`                  | Form `{identifier, password, next}`. Forwards to backend, 303 → `next` (success) or `next?error=1` (failure, e.g. taken identifier); `403` if `Origin`/`Referer` isn't in `trusted_origins`                                  |
-| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches                                                         |
+| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                     |
+|--------|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                        |
+| POST   | `/login`                     | Form `{identifier, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing |
+| POST   | `/register`                  | Form `{identifier, password, next}`. Forwards to backend, 303 → `next` (success) or `next?error=1` (failure, e.g. taken identifier); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                          |
+| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                |
 
 login routes:
 
@@ -104,9 +108,6 @@ Backend routes:
 
 Open items, in priority order (highest first):
 
-- [ ] **No rate limiting.** `/oauth/login`, `/register`, `/oauth/token` have no
-      attempt throttling. Argon2 raises the cost per guess but doesn't stop
-      distributed brute-forcing or registration spam.
 - [ ] **No server-side password policy.** `minlength="8"` on `register.html` is
       client-side only; `register.rs` accepts any length, including empty, via a
       direct API call.
@@ -173,6 +174,19 @@ Done:
       `trusted_origins` (`WA_TRUSTED_ORIGINS`) before doing anything else —
       `403` if it's missing or not on the list. A hostile site can no longer
       auto-submit a login/register form to bff and have it processed.
+- [x] **Rate limiting on bff's auth endpoints and proxy layer.** Per-IP limiting via
+      [`tower_governor`](https://crates.io/crates/tower_governor) (a GCRA/leaky-bucket
+      limiter built on the widely-used `governor` crate — chosen over rolling a
+      custom limiter or reaching for a younger/unproven crate; see commit history
+      for the comparison), applied as two independent `tower` layers, each with its
+      own bucket per peer IP (`WA_RATE_LIMIT_MAX_ATTEMPTS` / `WA_RATE_LIMIT_WINDOW_SECS`,
+      default 10 attempts/60s for both): one shared by `/login` + `/register`, one
+      shared by every proxied route — hammering the proxy layer can't burn the auth
+      bucket or vice versa. `/health` is exempt from both (a cheap liveness check
+      infra commonly polls at its own cadence). Only bff needed this — backend's
+      `/oauth/login`, `/register`, `/oauth/token` aren't directly internet-reachable
+      (see Architecture above), so bff is the only actual attack surface for
+      credential-stuffing/registration-spam volume.
 
 ## Prerequisites
 
@@ -254,20 +268,22 @@ exercising bff's proxy):
   saves the JSON body in memory under a generated `id` and returns it (`201`). `cargo
   run` in that directory, `$PORT` default `10002`.
 
-| Variable                    | App          | Default                         | Description                                                                                                                                                                                                                                    |
-|-----------------------------|--------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `WA_CONFIG_FILE`            | backend, bff | `config.yaml` (relative to cwd) | Path to the optional YAML config overlay                                                                                                                                                                                                       |
-| `WA_PORT`                   | backend      | `1983`                          | Backend listen port                                                                                                                                                                                                                            |
-| `WA_REDIRECT_URI_ALLOWLIST` | backend      | `http://localhost:8081/`        | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`                                                                                                        |
-| `WA_PKCE_CODE_TTL_SECS`     | backend      | `300`                           | How long an issued auth code stays redeemable                                                                                                                                                                                                  |
-| `WA_LOGIN_SESSION_TTL_SECS` | backend      | `60`                            | How long a `/oauth/login` session token stays valid for the follow-up `/oauth/authorize` call — just a server-to-server hop, so short-lived                                                                                                    |
-| `WA_LOGIN_PORT`             | login        | `8081`                          | Login page listen port                                                                                                                                                                                                                         |
-| `WA_BFF_PORT`               | bff          | `8080`                          | bff listen port                                                                                                                                                                                                                                |
-| `WA_BFF_URL`                | bff, login   | `http://localhost:8080`         | Public base URL of the bff, used by login to redirect into it                                                                                                                                                                                  |
-| `WA_BACKEND_URL`            | bff          | `http://localhost:1983`         | Backend base URL the bff exchanges codes against                                                                                                                                                                                               |
-| `WA_SESSION_COOKIE_NAME`    | bff          | `wa_session`                    | Name of the HttpOnly session cookie set after login                                                                                                                                                                                            |
-| `WA_TRUSTED_ORIGINS`        | bff          | `http://localhost:8081`         | Comma-separated origins allowed to POST to `/login`/`/register` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF") |
-| `WA_CLAIM_ENRICHMENT_URL`   | backend      | *(unset)*                       | Optional upstream claim-enrichment endpoint (unused yet)                                                                                                                                                                                       |
+| Variable                     | App          | Default                         | Description                                                                                                                                                                                                                                    |
+|------------------------------|--------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `WA_CONFIG_FILE`             | backend, bff | `config.yaml` (relative to cwd) | Path to the optional YAML config overlay                                                                                                                                                                                                       |
+| `WA_PORT`                    | backend      | `1983`                          | Backend listen port                                                                                                                                                                                                                            |
+| `WA_REDIRECT_URI_ALLOWLIST`  | backend      | `http://localhost:8081/`        | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`                                                                                                        |
+| `WA_PKCE_CODE_TTL_SECS`      | backend      | `300`                           | How long an issued auth code stays redeemable                                                                                                                                                                                                  |
+| `WA_LOGIN_SESSION_TTL_SECS`  | backend      | `60`                            | How long a `/oauth/login` session token stays valid for the follow-up `/oauth/authorize` call — just a server-to-server hop, so short-lived                                                                                                    |
+| `WA_LOGIN_PORT`              | login        | `8081`                          | Login page listen port                                                                                                                                                                                                                         |
+| `WA_BFF_PORT`                | bff          | `8080`                          | bff listen port                                                                                                                                                                                                                                |
+| `WA_BFF_URL`                 | bff, login   | `http://localhost:8080`         | Public base URL of the bff, used by login to redirect into it                                                                                                                                                                                  |
+| `WA_BACKEND_URL`             | bff          | `http://localhost:1983`         | Backend base URL the bff exchanges codes against                                                                                                                                                                                               |
+| `WA_SESSION_COOKIE_NAME`     | bff          | `wa_session`                    | Name of the HttpOnly session cookie set after login                                                                                                                                                                                            |
+| `WA_TRUSTED_ORIGINS`         | bff          | `http://localhost:8081`         | Comma-separated origins allowed to POST to `/login`/`/register` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF") |
+| `WA_RATE_LIMIT_MAX_ATTEMPTS` | bff          | `10`                            | Burst size for `/login`/`/register`'s per-IP rate limit (`tower_governor`) — independent bucket per route                                                                                                                                      |
+| `WA_RATE_LIMIT_WINDOW_SECS`  | bff          | `60`                            | Approximate window the burst size applies over; replenishes at `max_attempts / window_secs` per second                                                                                                                                         |
+| `WA_CLAIM_ENRICHMENT_URL`    | backend      | *(unset)*                       | Optional upstream claim-enrichment endpoint (unused yet)                                                                                                                                                                                       |
 
 ## Testing
 
