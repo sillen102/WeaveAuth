@@ -14,6 +14,9 @@ pub struct Config {
     pub login_session_ttl_secs: i64,
     /// How long an access token issued by `/oauth/token` stays valid for.
     pub access_token_ttl_secs: i64,
+    /// How long a refresh token stays redeemable before it must be re-issued
+    /// via a fresh login.
+    pub refresh_token_ttl_secs: i64,
 }
 
 impl Default for Config {
@@ -24,6 +27,7 @@ impl Default for Config {
             pkce_code_ttl_secs: 300,
             login_session_ttl_secs: 60,
             access_token_ttl_secs: 900,
+            refresh_token_ttl_secs: 2_592_000,
         }
     }
 }
@@ -74,6 +78,7 @@ mod tests {
             assert_eq!(config.pkce_code_ttl_secs, 300);
             assert_eq!(config.login_session_ttl_secs, 60);
             assert_eq!(config.access_token_ttl_secs, 900);
+            assert_eq!(config.refresh_token_ttl_secs, 2_592_000);
             Ok(())
         });
     }
@@ -83,7 +88,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\n",
+                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
@@ -96,6 +101,7 @@ mod tests {
             assert_eq!(config.pkce_code_ttl_secs, 42);
             assert_eq!(config.login_session_ttl_secs, 30);
             assert_eq!(config.access_token_ttl_secs, 120);
+            assert_eq!(config.refresh_token_ttl_secs, 86400);
             Ok(())
         });
     }
@@ -105,7 +111,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\n",
+                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
             jail.set_env("WA_PORT", "7000");
@@ -113,6 +119,7 @@ mod tests {
             jail.set_env("WA_PKCE_CODE_TTL_SECS", "11");
             jail.set_env("WA_LOGIN_SESSION_TTL_SECS", "5");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "3");
+            jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "7");
 
             let config = Config::load().unwrap();
             assert_eq!(config.port, 7000);
@@ -123,6 +130,7 @@ mod tests {
             assert_eq!(config.pkce_code_ttl_secs, 11);
             assert_eq!(config.login_session_ttl_secs, 5);
             assert_eq!(config.access_token_ttl_secs, 3);
+            assert_eq!(config.refresh_token_ttl_secs, 7);
             Ok(())
         });
     }

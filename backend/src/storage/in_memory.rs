@@ -1,7 +1,10 @@
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
-use crate::storage::{JwkStorage, LoginSessionStorage, PkceStorage, UserStorage};
+use crate::storage::{
+    JwkStorage, LoginSessionStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
+    UserStorage,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -153,15 +156,78 @@ impl LoginSessionStorage for InMemoryLoginSessionStorage {
     }
 }
 
+struct RefreshTokenRecord {
+    user_id: Uuid,
+    family_id: Uuid,
+    issued_at: DateTime<Utc>,
+    used: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct InMemoryRefreshTokenStorage {
+    tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
+    ttl_secs: i64,
+}
+
+impl InMemoryRefreshTokenStorage {
+    pub fn new(ttl_secs: i64) -> Self {
+        Self {
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
+        }
+    }
+}
+
+impl RefreshTokenStorage for InMemoryRefreshTokenStorage {
+    async fn save_refresh_token(&mut self, token: String, user_id: Uuid, family_id: Uuid) {
+        self.tokens.lock().await.insert(
+            token,
+            RefreshTokenRecord {
+                user_id,
+                family_id,
+                issued_at: Utc::now(),
+                used: false,
+            },
+        );
+    }
+
+    async fn take_refresh_token(&mut self, token: &str) -> RefreshTokenOutcome {
+        let mut tokens = self.tokens.lock().await;
+        let Some(record) = tokens.get_mut(token) else {
+            return RefreshTokenOutcome::NotFound;
+        };
+
+        if (Utc::now() - record.issued_at).num_seconds() > self.ttl_secs {
+            tokens.remove(token);
+            return RefreshTokenOutcome::NotFound;
+        }
+
+        if record.used {
+            let family_id = record.family_id;
+            tokens.retain(|_, r| r.family_id != family_id);
+            return RefreshTokenOutcome::Reused;
+        }
+
+        record.used = true;
+        RefreshTokenOutcome::Valid {
+            user_id: record.user_id,
+            family_id: record.family_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::User;
     use crate::storage::in_memory::{
-        InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
+        InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
+        InMemoryUserStorage,
     };
-    use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
+    use crate::storage::{
+        LoginSessionStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage,
+    };
 
     #[tokio::test]
     async fn test_create_user() {
@@ -300,5 +366,73 @@ mod tests {
         let token = storage.create_session(Uuid::new_v4()).await;
 
         assert_eq!(storage.take_session(&token).await, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_token_round_trips_to_the_user_and_family_it_was_saved_with() {
+        let mut storage = InMemoryRefreshTokenStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let family_id = Uuid::new_v4();
+        storage
+            .save_refresh_token("token1".to_string(), user_id, family_id)
+            .await;
+
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::Valid { user_id, family_id }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_is_detected_and_revokes_the_whole_family() {
+        let mut storage = InMemoryRefreshTokenStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let family_id = Uuid::new_v4();
+        storage
+            .save_refresh_token("token1".to_string(), user_id, family_id)
+            .await;
+
+        // Legitimate rotation: token1 -> token2, same family.
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::Valid { user_id, family_id }
+        );
+        storage
+            .save_refresh_token("token2".to_string(), user_id, family_id)
+            .await;
+
+        // token1 gets replayed (stale client or a thief) -- reuse detected.
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::Reused
+        );
+
+        // The whole family is now dead, including the still-unused sibling.
+        assert_eq!(
+            storage.take_refresh_token("token2").await,
+            RefreshTokenOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_rejects_unknown_token() {
+        let mut storage = InMemoryRefreshTokenStorage::new(60);
+        assert_eq!(
+            storage.take_refresh_token("no-such-token").await,
+            RefreshTokenOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_rejects_expired_entries() {
+        let mut storage = InMemoryRefreshTokenStorage::new(-1);
+        storage
+            .save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4())
+            .await;
+
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::NotFound
+        );
     }
 }

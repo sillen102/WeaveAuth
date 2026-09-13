@@ -95,7 +95,6 @@ mod controller {
 mod tests {
     use super::controller::*;
     use axum::extract::{Query, State};
-    use axum::http::StatusCode;
     use axum::response::{IntoResponse, Redirect};
     use std::sync::Arc;
 
@@ -120,6 +119,7 @@ mod tests {
             redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
             jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
+            refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
         };
         (state, login_session, user_id)
     }

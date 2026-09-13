@@ -55,3 +55,27 @@ pub(crate) trait PkceStorage {
         code: &str,
     ) -> Option<(String, CodeChallengeMethod, String, Uuid)>;
 }
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RefreshTokenOutcome {
+    /// Token was valid and unused; now consumed. Carries the user and the
+    /// token family so the caller can mint the next token in the same chain.
+    Valid { user_id: Uuid, family_id: Uuid },
+    /// Token was already used once before. This is either the legitimate
+    /// client re-sending a stale token, or an attacker replaying a stolen
+    /// one -- either way the chain is no longer trustworthy, so the storage
+    /// impl revokes every other token in the family as a side effect of
+    /// returning this variant.
+    Reused,
+    /// Unknown, already-revoked, or expired.
+    NotFound,
+}
+
+/// A single-use, rotating credential that redeems a fresh access token
+/// without re-authenticating (RFC 6749 6). Each refresh mints a new token in
+/// the same `family_id`; presenting an already-used token is treated as a
+/// signal the family is compromised (see `RefreshTokenOutcome::Reused`).
+pub(crate) trait RefreshTokenStorage {
+    async fn save_refresh_token(&mut self, token: String, user_id: Uuid, family_id: Uuid);
+    async fn take_refresh_token(&mut self, token: &str) -> RefreshTokenOutcome;
+}

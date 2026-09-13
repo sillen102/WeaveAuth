@@ -4,13 +4,12 @@ pub(crate) use controller::login_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use argon2::password_hash::phc::PasswordHash;
-    use argon2::{PasswordHasher, PasswordVerifier};
+    use argon2::PasswordVerifier;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
-    use std::sync::LazyLock;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
@@ -24,12 +23,13 @@ mod controller {
     /// attacker can enumerate valid usernames purely from response timing (a
     /// known identifier with a wrong password pays for a full Argon2 hash before
     /// failing; an unknown one previously failed immediately).
-    static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
-        ARGON2
-            .hash_password(b"not-a-real-password")
-            .expect("hashing a fixed password never fails")
-            .to_string()
-    });
+    ///
+    /// A fixed literal, not computed at startup: hashing is fallible in
+    /// principle (clippy denies the `expect()` that would be needed to unwrap
+    /// it), and there's no benefit to hashing a constant input at runtime --
+    /// it always produces a hash with the same cost, whether computed once
+    /// at build time or once at first request.
+    const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$+asaoNd4judQBozzpttaCQ$WFrspw+VJ+HAPOXqRwravZFYap0GT3yyfgRf5ZVv6qc";
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
@@ -67,7 +67,7 @@ mod controller {
         // other task while it hashes.
         let hash_str = user
             .as_ref()
-            .map_or_else(|| DUMMY_PASSWORD_HASH.clone(), |u| u.password.clone());
+            .map_or_else(|| DUMMY_PASSWORD_HASH.to_string(), |u| u.password.clone());
         let password = req.password;
         let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
             let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
@@ -134,6 +134,7 @@ mod tests {
             redirect_uri_allowlist: Arc::new(vec![]),
             jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
+            refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
         }
     }
 
