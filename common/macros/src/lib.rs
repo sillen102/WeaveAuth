@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![deny(
     dead_code,
     clippy::unwrap_used,
@@ -10,6 +11,14 @@
     clippy::redundant_clone,
     clippy::todo,
     clippy::unimplemented
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
 )]
 
 use proc_macro::TokenStream;

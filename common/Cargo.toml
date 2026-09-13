@@ -3,6 +3,9 @@ name = "common"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+auth = []
+
 [dependencies]
 axum = { workspace =  true }
 http = { workspace = true }

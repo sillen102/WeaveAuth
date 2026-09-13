@@ -81,7 +81,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                     std::collections::HashMap<String, String>,
                 >| async move {
                     assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
-                    assert!(q.get("code_challenge").is_some());
+                    assert!(q.contains_key("code_challenge"));
                     assert_eq!(
                         q.get("code_challenge_method").map(String::as_str),
                         Some("S256")
@@ -126,7 +126,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
 async fn login_exchanges_code_sets_session_cookie_and_redirects_without_token_in_url()
 -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app.oneshot(login_request("http://admin.test/")?).await?;
 
@@ -171,7 +171,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() -> anyhow::
         let _ = axum::serve(listener, router).await;
     });
 
-    let app = app(test_config(format!("http://{addr}")));
+    let app = app(test_config(format!("http://{addr}"))).unwrap();
 
     let resp = app
         .oneshot(with_test_peer(
@@ -195,7 +195,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() -> anyhow::
 #[tokio::test]
 async fn login_requires_redirect_uri() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app
         .oneshot(with_test_peer(
@@ -218,7 +218,7 @@ async fn login_forwards_redirect_uri_to_backend_and_rejects_when_backend_does() 
     // A rejected redirect_uri (no code, no token) surfaces as 400, not a generic
     // gateway failure.
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app.oneshot(login_request("http://evil.test/")?).await?;
 
@@ -232,7 +232,7 @@ async fn login_rejects_redirect_uri_backend_does_not_allowlist_even_when_it_poin
     // A redirect_uri pointing at bff's own proxy routes (e.g. /downstream) fails
     // unless backend's allowlist includes it.
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app
         .oneshot(login_request("http://bff.test/downstream")?)
@@ -254,7 +254,7 @@ async fn login_returns_bad_gateway_when_backend_is_unreachable_or_broken() -> an
         let _ = axum::serve(listener, router).await;
     });
 
-    let app = app(test_config(format!("http://{addr}")));
+    let app = app(test_config(format!("http://{addr}"))).unwrap();
 
     let resp = app.oneshot(login_request("http://admin.test/")?).await?;
 
@@ -271,7 +271,7 @@ async fn login_returns_bad_gateway_when_login_response_is_not_valid_json() -> an
         let _ = axum::serve(listener, router).await;
     });
 
-    let app = app(test_config(format!("http://{addr}")));
+    let app = app(test_config(format!("http://{addr}"))).unwrap();
 
     let resp = app.oneshot(login_request("http://admin.test/")?).await?;
 
@@ -307,7 +307,7 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() -> anyhow
         let _ = axum::serve(listener, router).await;
     });
 
-    let app = app(test_config(format!("http://{addr}")));
+    let app = app(test_config(format!("http://{addr}"))).unwrap();
 
     let resp = app.oneshot(login_request("http://admin.test/")?).await?;
 
@@ -318,7 +318,7 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() -> anyhow
 #[tokio::test]
 async fn login_never_redirects_the_browser_to_backend() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend.clone()));
+    let app = app(test_config(backend.clone())).unwrap();
 
     let resp = app.oneshot(login_request("http://admin.test/")?).await?;
 

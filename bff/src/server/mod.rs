@@ -15,17 +15,16 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(config: Config) -> Self {
-        Self {
+    pub(crate) fn new(config: Config) -> anyhow::Result<Self> {
+        Ok(Self {
             config: Arc::new(config),
             sessions: InMemorySessionStorage::new(),
             // No auto-follow: /login needs the raw 303 from backend's
             // /oauth/authorize to read `code` out of its Location header itself.
             http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("http client"),
-        }
+                .build()?,
+        })
     }
 }
 
@@ -38,13 +37,13 @@ pub async fn app_start(config: Config) -> anyhow::Result<()> {
     // (extract::ConnectInfo), not a spoofable header.
     axum::serve(
         listener,
-        app(config).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app(config)?.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
     Ok(())
 }
 
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.
-pub fn app(config: Config) -> axum::Router {
-    router(AppState::new(config))
+pub fn app(config: Config) -> anyhow::Result<axum::Router> {
+    router(AppState::new(config)?)
 }

@@ -11,6 +11,14 @@
     clippy::todo,
     clippy::unimplemented
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::env;
 use axum::extract::State;
@@ -90,6 +98,9 @@ async fn config_js(State(config): State<Config>) -> impl IntoResponse {
 }
 
 #[cfg(test)]
+// figment::Jail::expect_with's closure signature is fixed by the crate; its
+// Result<(), figment::Error> can't be shrunk from call sites.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use figment::Jail;

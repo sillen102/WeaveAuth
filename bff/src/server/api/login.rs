@@ -252,6 +252,7 @@ mod tests {
             rate_limit_max_attempts: 1000,
             rate_limit_window_secs: 60,
         })
+        .expect("valid app state")
     }
 
     #[tokio::test]

@@ -70,10 +70,12 @@ impl UserStorage for InMemoryUserStorage {
     }
 }
 
+/// auth_code -> (code_challenge, method, issued_at, redirect_uri, user_id)
+type PkceEntries = HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String, Uuid)>;
+
 #[derive(Clone)]
 pub(crate) struct InMemoryPkceStorage {
-    code_challenges:
-        Arc<Mutex<HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String, Uuid)>>>,
+    code_challenges: Arc<Mutex<PkceEntries>>,
     ttl_secs: i64,
 }
 
@@ -120,9 +122,12 @@ impl PkceStorage for InMemoryPkceStorage {
     }
 }
 
+/// session_id -> (user_id, issued_at)
+type LoginSessionEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
+
 #[derive(Clone)]
 pub(crate) struct InMemoryLoginSessionStorage {
-    sessions: Arc<Mutex<HashMap<String, (Uuid, DateTime<Utc>)>>>,
+    sessions: Arc<Mutex<LoginSessionEntries>>,
     ttl_secs: i64,
 }
 
