@@ -44,13 +44,11 @@ mod controller {
             .await
             .ok_or(ProxyError::Unauthenticated)?;
 
+        let auth_value = format!("{} {}", TokenType::Bearer, session.access_token)
+            .parse()
+            .map_err(|_| ProxyError::Unauthenticated)?;
         req.headers_mut().remove(header::COOKIE);
-        req.headers_mut().insert(
-            header::AUTHORIZATION,
-            format!("{} {}", TokenType::Bearer, session.access_token)
-                .parse()
-                .expect("bearer token is a valid header value"),
-        );
+        req.headers_mut().insert(header::AUTHORIZATION, auth_value);
 
         Ok(next.run(req).await)
     }
@@ -79,10 +77,10 @@ mod tests {
     use super::controller::*;
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    fn headers_with_cookie(value: &str) -> HeaderMap {
+    fn headers_with_cookie(value: &str) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, HeaderValue::from_str(value).unwrap());
-        headers
+        headers.insert(header::COOKIE, HeaderValue::from_str(value)?);
+        Ok(headers)
     }
 
     #[test]
@@ -92,20 +90,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_cookie_finds_the_named_cookie_among_several() {
-        let headers = headers_with_cookie("other=1; wa_session=abc123; another=2");
+    fn extract_cookie_finds_the_named_cookie_among_several() -> anyhow::Result<()> {
+        let headers = headers_with_cookie("other=1; wa_session=abc123; another=2")?;
         assert_eq!(extract_cookie(&headers, "wa_session"), Some("abc123".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn extract_cookie_returns_none_when_name_is_absent() {
-        let headers = headers_with_cookie("other=1; another=2");
+    fn extract_cookie_returns_none_when_name_is_absent() -> anyhow::Result<()> {
+        let headers = headers_with_cookie("other=1; another=2")?;
         assert_eq!(extract_cookie(&headers, "wa_session"), None);
+        Ok(())
     }
 
     #[test]
-    fn extract_cookie_handles_a_single_cookie_with_no_semicolons() {
-        let headers = headers_with_cookie("wa_session=only-one");
+    fn extract_cookie_handles_a_single_cookie_with_no_semicolons() -> anyhow::Result<()> {
+        let headers = headers_with_cookie("wa_session=only-one")?;
         assert_eq!(extract_cookie(&headers, "wa_session"), Some("only-one".to_string()));
+        Ok(())
     }
 }
