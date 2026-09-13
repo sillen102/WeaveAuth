@@ -70,7 +70,7 @@ struct VariantInfo {
 /// The derived `IntoResponse` impl also sets a `reason` field on the response body to the enum
 /// variant's name (e.g. `"NotFound"`), so callers can distinguish variants that share a status code.
 ///
-/// By default the error response type is `::common::responses::ErrorResponse`. Override with the
+/// By default the error response type is `::common::model::error_response::ErrorResponse`. Override with the
 /// `#[error_response_type(path::to::MyErrorResponse)]` attribute on the enum. The error response type
 /// must implement `schemars::JsonSchema` and have a
 /// `fn new(impl Into<String>, impl Into<String>) -> Self` constructor taking `(details, reason)`.
@@ -130,7 +130,7 @@ fn parse_error_response_type(attrs: &[syn::Attribute]) -> syn::Path {
         .iter()
         .find(|a| a.path().is_ident("error_response_type"))
         .and_then(|a| a.parse_args::<syn::Path>().ok())
-        .unwrap_or_else(|| syn::parse_quote!(::common::responses::ErrorResponse))
+        .unwrap_or_else(|| syn::parse_quote!(::common::model::error_response::ErrorResponse))
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {

@@ -1,4 +1,4 @@
-use crate::server::api::{health::health, login::start_login, proxy::proxy, register::start_register};
+use crate::server::api::{health::health, login::start_login, proxy::proxy_router, register::start_register};
 use crate::server::AppState;
 use axum::routing::{get, post};
 use axum::Router;
@@ -31,16 +31,15 @@ pub(crate) fn router(state: AppState) -> Router {
     let auth_routes = Router::new()
         .route("/login", post(start_login))
         .route("/register", post(start_register))
-        .layer(GovernorLayer::new(build_governor()));
+        .layer(GovernorLayer::new(build_governor()))
+        .with_state(state.clone());
 
-    let proxy_routes = Router::new()
-        .fallback(proxy)
-        .layer(GovernorLayer::new(build_governor()));
+    let proxy_governor = build_governor();
+    let proxy_routes = proxy_router(state).layer(GovernorLayer::new(proxy_governor));
 
     Router::new()
         .route("/health", get(health))
         .merge(auth_routes)
         .merge(proxy_routes)
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }

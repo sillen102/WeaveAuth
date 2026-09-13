@@ -1,55 +1,24 @@
-pub(crate) use controller::proxy;
+pub(crate) use controller::proxy_router;
 
 mod controller {
-    use axum::body::Body;
-    use axum::extract::{Request, State};
-    use axum::http::{header, HeaderMap, HeaderName, StatusCode};
-    use axum::response::{IntoResponse, Response};
-    use common_macros::ErrorResponses;
-    use thiserror::Error;
-
     use crate::server::AppState;
     use crate::storage::SessionStorage;
+    use axum::Router;
+    use axum::extract::{Request, State};
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::middleware::{self, Next};
+    use axum::response::Response;
+    use axum_reverse_proxy::ReverseProxy;
+    use common::model::token::TokenType;
+    use common_macros::ErrorResponses;
+    use thiserror::Error;
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     #[error_response_no_openapi]
     pub(crate) enum ProxyError {
-        #[error("no route configured for this path")]
-        #[error_response(StatusCode::NOT_FOUND, details = "no route configured for this path")]
-        RouteNotFound,
         #[error("missing or invalid session")]
         #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
         Unauthenticated,
-        #[error("could not read request body")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "could not read request body")]
-        MalformedBody,
-        #[error("unsupported HTTP method")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "unsupported HTTP method")]
-        UnsupportedMethod,
-        #[error("upstream request failed")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "upstream request failed")]
-        UpstreamUnavailable,
-    }
-
-    /// Headers that must not be blindly forwarded in either direction: they're
-    /// connection-scoped, or (cookie/authorization) get replaced deliberately below.
-    pub(super) fn is_hop_by_hop(name: &HeaderName) -> bool {
-        matches!(
-            name.as_str(),
-            "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-                | "host"
-                | "cookie"
-                | "set-cookie"
-                | "authorization"
-                | "content-length"
-        )
     }
 
     pub(super) fn extract_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
@@ -60,17 +29,13 @@ mod controller {
         })
     }
 
-    pub(crate) async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, ProxyError> {
-        let path = req.uri().path().to_string();
-        let route = state
-            .config
-            .routes
-            .iter()
-            .filter(|r| path.starts_with(&r.path_prefix))
-            .max_by_key(|r| r.path_prefix.len())
-            .cloned()
-            .ok_or(ProxyError::RouteNotFound)?;
-
+    /// Swaps the session cookie for the upstream `Authorization: Bearer <token>`
+    /// header before handing the request to the reverse proxy.
+    async fn authenticate(
+        State(state): State<AppState>,
+        mut req: Request,
+        next: Next,
+    ) -> Result<Response, ProxyError> {
         let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
             .ok_or(ProxyError::Unauthenticated)?;
         let session = state
@@ -79,85 +44,40 @@ mod controller {
             .await
             .ok_or(ProxyError::Unauthenticated)?;
 
-        let (parts, body) = req.into_parts();
-        let body_bytes = axum::body::to_bytes(body, usize::MAX)
-            .await
-            .map_err(|_| ProxyError::MalformedBody)?;
+        req.headers_mut().remove(header::COOKIE);
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("{} {}", TokenType::Bearer, session.access_token)
+                .parse()
+                .expect("bearer token is a valid header value"),
+        );
 
-        let rest = path.strip_prefix(&route.path_prefix).unwrap_or("");
-        let query = parts
-            .uri
-            .query()
-            .map(|q| format!("?{q}"))
-            .unwrap_or_default();
-        let target = format!("{}{}{}", route.upstream_url, rest, query);
+        Ok(next.run(req).await)
+    }
 
-        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-            .map_err(|_| ProxyError::UnsupportedMethod)?;
+    /// One `axum-reverse-proxy` service per configured route, merged, gated by
+    /// session auth. The proxy crate handles path stripping, header/body
+    /// forwarding, and hop-by-hop header removal.
+    pub(crate) fn proxy_router(state: AppState) -> Router {
+        let routes = state
+            .config
+            .routes
+            .iter()
+            .fold(Router::new(), |router, route| {
+                let upstream: Router = ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
+                router.merge(upstream)
+            });
 
-        let mut upstream_req = state.http_client.request(method, &target);
-        for (name, value) in parts.headers.iter() {
-            if !is_hop_by_hop(name) {
-                upstream_req = upstream_req.header(name, value);
-            }
-        }
-        upstream_req = upstream_req
-            .header(header::AUTHORIZATION, format!("Bearer {}", session.access_token))
-            .body(body_bytes);
-
-        let upstream_resp = upstream_req
-            .send()
-            .await
-            .map_err(|_| ProxyError::UpstreamUnavailable)?;
-
-        let status = upstream_resp.status().as_u16();
-        let mut builder = Response::builder().status(status);
-        for (name, value) in upstream_resp.headers().iter() {
-            if !is_hop_by_hop(name) {
-                builder = builder.header(name, value);
-            }
-        }
-        let resp_bytes = upstream_resp
-            .bytes()
-            .await
-            .map_err(|_| ProxyError::UpstreamUnavailable)?;
-
-        Ok(builder.body(Body::from(resp_bytes)).unwrap().into_response())
+        routes
+            .layer(middleware::from_fn_with_state(state, authenticate))
+            .fallback(StatusCode::NOT_FOUND)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
-
-    #[test]
-    fn is_hop_by_hop_flags_connection_scoped_and_replaced_headers() {
-        for name in [
-            "connection",
-            "Connection",
-            "keep-alive",
-            "cookie",
-            "Cookie",
-            "set-cookie",
-            "authorization",
-            "Authorization",
-            "content-length",
-            "host",
-        ] {
-            assert!(
-                is_hop_by_hop(&HeaderName::from_bytes(name.as_bytes()).unwrap()),
-                "expected {name} to be hop-by-hop"
-            );
-        }
-    }
-
-    #[test]
-    fn is_hop_by_hop_leaves_ordinary_headers_alone() {
-        for name in ["content-type", "accept", "x-request-id"] {
-            assert!(!is_hop_by_hop(&HeaderName::from_bytes(name.as_bytes()).unwrap()));
-        }
-    }
+    use axum::http::{HeaderMap, HeaderValue, header};
 
     fn headers_with_cookie(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

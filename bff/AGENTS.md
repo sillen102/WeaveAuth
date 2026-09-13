@@ -56,6 +56,25 @@ is made). Call the handler function directly (`start_login(State(state), headers
 Form(req)).await`), constructing `AppState` via `AppState::new(Config { .. })` by hand, no
 HTTP parsing involved.
 
+## Error handling
+
+Same pattern as `backend/`: each handler's fallible path is its own `thiserror`-derived
+enum (`LoginError`, `RegisterError`, `ProxyError`, ...), declared in the endpoint's own
+file. One variant per distinct failure reason, not one per status code --
+`#[error_response(StatusCode::X, details = "...")]` on each variant maps it to an HTTP
+status and a human-readable `details` string; several variants may share a status code
+when the reason (the variant name) is what actually disambiguates them.
+
+`#[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]` (from `common_macros`) generates
+`IntoResponse` (a JSON body via `common::responses::ErrorResponse`). Because bff has no
+OpenAPI layer, every one of these enums also carries `#[error_response_no_openapi]`,
+which skips the macro's `aide::OperationOutput` codegen -- keeping bff free of any `aide`
+dependency. Handlers return `Result<T, MyError>` directly; map fallible calls
+(`require_trusted_origin`, `reqwest` sends, upstream response parsing, ...) to a variant
+with `.map_err(|_| MyError::Whatever)` or `.ok_or(...)` at the call site instead of
+bubbling up a raw `StatusCode`. Tests assert against the enum variant (`result.err()`,
+`Some(MyError::Whatever)`), never against a bare `StatusCode`.
+
 ## Where HTTP-level tests still go
 
 `tests/*.rs` (`pkce_flow.rs`, `register.rs`, `proxy.rs`) cover the same endpoints

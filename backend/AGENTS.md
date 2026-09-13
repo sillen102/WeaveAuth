@@ -61,6 +61,26 @@ This mirrors the pattern already used elsewhere in the crate for non-endpoint co
 `#[cfg(test)] mod tests` colocated with the code under test rather than centralizing
 tests by module type.
 
+## Error handling
+
+Each handler's fallible path is its own `thiserror`-derived enum (`AuthorizeError`,
+`LoginError`, `TokenError`, ...), declared in the endpoint's own file next to its
+request/response types. One variant per distinct failure reason, not one per status code
+-- `#[error_response(StatusCode::X, details = "...")]` on each variant maps it to an HTTP
+status and a human-readable `details` string; several variants may share a status code
+(see `authorize.rs`'s `InvalidLoginSession` / `InvalidRedirectUri`, both 4xx but distinct
+reasons) since `reason` (the variant name) is what actually disambiguates them for callers.
+
+`#[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]` (from `common_macros`) generates
+both `IntoResponse` (a JSON body via `common::responses::ErrorResponse`, or an overridden
+`#[error_response_type(...)]`) and `aide::OperationOutput`, so the handler's `Result<T,
+MyError>` return type alone documents every possible error response in the generated
+OpenAPI spec -- no separate response-type bookkeeping in `..._doc()`. Handlers return
+`Result<T, MyError>` directly; map internal fallible calls (`spawn_blocking`, storage
+lookups, ...) to a variant with `.map_err(|_| MyError::Whatever)` or `.ok_or(...)` at the
+call site instead of bubbling up raw error types. Tests assert against the enum variant
+(`result.err()`, `Some(MyError::Whatever)`), never against a bare `StatusCode`.
+
 ## Where HTTP-level tests still go
 
 `tests/api_test.rs` covers the same endpoints end-to-end through the real router

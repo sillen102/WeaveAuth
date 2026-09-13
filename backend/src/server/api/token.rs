@@ -9,6 +9,7 @@ mod controller {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Duration, Utc};
+    use common::model::token::TokenType;
     use common_macros::ErrorResponses;
     use jsonwebtoken::{Algorithm, Header};
     use rand::RngExt;
@@ -34,12 +35,6 @@ mod controller {
         pub(super) code: String,
         pub(super) code_verifier: String,
         pub(super) redirect_uri: String,
-    }
-
-    #[derive(Serialize, JsonSchema)]
-    #[serde(rename_all = "PascalCase")]
-    pub(crate) enum TokenType {
-        Bearer,
     }
 
     #[derive(Serialize, JsonSchema)]

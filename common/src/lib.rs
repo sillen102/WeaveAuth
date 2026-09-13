@@ -12,4 +12,4 @@
 )]
 
 pub mod docs;
-pub mod responses;
+pub mod model;

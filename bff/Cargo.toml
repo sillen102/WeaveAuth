@@ -9,6 +9,7 @@ common-macros = { path = "../common/macros" }
 thiserror = { workspace = true }
 
 axum = { workspace = true }
+axum-reverse-proxy = "2.2"
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true }
