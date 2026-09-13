@@ -12,3 +12,4 @@
 )]
 
 pub mod docs;
+pub mod responses;

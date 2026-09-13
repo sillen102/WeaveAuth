@@ -5,9 +5,31 @@ mod controller {
     use axum::extract::{Request, State};
     use axum::http::{header, HeaderMap, HeaderName, StatusCode};
     use axum::response::{IntoResponse, Response};
+    use common_macros::ErrorResponses;
+    use thiserror::Error;
 
     use crate::server::AppState;
     use crate::storage::SessionStorage;
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum ProxyError {
+        #[error("no route configured for this path")]
+        #[error_response(StatusCode::NOT_FOUND, details = "no route configured for this path")]
+        RouteNotFound,
+        #[error("missing or invalid session")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
+        Unauthenticated,
+        #[error("could not read request body")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "could not read request body")]
+        MalformedBody,
+        #[error("unsupported HTTP method")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "unsupported HTTP method")]
+        UnsupportedMethod,
+        #[error("upstream request failed")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "upstream request failed")]
+        UpstreamUnavailable,
+    }
 
     /// Headers that must not be blindly forwarded in either direction: they're
     /// connection-scoped, or (cookie/authorization) get replaced deliberately below.
@@ -38,7 +60,7 @@ mod controller {
         })
     }
 
-    pub(crate) async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, StatusCode> {
+    pub(crate) async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, ProxyError> {
         let path = req.uri().path().to_string();
         let route = state
             .config
@@ -47,20 +69,20 @@ mod controller {
             .filter(|r| path.starts_with(&r.path_prefix))
             .max_by_key(|r| r.path_prefix.len())
             .cloned()
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(ProxyError::RouteNotFound)?;
 
         let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(ProxyError::Unauthenticated)?;
         let session = state
             .sessions
             .get_session(&session_id)
             .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(ProxyError::Unauthenticated)?;
 
         let (parts, body) = req.into_parts();
         let body_bytes = axum::body::to_bytes(body, usize::MAX)
             .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| ProxyError::MalformedBody)?;
 
         let rest = path.strip_prefix(&route.path_prefix).unwrap_or("");
         let query = parts
@@ -71,7 +93,7 @@ mod controller {
         let target = format!("{}{}{}", route.upstream_url, rest, query);
 
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| ProxyError::UnsupportedMethod)?;
 
         let mut upstream_req = state.http_client.request(method, &target);
         for (name, value) in parts.headers.iter() {
@@ -86,7 +108,7 @@ mod controller {
         let upstream_resp = upstream_req
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| ProxyError::UpstreamUnavailable)?;
 
         let status = upstream_resp.status().as_u16();
         let mut builder = Response::builder().status(status);
@@ -98,7 +120,7 @@ mod controller {
         let resp_bytes = upstream_resp
             .bytes()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| ProxyError::UpstreamUnavailable)?;
 
         Ok(builder.body(Body::from(resp_bytes)).unwrap().into_response())
     }

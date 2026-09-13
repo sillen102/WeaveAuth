@@ -9,9 +9,11 @@ mod controller {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use chrono::{DateTime, Utc};
+    use common_macros::ErrorResponses;
     use rand::RngExt;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
+    use thiserror::Error;
     use uuid::Uuid;
 
     use crate::model::session::SessionData;
@@ -64,6 +66,23 @@ mod controller {
         user_id: Uuid,
     }
 
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum LoginError {
+        #[error("request did not come from a trusted origin")]
+        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        UntrustedOrigin,
+        #[error("redirect_uri is not allowed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
+        InvalidRedirectUri,
+        #[error("token exchange failed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
+        TokenExchangeFailed,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
     /// Verifies the submitted credentials against backend's `/oauth/login`, then
     /// drives the whole authorization-code + PKCE exchange server-to-server in
     /// one request, so the browser only ever talks to bff and never sees backend
@@ -84,8 +103,9 @@ mod controller {
         State(mut state): State<AppState>,
         headers: HeaderMap,
         Form(req): Form<LoginRequest>,
-    ) -> Result<Response, StatusCode> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)?;
+    ) -> Result<Response, LoginError> {
+        require_trusted_origin(&headers, &state.config.trusted_origins)
+            .map_err(|_| LoginError::UntrustedOrigin)?;
 
         let redirect_uri = req.redirect_uri;
 
@@ -98,7 +118,7 @@ mod controller {
             })
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| LoginError::BackendUnavailable)?;
         if verify_resp.status() == StatusCode::UNAUTHORIZED {
             // A plain form POST, not a fetch -- so a friendly bounce back to the
             // login page (rather than a bare 401 body) is what the browser shows.
@@ -110,12 +130,12 @@ mod controller {
                 .into_response());
         }
         if !verify_resp.status().is_success() {
-            return Err(StatusCode::BAD_GATEWAY);
+            return Err(LoginError::BackendUnavailable);
         }
         let login_session = verify_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?
+            .map_err(|_| LoginError::BackendUnavailable)?
             .login_session;
 
         let mut verifier_bytes = [0u8; 32];
@@ -136,25 +156,25 @@ mod controller {
             .get(format!("{}/oauth/authorize?{}", state.config.backend_url, qs))
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| LoginError::BackendUnavailable)?;
 
         if authorize_resp.status() == StatusCode::BAD_REQUEST {
             // backend rejected redirect_uri (not allowlisted) -- a client error, not a
             // backend-connectivity problem.
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(LoginError::InvalidRedirectUri);
         }
         if !authorize_resp.status().is_redirection() {
-            return Err(StatusCode::BAD_GATEWAY);
+            return Err(LoginError::BackendUnavailable);
         }
         let location = authorize_resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or(StatusCode::BAD_GATEWAY)?;
+            .ok_or(LoginError::BackendUnavailable)?;
         let code = url::Url::parse(location)
             .ok()
             .and_then(|u| u.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.into_owned()))
-            .ok_or(StatusCode::BAD_GATEWAY)?;
+            .ok_or(LoginError::BackendUnavailable)?;
 
         let token_req = TokenExchangeRequest {
             grant_type: "authorization_code",
@@ -170,12 +190,15 @@ mod controller {
             .form(&token_req)
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| LoginError::BackendUnavailable)?;
 
         if !token_resp.status().is_success() {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(LoginError::TokenExchangeFailed);
         }
-        let token: TokenResponse = token_resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let token: TokenResponse = token_resp
+            .json()
+            .await
+            .map_err(|_| LoginError::BackendUnavailable)?;
 
         let session_id = Uuid::new_v4().to_string();
         state
@@ -210,7 +233,7 @@ mod controller {
 mod tests {
     use super::controller::*;
     use axum::extract::State;
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue};
     use axum::Form;
 
     use crate::config::Config;
@@ -245,6 +268,6 @@ mod tests {
 
         let result = start_login(State(state), headers, Form(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(result.err(), Some(LoginError::UntrustedOrigin));
     }
 }

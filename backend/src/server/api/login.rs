@@ -11,6 +11,8 @@ mod controller {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use std::sync::LazyLock;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::crypto::ARGON2;
     use crate::server::AppState;
@@ -41,23 +43,20 @@ mod controller {
         pub(super) login_session: String,
     }
 
-    // OpenAPI documentation for this route.
-    pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("login")
-            .summary("Authenticate a user")
-            .description(
-                "Checks identifier/password against stored users and, on success, returns a \
-                 short-lived login_session token that /oauth/authorize requires before it will \
-                 issue a code -- this is what makes authentication happen before authorization \
-                 regardless of what order a caller invokes the two endpoints in",
-            )
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum LoginError {
+        #[error("invalid credentials")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid credentials")]
+        InvalidCredentials,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
     }
 
     pub(crate) async fn login(
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
-    ) -> Result<Json<LoginResponse>, StatusCode> {
+    ) -> Result<Json<LoginResponse>, LoginError> {
         let user = state.users.get_user_by_identifier(&req.identifier).await;
 
         // Always hash, even for an unknown identifier (against a fixed dummy hash)
@@ -75,13 +74,26 @@ mod controller {
             Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| LoginError::UnexpectedError)?
+        .map_err(|_| LoginError::UnexpectedError)?;
 
-        let user = user.filter(|_| verified).ok_or(StatusCode::UNAUTHORIZED)?;
+        let user = user.filter(|_| verified).ok_or(LoginError::InvalidCredentials)?;
 
         let login_session = state.login_sessions.create_session(user.id).await;
         Ok(Json(LoginResponse { login_session }))
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("login")
+            .summary("Authenticate a user")
+            .description(
+                "Checks identifier/password against stored users and, on success, returns a \
+                 short-lived login_session token that /oauth/authorize requires before it will \
+                 issue a code -- this is what makes authentication happen before authorization \
+                 regardless of what order a caller invokes the two endpoints in",
+            )
     }
 }
 
@@ -96,7 +108,6 @@ mod tests {
     use crate::storage::UserStorage;
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
-    use axum::http::StatusCode;
     use std::sync::Arc;
 
     use crate::crypto::ARGON2;
@@ -149,7 +160,7 @@ mod tests {
 
         let result = login(State(state), Json(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
 
     #[tokio::test]
@@ -162,7 +173,7 @@ mod tests {
 
         let result = login(State(state), Json(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
 
     #[tokio::test]
@@ -181,7 +192,7 @@ mod tests {
         let result = login(State(state), Json(req)).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
         assert!(
             elapsed > std::time::Duration::from_millis(1),
             "unknown-identifier login returned in {elapsed:?} -- looks like it short-circuited \

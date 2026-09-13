@@ -1,0 +1,7 @@
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.lint]
+description = "Run linters"
+run = "cargo clippy --all-targets -- -D warnings"

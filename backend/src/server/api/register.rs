@@ -10,7 +10,9 @@ mod controller {
     use chrono::Utc;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use thiserror::Error;
     use uuid::Uuid;
+    use common_macros::ErrorResponses;
 
     use crate::crypto::ARGON2;
     use crate::model::user::User;
@@ -23,21 +25,20 @@ mod controller {
         pub(super) password: String,
     }
 
-    // OpenAPI documentation for this route.
-    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("register")
-            .summary("Register a new user")
-            .description(
-                "Creates a user with a password hashed via Argon2; 409 if the identifier is \
-                 already taken",
-            )
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum RegisterError {
+        #[error("identifier already taken")]
+        #[error_response(StatusCode::CONFLICT, details = "identifier already taken")]
+        IdentifierTaken,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
     }
 
     pub(crate) async fn register(
         State(mut state): State<AppState>,
         Json(req): Json<RegisterRequest>,
-    ) -> Result<StatusCode, StatusCode> {
+    ) -> Result<StatusCode, RegisterError> {
         // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking keeps
         // it off this tokio worker thread so it doesn't stall other tasks while
         // hashing.
@@ -48,8 +49,8 @@ mod controller {
                 .map(|h| h.to_string())
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| RegisterError::UnexpectedError)?
+        .map_err(|_| RegisterError::UnexpectedError)?;
 
         let now = Utc::now();
         let saved = state
@@ -64,10 +65,21 @@ mod controller {
             .await;
 
         if !saved {
-            return Err(StatusCode::CONFLICT);
+            return Err(RegisterError::IdentifierTaken);
         }
 
         Ok(StatusCode::CREATED)
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("register")
+            .summary("Register a new user")
+            .description(
+                "Creates a user with a password hashed via Argon2; 409 if the identifier is \
+                 already taken",
+            )
     }
 }
 
@@ -120,6 +132,6 @@ mod tests {
         let second_result = register(State(state), Json(second)).await;
 
         assert_eq!(first_result, Ok(StatusCode::CREATED));
-        assert_eq!(second_result, Err(StatusCode::CONFLICT));
+        assert_eq!(second_result, Err(RegisterError::IdentifierTaken));
     }
 }

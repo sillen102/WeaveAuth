@@ -5,7 +5,9 @@ mod controller {
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::Form;
+    use common_macros::ErrorResponses;
     use serde::{Deserialize, Serialize};
+    use thiserror::Error;
 
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
@@ -25,6 +27,17 @@ mod controller {
         password: &'a str,
     }
 
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum RegisterError {
+        #[error("request did not come from a trusted origin")]
+        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        UntrustedOrigin,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
     /// Forwards registration to backend's `/register`, then bounces the browser
     /// back to `next` (the login page) -- `?error=1` appended when it failed, so
     /// the static registration page can show a message without any JS fetch/CORS
@@ -33,8 +46,9 @@ mod controller {
         State(state): State<AppState>,
         headers: HeaderMap,
         Form(req): Form<RegisterRequest>,
-    ) -> Result<Response, StatusCode> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)?;
+    ) -> Result<Response, RegisterError> {
+        require_trusted_origin(&headers, &state.config.trusted_origins)
+            .map_err(|_| RegisterError::UntrustedOrigin)?;
 
         let resp = state
             .http_client
@@ -45,7 +59,7 @@ mod controller {
             })
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| RegisterError::BackendUnavailable)?;
 
         let location = if resp.status().is_success() {
             req.next
@@ -53,7 +67,7 @@ mod controller {
             let sep = if req.next.contains('?') { '&' } else { '?' };
             format!("{}{sep}error=1", req.next)
         } else {
-            return Err(StatusCode::BAD_GATEWAY);
+            return Err(RegisterError::BackendUnavailable);
         };
 
         Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
@@ -64,7 +78,7 @@ mod controller {
 mod tests {
     use super::controller::*;
     use axum::extract::State;
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue};
     use axum::Form;
 
     use crate::config::Config;
@@ -98,6 +112,6 @@ mod tests {
 
         let result = start_register(State(state), headers, Form(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(result.err(), Some(RegisterError::UntrustedOrigin));
     }
 }

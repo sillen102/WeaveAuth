@@ -11,6 +11,8 @@ mod controller {
     use rand::RngExt;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
@@ -28,33 +30,32 @@ mod controller {
         pub(super) login_session: String,
     }
 
-    // OpenAPI documentation for this route.
-    pub(crate) fn authorize_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("authorize")
-            .summary("Issue an authorization code")
-            .description(
-                "Requires a login_session from /oauth/login proving the user is authenticated, \
-                 then binds a single-use auth_code to the given PKCE code_challenge",
-            )
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum AuthorizeError {
+        #[error("invalid login session")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid login session")]
+        InvalidLoginSession,
+        #[error("invalid redirect uri")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid redirect uri")]
+        InvalidRedirectUri,
     }
 
     pub(crate) async fn authorize(
         State(mut state): State<AppState>,
         Query(req): Query<AuthorizeRequest>,
-    ) -> Result<Redirect, StatusCode> {
+    ) -> Result<Redirect, AuthorizeError> {
         let user_id = state
             .login_sessions
             .take_session(&req.login_session)
             .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(AuthorizeError::InvalidLoginSession)?;
 
         if !state
             .redirect_uri_allowlist
             .iter()
             .any(|allowed| allowed == &req.redirect_uri)
         {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(AuthorizeError::InvalidRedirectUri);
         }
 
         let mut code_bytes = [0u8; 32];
@@ -78,6 +79,16 @@ mod controller {
         };
         Ok(Redirect::to(&location))
     }
+
+    pub(crate) fn authorize_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("authorize")
+            .summary("Issue an authorization code")
+            .description(
+                "Requires a login_session from /oauth/login proving the user is authenticated, \
+                 then binds a single-use auth_code to the given PKCE code_challenge",
+            )
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +100,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::model::pkce::CodeChallengeMethod;
+    use crate::server::api::authorize::controller::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, PkceStorage};
 
@@ -185,7 +197,7 @@ mod tests {
 
         let result = authorize(State(state), Query(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(result.err(), Some(InvalidRedirectUri));
     }
 
     #[tokio::test]
@@ -201,7 +213,7 @@ mod tests {
 
         let result = authorize(State(state), Query(req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(result.err(), Some(InvalidLoginSession));
     }
 
     #[tokio::test]
@@ -225,7 +237,7 @@ mod tests {
         };
         let result = authorize(State(state), Query(replay_req)).await;
 
-        assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(result.err(), Some(InvalidLoginSession));
     }
 
     #[tokio::test]

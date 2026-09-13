@@ -5,6 +5,7 @@ config_roots = [
     "backend",
     "bff",
     "common",
+    "common/macros",
     "login",
     "testing/downstream-service",
     "testing/user-service",

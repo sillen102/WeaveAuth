@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "bff", "common", "login"]
+members = ["backend", "bff", "common", "common/macros", "login"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ reqwest = { version = "0.13", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+thiserror = "2"
 uuid = "1"
 chrono = "0.4"
 url = "2"

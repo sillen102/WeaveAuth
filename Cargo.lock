@@ -312,9 +312,28 @@ version = "0.1.0"
 dependencies = [
  "aide",
  "axum",
+ "chrono",
  "http",
  "scalar_api_reference",
+ "schemars",
+ "serde",
  "serde_json",
+]
+
+[[package]]
+name = "common-macros"
+version = "0.1.0"
+dependencies = [
+ "aide",
+ "axum",
+ "common",
+ "proc-macro2",
+ "quote",
+ "schemars",
+ "serde",
+ "serde_json",
+ "syn 3.0.5",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3062,6 +3081,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "common",
+ "common-macros",
  "jsonwebtoken",
  "rand 0.10.2",
  "rsa",
@@ -3070,6 +3090,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tower-http 0.7.1",
@@ -3087,12 +3108,15 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "common",
+ "common-macros",
  "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tower-http 0.7.1",
