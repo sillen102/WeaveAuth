@@ -9,7 +9,7 @@ mod controller {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Duration, Utc};
-    use common::model::token::TokenType;
+    use common::model::token::{GrantType, TokenType};
     use common_macros::ErrorResponses;
     use jsonwebtoken::{Algorithm, Header};
     use rand::RngExt;
@@ -30,13 +30,6 @@ mod controller {
         exp: i64,
     }
 
-    #[derive(Deserialize, JsonSchema, Eq, PartialEq)]
-    #[serde(rename_all = "snake_case")]
-    pub(crate) enum GrantType {
-        AuthorizationCode,
-        RefreshToken,
-    }
-
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct TokenRequest {
         pub(super) grant_type: GrantType,
@@ -52,6 +45,7 @@ mod controller {
         pub(super) refresh_token: String,
         token_type: TokenType,
         expires_at: DateTime<Utc>,
+        pub(super) refresh_expires_at: DateTime<Utc>,
         /// The user this token was issued to -- carried through from the
         /// `login_session` `/oauth/login` created, via the auth code.
         pub(super) user_id: Uuid,
@@ -151,6 +145,7 @@ mod controller {
     ) -> Result<Json<TokenResponse>, TokenError> {
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
+        let refresh_expires_at = issued_at + Duration::seconds(state.refresh_token_ttl_secs);
         let claims = Claims {
             sub: user_id,
             iat: issued_at.timestamp(),
@@ -175,6 +170,7 @@ mod controller {
             refresh_token,
             token_type: TokenType::Bearer,
             expires_at,
+            refresh_expires_at,
             user_id,
         }))
     }
@@ -196,6 +192,7 @@ mod tests {
     use super::controller::*;
     use axum::Json;
     use axum::extract::{Form, State};
+    use common::model::token::GrantType;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
@@ -216,6 +213,7 @@ mod tests {
                 .expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
+            refresh_token_ttl_secs: 2_592_000,
         }
     }
 

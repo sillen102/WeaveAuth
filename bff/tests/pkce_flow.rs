@@ -111,6 +111,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                     "refresh_token": "test-refresh-token",
                     "token_type": "Bearer",
                     "expires_at": chrono::Utc::now() + chrono::Duration::minutes(15),
+                    "refresh_expires_at": chrono::Utc::now() + chrono::Duration::days(30),
                     "user_id": uuid::Uuid::new_v4(),
                 }))
             }),

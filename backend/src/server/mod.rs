@@ -18,6 +18,7 @@ pub(crate) struct AppState {
     pub(crate) jwt_keys: InMemoryJwkStorage,
     pub(crate) access_token_ttl_secs: i64,
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
+    pub(crate) refresh_token_ttl_secs: i64,
 }
 
 impl AppState {
@@ -30,6 +31,7 @@ impl AppState {
             jwt_keys: InMemoryJwkStorage::new()?,
             access_token_ttl_secs: config.access_token_ttl_secs,
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
+            refresh_token_ttl_secs: config.refresh_token_ttl_secs,
         })
     }
 }
