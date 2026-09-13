@@ -17,6 +17,7 @@ fn test_config() -> Config {
         pkce_code_ttl_secs: 300,
         login_session_ttl_secs: 60,
         access_token_ttl_secs: 900,
+        refresh_token_ttl_secs: 2_592_000,
     }
 }
 
@@ -112,7 +113,7 @@ async fn token_exchange_full_round_trip() {
             Request::post("/oauth/token")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(format!(
-                    "code={code}&code_verifier={verifier}&redirect_uri=http%3A%2F%2Fbff.test%2Fcallback"
+                    "grant_type=authorization_code&code={code}&code_verifier={verifier}&redirect_uri=http%3A%2F%2Fbff.test%2Fcallback"
                 )))
                 .unwrap(),
         )
@@ -141,7 +142,7 @@ async fn token_exchange_rejects_expired_code() {
             Request::post("/oauth/token")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(format!(
-                    "code={code}&code_verifier={verifier}&redirect_uri=http%3A%2F%2Fbff.test%2Fcallback"
+                    "grant_type=authorization_code&code={code}&code_verifier={verifier}&redirect_uri=http%3A%2F%2Fbff.test%2Fcallback"
                 )))
                 .unwrap(),
         )

@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::server::router::router;
 use crate::storage::in_memory::{
-    InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
+    InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryPkceStorage,
+    InMemoryRefreshTokenStorage, InMemoryUserStorage,
 };
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ pub(crate) struct AppState {
     pub(crate) redirect_uri_allowlist: Arc<Vec<String>>,
     pub(crate) jwt_keys: InMemoryJwkStorage,
     pub(crate) access_token_ttl_secs: i64,
+    pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
 }
 
 impl AppState {
@@ -27,6 +29,7 @@ impl AppState {
             redirect_uri_allowlist: Arc::new(config.redirect_uri_allowlist.clone()),
             jwt_keys: InMemoryJwkStorage::new()?,
             access_token_ttl_secs: config.access_token_ttl_secs,
+            refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
         })
     }
 }
