@@ -66,7 +66,7 @@ fn register_request(identifier: &str, next: &str) -> anyhow::Result<Request<Body
 #[tokio::test]
 async fn redirects_to_next_on_success() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app
         .oneshot(register_request("alice", "http://login.test/")?)
@@ -81,7 +81,7 @@ async fn redirects_to_next_on_success() -> anyhow::Result<()> {
 #[tokio::test]
 async fn appends_error_query_param_when_backend_rejects() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
-    let app = app(test_config(backend));
+    let app = app(test_config(backend)).unwrap();
 
     let resp = app
         .oneshot(register_request("taken", "http://login.test/register.html")?)
@@ -99,7 +99,7 @@ async fn rate_limits_repeated_attempts_from_the_same_ip() -> anyhow::Result<()> 
     let mut config = test_config(backend);
     config.rate_limit_max_attempts = 1;
     config.rate_limit_window_secs = 60;
-    let app = app(config);
+    let app = app(config).unwrap();
 
     let first = app
         .clone()
@@ -116,7 +116,7 @@ async fn rate_limits_repeated_attempts_from_the_same_ip() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn returns_bad_gateway_when_backend_unreachable() -> anyhow::Result<()> {
-    let app = app(test_config("http://127.0.0.1:1".into()));
+    let app = app(test_config("http://127.0.0.1:1".into())).unwrap();
 
     let resp = app
         .oneshot(register_request("alice", "http://login.test/")?)

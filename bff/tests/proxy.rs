@@ -200,7 +200,7 @@ async fn proxies_authenticated_request_swapping_cookie_for_bearer_token() -> any
         path_prefix: "/api".into(),
         upstream_url: upstream,
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
 
     let login_resp = app.clone().oneshot(login_request("http://admin.test/")?).await?;
     let set_cookie = login_resp
@@ -233,7 +233,7 @@ async fn missing_session_cookie_is_unauthorized() -> anyhow::Result<()> {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
 
     let resp = app
         .oneshot(with_test_peer(
@@ -252,7 +252,7 @@ async fn unknown_session_cookie_is_unauthorized() -> anyhow::Result<()> {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
 
     let resp = app
         .oneshot(with_test_peer(
@@ -293,7 +293,7 @@ async fn longest_matching_prefix_wins() -> anyhow::Result<()> {
             upstream_url: specific_upstream.clone(),
         },
     ];
-    let app = app(test_config(backend.clone(), routes));
+    let app = app(test_config(backend.clone(), routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), &backend).await?;
 
     let resp = app
@@ -332,7 +332,7 @@ async fn query_string_is_forwarded_to_upstream() -> anyhow::Result<()> {
         path_prefix: "/api".into(),
         upstream_url: format!("http://{addr}"),
     }];
-    let app = app(test_config(backend.clone(), routes));
+    let app = app(test_config(backend.clone(), routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), &backend).await?;
 
     let resp = app
@@ -366,7 +366,7 @@ async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
         path_prefix: "/api".into(),
         upstream_url: format!("http://{addr}"),
     }];
-    let app = app(test_config(backend.clone(), routes));
+    let app = app(test_config(backend.clone(), routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), &backend).await?;
 
     let resp = app
@@ -386,7 +386,7 @@ async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
 #[tokio::test]
 async fn unmatched_path_is_not_found() -> anyhow::Result<()> {
     let (backend, _bh) = stub_backend().await?;
-    let app = app(test_config(backend, vec![]));
+    let app = app(test_config(backend, vec![])).unwrap();
 
     let resp = app
         .oneshot(with_test_peer(
@@ -406,7 +406,7 @@ async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
     let mut config = test_config(backend, vec![]);
     config.rate_limit_max_attempts = 1;
     config.rate_limit_window_secs = 60;
-    let app = app(config);
+    let app = app(config).unwrap();
 
     for _ in 0..5 {
         let resp = app
@@ -428,7 +428,7 @@ async fn proxy_rate_limit_is_independent_from_the_auth_bucket() -> anyhow::Resul
     let mut config = test_config(backend, vec![]);
     config.rate_limit_max_attempts = 1;
     config.rate_limit_window_secs = 60;
-    let app = app(config);
+    let app = app(config).unwrap();
 
     let first_proxy_hit = app
         .clone()
@@ -467,7 +467,7 @@ async fn access_token_within_the_refresh_leeway_is_refreshed_even_though_not_yet
         path_prefix: "/api".into(),
         upstream_url: upstream,
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), "").await?;
 
     let resp = app
@@ -496,7 +496,7 @@ async fn expired_access_token_is_transparently_refreshed() -> anyhow::Result<()>
         path_prefix: "/api".into(),
         upstream_url: upstream,
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), "").await?;
 
     let resp = app
@@ -527,7 +527,7 @@ async fn refreshed_token_is_persisted_so_a_second_request_does_not_refresh_again
         path_prefix: "/api".into(),
         upstream_url: upstream,
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), "").await?;
 
     for _ in 0..2 {
@@ -556,7 +556,7 @@ async fn expired_access_and_refresh_token_is_unauthorized() -> anyhow::Result<()
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), "").await?;
 
     let resp = app
@@ -583,7 +583,7 @@ async fn failed_refresh_call_is_unauthorized() -> anyhow::Result<()> {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
     }];
-    let app = app(test_config(backend, routes));
+    let app = app(test_config(backend, routes)).unwrap();
     let cookie = seeded_cookie(app.clone(), "").await?;
 
     let resp = app

@@ -11,6 +11,14 @@
     clippy::todo,
     clippy::unimplemented
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod docs;
 pub mod model;

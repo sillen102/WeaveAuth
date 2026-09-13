@@ -91,6 +91,9 @@ impl Config {
 }
 
 #[cfg(test)]
+// figment::Jail::expect_with's closure signature is fixed by the crate; its
+// Result<(), figment::Error> can't be shrunk from call sites.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use figment::Jail;
