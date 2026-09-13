@@ -1,8 +1,17 @@
 pub(crate) mod in_memory;
 
+use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
+use std::sync::Arc;
 use uuid::Uuid;
+
+pub(crate) trait JwkStorage {
+    /// The key `/oauth/token` should sign new access tokens with.
+    async fn active_key(&self) -> Arc<JwtKeys>;
+    /// The public keys to publish at `/.well-known/jwks.json`.
+    async fn jwk_set(&self) -> serde_json::Value;
+}
 
 pub(crate) trait UserStorage {
     /// Saves `user` unless its `identifier` is already taken, in which case

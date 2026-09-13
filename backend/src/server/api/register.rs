@@ -3,9 +3,7 @@ pub(crate) use controller::register_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
-    use rand_core::OsRng;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::Json;
@@ -45,9 +43,8 @@ mod controller {
         // hashing.
         let password = req.password;
         let password_hash = tokio::task::spawn_blocking(move || {
-            let salt = SaltString::generate(&mut OsRng);
             ARGON2
-                .hash_password(password.as_bytes(), &salt)
+                .hash_password(password.as_bytes())
                 .map(|h| h.to_string())
         })
         .await
@@ -89,6 +86,8 @@ mod tests {
             users: InMemoryUserStorage::new(),
             login_sessions: crate::storage::in_memory::InMemoryLoginSessionStorage::new(60),
             redirect_uri_allowlist: Arc::new(vec![]),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            access_token_ttl_secs: 900,
         }
     }
 

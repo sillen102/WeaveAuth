@@ -4,9 +4,11 @@ resolver = "2"
 
 [workspace.dependencies]
 axum = "0.8"
-aide = { version = "0.15" }
-schemars = "0.9"
-argon2 = "0.5"
+aide = "0.16.0-alpha.4"
+schemars = "1.2"
+argon2 = "0.6"
+jsonwebtoken = "11"
+rsa = { version = "0.9", features = ["pem"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower-http = "0.7"
 tower = { version = "0.5", features = ["util"] }
@@ -21,3 +23,6 @@ uuid = "1"
 chrono = "0.4"
 url = "2"
 http = "1.5"
+sha2 = "0.11"
+base64 = "0.23"
+rand = "0.10"

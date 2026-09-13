@@ -1,5 +1,5 @@
-pub(crate) use controller::auth_authorize;
-pub(crate) use controller::auth_authorize_doc;
+pub(crate) use controller::authorize;
+pub(crate) use controller::authorize_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -29,7 +29,7 @@ mod controller {
     }
 
     // OpenAPI documentation for this route.
-    pub(crate) fn auth_authorize_doc(op: TransformOperation) -> TransformOperation {
+    pub(crate) fn authorize_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("authorize")
             .summary("Issue an authorization code")
@@ -39,7 +39,7 @@ mod controller {
             )
     }
 
-    pub(crate) async fn auth_authorize(
+    pub(crate) async fn authorize(
         State(mut state): State<AppState>,
         Query(req): Query<AuthorizeRequest>,
     ) -> Result<Redirect, StatusCode> {
@@ -106,6 +106,8 @@ mod tests {
             users: crate::storage::in_memory::InMemoryUserStorage::new(),
             login_sessions,
             redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            access_token_ttl_secs: 900,
         };
         (state, login_session, user_id)
     }
@@ -132,7 +134,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), Query(req)).await.unwrap();
 
         let location = location_of(redirect);
         assert!(location.starts_with("http://redirect.test?code="));
@@ -149,7 +151,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), Query(req)).await.unwrap();
 
         assert!(location_of(redirect).ends_with("&state=xyz"));
     }
@@ -165,7 +167,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = auth_authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), Query(req)).await.unwrap();
 
         assert!(!location_of(redirect).contains("state="));
     }
@@ -181,7 +183,7 @@ mod tests {
             login_session,
         };
 
-        let result = auth_authorize(State(state), Query(req)).await;
+        let result = authorize(State(state), Query(req)).await;
 
         assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
     }
@@ -197,7 +199,7 @@ mod tests {
             login_session: "not-a-real-session".to_string(),
         };
 
-        let result = auth_authorize(State(state), Query(req)).await;
+        let result = authorize(State(state), Query(req)).await;
 
         assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
     }
@@ -212,7 +214,7 @@ mod tests {
             state: None,
             login_session: login_session.clone(),
         };
-        let _ = auth_authorize(State(state.clone()), Query(req)).await.unwrap();
+        let _ = authorize(State(state.clone()), Query(req)).await.unwrap();
 
         let replay_req = AuthorizeRequest {
             redirect_uri: "http://redirect.test".to_string(),
@@ -221,7 +223,7 @@ mod tests {
             state: None,
             login_session,
         };
-        let result = auth_authorize(State(state), Query(replay_req)).await;
+        let result = authorize(State(state), Query(replay_req)).await;
 
         assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
     }
@@ -238,7 +240,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = auth_authorize(State(state.clone()), Query(req)).await.unwrap();
+        let redirect = authorize(State(state.clone()), Query(req)).await.unwrap();
         let location = location_of(redirect);
         let code = location.split("code=").nth(1).unwrap();
 

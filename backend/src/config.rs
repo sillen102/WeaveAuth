@@ -12,6 +12,8 @@ pub struct Config {
     /// `/oauth/authorize` call -- just a server-to-server hop, so this is
     /// deliberately short-lived.
     pub login_session_ttl_secs: i64,
+    /// How long an access token issued by `/oauth/token` stays valid for.
+    pub access_token_ttl_secs: i64,
 }
 
 /// Optional YAML overlay, read before env vars are applied. Path is
@@ -22,6 +24,7 @@ struct FileConfig {
     redirect_uri_allowlist: Option<Vec<String>>,
     pkce_code_ttl_secs: Option<i64>,
     login_session_ttl_secs: Option<i64>,
+    access_token_ttl_secs: Option<i64>,
 }
 
 fn load_file_config() -> Result<FileConfig, anyhow::Error> {
@@ -65,11 +68,18 @@ impl Config {
             .or(file.login_session_ttl_secs)
             .unwrap_or(60);
 
+        let access_token_ttl_secs = env::var("WA_ACCESS_TOKEN_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file.access_token_ttl_secs)
+            .unwrap_or(900);
+
         Ok(Self {
             port,
             redirect_uri_allowlist,
             pkce_code_ttl_secs,
             login_session_ttl_secs,
+            access_token_ttl_secs,
         })
     }
 }
@@ -111,6 +121,7 @@ mod tests {
         "WA_REDIRECT_URI_ALLOWLIST",
         "WA_PKCE_CODE_TTL_SECS",
         "WA_LOGIN_SESSION_TTL_SECS",
+        "WA_ACCESS_TOKEN_TTL_SECS",
         "WA_CONFIG_FILE",
     ];
 
@@ -145,6 +156,7 @@ mod tests {
         );
         assert_eq!(config.pkce_code_ttl_secs, 300);
         assert_eq!(config.login_session_ttl_secs, 60);
+        assert_eq!(config.access_token_ttl_secs, 900);
     }
 
     #[test]
@@ -152,7 +164,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _clear = clear_env();
         let path = temp_yaml(
-            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\n",
+            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\n",
         );
         let _guard = EnvGuard::set(&[("WA_CONFIG_FILE", path.to_str().unwrap())]);
 
@@ -164,6 +176,7 @@ mod tests {
         );
         assert_eq!(config.pkce_code_ttl_secs, 42);
         assert_eq!(config.login_session_ttl_secs, 30);
+        assert_eq!(config.access_token_ttl_secs, 120);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -173,7 +186,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _clear = clear_env();
         let path = temp_yaml(
-            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\n",
+            "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\n",
         );
         let _guard = EnvGuard::set(&[
             ("WA_CONFIG_FILE", path.to_str().unwrap()),
@@ -181,6 +194,7 @@ mod tests {
             ("WA_REDIRECT_URI_ALLOWLIST", "http://env.test/callback"),
             ("WA_PKCE_CODE_TTL_SECS", "11"),
             ("WA_LOGIN_SESSION_TTL_SECS", "5"),
+            ("WA_ACCESS_TOKEN_TTL_SECS", "3"),
         ]);
 
         let config = Config::load().unwrap();
@@ -191,6 +205,7 @@ mod tests {
         );
         assert_eq!(config.pkce_code_ttl_secs, 11);
         assert_eq!(config.login_session_ttl_secs, 5);
+        assert_eq!(config.access_token_ttl_secs, 3);
 
         std::fs::remove_file(path).unwrap();
     }

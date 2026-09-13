@@ -1,6 +1,6 @@
 use crate::server::api::{
-    authorize::auth_authorize, authorize::auth_authorize_doc, health::health, login::login,
-    login::login_doc, register::register, register::register_doc, token::issue_token,
+    authorize::authorize, authorize::authorize_doc, health::health, jwks::jwks, jwks::jwks_doc,
+    login::login, login::login_doc, register::register, register::register_doc, token::issue_token,
     token::issue_token_doc,
 };
 use crate::server::AppState;
@@ -26,10 +26,8 @@ pub(crate) fn router(state: AppState) -> Router {
 fn oauth_routes() -> ApiRouter<AppState> {
     ApiRouter::new()
         .api_route("/oauth/login", post_with(login, login_doc))
-        .api_route(
-            "/oauth/authorize",
-            get_with(auth_authorize, auth_authorize_doc),
-        )
+        .api_route("/oauth/authorize", get_with(authorize, authorize_doc))
         .api_route("/oauth/token", post_with(issue_token, issue_token_doc))
         .api_route("/register", post_with(register, register_doc))
+        .api_route("/.well-known/jwks.json", get_with(jwks, jwks_doc))
 }

@@ -16,6 +16,7 @@ fn test_config() -> Config {
         redirect_uri_allowlist: vec!["http://bff.test/callback".to_string()],
         pkce_code_ttl_secs: 300,
         login_session_ttl_secs: 60,
+        access_token_ttl_secs: 900,
     }
 }
 
@@ -101,7 +102,7 @@ fn challenge_for(verifier: &str) -> String {
 
 #[tokio::test]
 async fn token_exchange_full_round_trip() {
-    let app = app(&test_config());
+    let app = app(&test_config()).expect("test app builds");
     let verifier = "correct-verifier";
     let challenge = challenge_for(verifier);
     let code = issue_code(app.clone(), &challenge).await;
@@ -130,7 +131,7 @@ async fn token_exchange_full_round_trip() {
 async fn token_exchange_rejects_expired_code() {
     let mut config = test_config();
     config.pkce_code_ttl_secs = -1; // already "expired" the instant it's issued
-    let app = app(&config);
+    let app = app(&config).expect("test app builds");
     let verifier = "correct-verifier";
     let challenge = challenge_for(verifier);
     let code = issue_code(app.clone(), &challenge).await;

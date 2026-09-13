@@ -1,6 +1,7 @@
+use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
-use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
+use crate::storage::{JwkStorage, LoginSessionStorage, PkceStorage, UserStorage};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -9,6 +10,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+#[derive(Clone)]
+pub(crate) struct InMemoryJwkStorage {
+    active_key: Arc<JwtKeys>,
+}
+
+impl InMemoryJwkStorage {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            active_key: Arc::new(JwtKeys::generate()?),
+        })
+    }
+}
+
+impl JwkStorage for InMemoryJwkStorage {
+    async fn active_key(&self) -> Arc<JwtKeys> {
+        self.active_key.clone()
+    }
+
+    async fn jwk_set(&self) -> serde_json::Value {
+        self.active_key.jwk_set()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct InMemoryUserStorage {

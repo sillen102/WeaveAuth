@@ -9,6 +9,7 @@ mod controller {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use chrono::{DateTime, Duration, Utc};
+    use jsonwebtoken::{Header, Algorithm};
     use rand::RngExt;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -16,7 +17,15 @@ mod controller {
     use uuid::Uuid;
 
     use crate::server::AppState;
-    use crate::storage::PkceStorage;
+    use crate::storage::{JwkStorage, PkceStorage};
+
+    /// Access token claims (RFC 7519).
+    #[derive(Serialize)]
+    struct Claims {
+        sub: Uuid,
+        iat: i64,
+        exp: i64,
+    }
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct TokenRequest {
@@ -75,9 +84,20 @@ mod controller {
             return Err(StatusCode::BAD_REQUEST);
         }
 
+        let issued_at = Utc::now();
+        let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
+        let claims = Claims {
+            sub: user_id,
+            iat: issued_at.timestamp(),
+            exp: expires_at.timestamp(),
+        };
+        let signing_key = state.jwt_keys.active_key().await;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(signing_key.kid.clone());
+        let access_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         let mut token_bytes = [0u8; 32];
-        rand::rng().fill(&mut token_bytes);
-        let access_token = URL_SAFE_NO_PAD.encode(token_bytes);
         rand::rng().fill(&mut token_bytes);
         let refresh_token = URL_SAFE_NO_PAD.encode(token_bytes);
 
@@ -85,7 +105,7 @@ mod controller {
             access_token,
             refresh_token,
             token_type: TokenType::Bearer,
-            expires_at: Utc::now() + Duration::minutes(15),
+            expires_at,
             user_id,
         }))
     }
@@ -113,6 +133,8 @@ mod tests {
             users: crate::storage::in_memory::InMemoryUserStorage::new(),
             login_sessions: crate::storage::in_memory::InMemoryLoginSessionStorage::new(60),
             redirect_uri_allowlist: Arc::new(vec![]),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            access_token_ttl_secs: 900,
         }
     }
 

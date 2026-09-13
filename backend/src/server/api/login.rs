@@ -3,8 +3,7 @@ pub(crate) use controller::login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::password_hash::{PasswordHash, SaltString};
+    use argon2::password_hash::phc::PasswordHash;
     use argon2::{PasswordHasher, PasswordVerifier};
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -24,9 +23,8 @@ mod controller {
     /// known identifier with a wrong password pays for a full Argon2 hash before
     /// failing; an unknown one previously failed immediately).
     static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
-        let salt = SaltString::generate(&mut OsRng);
         ARGON2
-            .hash_password(b"not-a-real-password", &salt)
+            .hash_password(b"not-a-real-password")
             .expect("hashing a fixed password never fails")
             .to_string()
     });
@@ -96,8 +94,6 @@ mod tests {
         InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
     };
     use crate::storage::UserStorage;
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
@@ -106,10 +102,9 @@ mod tests {
     use crate::crypto::ARGON2;
 
     async fn state_with_user(identifier: &str, password: &str) -> AppState {
-        let salt = SaltString::generate(&mut OsRng);
         let hash = ARGON2
-            .hash_password(password.as_bytes(), &salt)
-            .unwrap()
+            .hash_password(password.as_bytes())
+            .expect("hashing a test password never fails")
             .to_string();
 
         let mut users = InMemoryUserStorage::new();
@@ -126,6 +121,8 @@ mod tests {
             users,
             login_sessions: InMemoryLoginSessionStorage::new(60),
             redirect_uri_allowlist: Arc::new(vec![]),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            access_token_ttl_secs: 900,
         }
     }
 
