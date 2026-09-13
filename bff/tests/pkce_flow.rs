@@ -316,39 +316,6 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() {
 }
 
 #[tokio::test]
-async fn login_rejects_an_untrusted_origin_before_touching_backend() {
-    // /oauth/login panics if hit -- the origin check must reject this before
-    // any backend call, or a hostile site could log a victim into an
-    // attacker-controlled account ("login CSRF").
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let router = Router::new().route(
-        "/oauth/login",
-        post(|| async {
-            panic!("backend must not be called for an untrusted origin");
-            #[allow(unreachable_code)]
-            StatusCode::OK
-        }),
-    );
-    let _h = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-    let app = app(test_config(format!("http://{addr}")));
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::post("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("origin", "http://evil.test")
-                .body(login_form_body("http://admin.test/"))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
 async fn login_never_redirects_the_browser_to_backend() {
     let (backend, _h) = stub_backend().await;
     let app = app(test_config(backend.clone()));

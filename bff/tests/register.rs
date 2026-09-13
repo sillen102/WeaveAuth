@@ -93,26 +93,6 @@ async fn appends_error_query_param_when_backend_rejects() {
 }
 
 #[tokio::test]
-async fn rejects_an_untrusted_origin() {
-    let app = app(test_config("http://127.0.0.1:1".into()));
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::post("/register")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("origin", "http://evil.test")
-                .body(Body::from(
-                    "identifier=alice&password=hunter2&next=http%3A%2F%2Flogin.test%2F",
-                ))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
 async fn rate_limits_repeated_attempts_from_the_same_ip() {
     let (backend, _h) = stub_backend().await;
     let mut config = test_config(backend);

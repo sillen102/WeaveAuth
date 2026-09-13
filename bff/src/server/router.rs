@@ -1,4 +1,4 @@
-use crate::server::api::{login::start_login, proxy::proxy, register::start_register};
+use crate::server::api::{health::health, login::start_login, proxy::proxy, register::start_register};
 use crate::server::AppState;
 use axum::routing::{get, post};
 use axum::Router;
@@ -43,8 +43,4 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(proxy_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-}
-
-async fn health() -> &'static str {
-    "ok"
 }
