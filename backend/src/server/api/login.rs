@@ -135,6 +135,7 @@ mod tests {
             jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
+            refresh_token_ttl_secs: 2_592_000,
         }
     }
 

@@ -63,6 +63,7 @@ mod controller {
         access_token: String,
         refresh_token: String,
         expires_at: DateTime<Utc>,
+        refresh_expires_at: DateTime<Utc>,
         user_id: Uuid,
     }
 
@@ -209,6 +210,7 @@ mod controller {
                     access_token: token.access_token,
                     refresh_token: token.refresh_token,
                     expires_at: token.expires_at,
+                    refresh_expires_at: token.refresh_expires_at,
                     user_id: token.user_id,
                 },
             )

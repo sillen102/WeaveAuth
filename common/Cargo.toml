@@ -12,3 +12,4 @@ aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "scala
 scalar_api_reference = { version = "0.2" }
 schemars = { workspace = true, features = ["chrono04"] }
 chrono = { workspace = true, features = ["serde"] }
+strum = { workspace = true }
