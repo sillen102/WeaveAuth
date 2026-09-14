@@ -21,15 +21,15 @@ mod controller {
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
-        pub(super) identifier: String,
+        pub(super) email: String,
         pub(super) password: String,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum RegisterError {
-        #[error("identifier already taken")]
-        #[error_response(StatusCode::CONFLICT, details = "identifier already taken")]
-        IdentifierTaken,
+        #[error("email already taken")]
+        #[error_response(StatusCode::CONFLICT, details = "email already taken")]
+        EmailTaken,
         #[error("internal error")]
         #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
         UnexpectedError,
@@ -57,15 +57,19 @@ mod controller {
             .users
             .create_user(User {
                 id: Uuid::new_v4(),
-                identifier: req.identifier,
-                password: password_hash,
+                email: req.email,
+                password: Some(password_hash),
+                // This app has no verification-email flow of its own -- only
+                // an OIDC provider confirming the address (see
+                // `UserStorage::link_or_create_oidc_user`) flips this to true.
+                email_verified: false,
                 created_at: now,
                 updated_at: now,
             })
             .await;
 
         if !saved {
-            return Err(RegisterError::IdentifierTaken);
+            return Err(RegisterError::EmailTaken);
         }
 
         Ok(StatusCode::CREATED)
@@ -77,7 +81,7 @@ mod controller {
             .id("register")
             .summary("Register a new user")
             .description(
-                "Creates a user with a password hashed via Argon2; 409 if the identifier is \
+                "Creates a user with a password hashed via Argon2; 409 if the email is \
                  already taken",
             )
     }
@@ -102,6 +106,10 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
+            oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
+            pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
+            oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
         }
     }
 
@@ -109,7 +117,7 @@ mod tests {
     async fn registers_user_with_hashed_password() {
         let state = state();
         let req = RegisterRequest {
-            identifier: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "hunter2".to_string(),
         };
 
@@ -119,14 +127,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_taken_identifier() {
+    async fn rejects_a_taken_email() {
         let state = state();
         let first = RegisterRequest {
-            identifier: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "hunter2".to_string(),
         };
         let second = RegisterRequest {
-            identifier: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "different-password".to_string(),
         };
 
@@ -134,6 +142,6 @@ mod tests {
         let second_result = register(State(state), Json(second)).await;
 
         assert_eq!(first_result, Ok(StatusCode::CREATED));
-        assert_eq!(second_result, Err(RegisterError::IdentifierTaken));
+        assert_eq!(second_result, Err(RegisterError::EmailTaken));
     }
 }

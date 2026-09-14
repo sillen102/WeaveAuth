@@ -1,9 +1,12 @@
 use crate::config::Config;
+use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
-    InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryPkceStorage,
-    InMemoryRefreshTokenStorage, InMemoryUserStorage,
+    InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
+    InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
+    InMemoryUserStorage,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod api;
@@ -19,10 +22,23 @@ pub(crate) struct AppState {
     pub(crate) access_token_ttl_secs: i64,
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
     pub(crate) refresh_token_ttl_secs: i64,
+    pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
+    pub(crate) oidc_state: InMemoryOidcStateStorage,
+    pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
+    pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
 }
 
 impl AppState {
-    pub(crate) fn new(config: &Config) -> anyhow::Result<Self> {
+    pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
+        // No redirects: an OIDC provider redirecting this server-side request
+        // elsewhere would be a request-forgery vector, not a legitimate flow.
+        let oidc_http_client = Arc::new(
+            openidconnect::reqwest::ClientBuilder::new()
+                .redirect(openidconnect::reqwest::redirect::Policy::none())
+                .build()?,
+        );
+        let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
+
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
             users: InMemoryUserStorage::new(),
@@ -32,6 +48,10 @@ impl AppState {
             access_token_ttl_secs: config.access_token_ttl_secs,
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
+            oidc_providers: Arc::new(oidc_providers),
+            oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
+            pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
+            oidc_http_client,
         })
     }
 }
@@ -41,11 +61,11 @@ pub async fn app_start(config: &Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, app(config)?).await?;
+    axum::serve(listener, app(config).await?).await?;
     Ok(())
 }
 
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.
-pub fn app(config: &Config) -> anyhow::Result<axum::Router> {
-    Ok(router(AppState::new(config)?))
+pub async fn app(config: &Config) -> anyhow::Result<axum::Router> {
+    Ok(router(AppState::new(config).await?))
 }

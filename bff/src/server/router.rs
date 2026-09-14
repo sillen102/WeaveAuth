@@ -1,4 +1,7 @@
-use crate::server::api::{health::health, login::start_login, proxy::proxy_router, register::start_register};
+use crate::server::api::{
+    health::health, login::start_login, oidc::oidc_callback, oidc::start_oidc_login,
+    proxy::proxy_router, register::start_register,
+};
 use crate::server::AppState;
 use axum::routing::{get, post};
 use axum::Router;
@@ -30,6 +33,8 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
     let auth_routes = Router::new()
         .route("/login", post(start_login))
         .route("/register", post(start_register))
+        .route("/oidc/{provider}/login", get(start_oidc_login))
+        .route("/oidc/{provider}/callback", get(oidc_callback))
         .layer(GovernorLayer::new(build_governor()?))
         .with_state(state.clone());
 

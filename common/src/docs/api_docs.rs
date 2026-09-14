@@ -42,17 +42,39 @@ async fn serve_openapi(
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// use aide::axum::routing::{get_with, post_with};
+/// use aide::axum::ApiRouter;
+/// use aide::transform::TransformOperation;
+/// use axum::extract::State;
+/// use axum::Router;
+/// use common::docs::api_docs::api_docs_router;
+///
+/// #[derive(Clone)]
+/// struct AppState;
+///
+/// async fn login(State(_state): State<AppState>) {}
+/// fn login_doc(op: TransformOperation) -> TransformOperation {
+///     op.description("Log in")
+/// }
+///
+/// async fn issue_token(State(_state): State<AppState>) {}
+/// fn issue_token_doc(op: TransformOperation) -> TransformOperation {
+///     op.description("Issue a token")
+/// }
+///
+/// let state = AppState;
+///
 /// let routes = ApiRouter::new()
 ///     .api_route("/oauth/login", get_with(login, login_doc))
 ///     .api_route("/oauth/token", post_with(issue_token, issue_token_doc));
 ///
 /// let (documented_routes, docs) = api_docs_router("WeaveAuth Backend", routes);
 ///
-/// Router::new()
+/// let _app: Router<()> = Router::new()
 ///     .nest("/api", documented_routes)
 ///     .with_state(state)
-///     .merge(docs)
+///     .merge(docs);
 /// ```
 pub fn api_docs_router<S: Clone + Send + Sync + 'static>(
     title: &str,

@@ -1,3 +1,18 @@
 redirect_uri_allowlist:
   - http://localhost:8080/downstream
 pkce_code_ttl_secs: 300
+# Third-party OIDC login, e.g. Google. Client registered at
+# https://console.cloud.google.com/apis/credentials. redirect_uri must be
+# bff's public URL (backend itself isn't internet-exposed) -- add it to the
+# client's "Authorized redirect URIs".
+#
+# client_id/client_secret below are placeholders -- real values go in a local
+# .env (see .env.example), which overrides these via WA_OIDC_GOOGLE_CLIENT_ID
+# / WA_OIDC_GOOGLE_CLIENT_SECRET and is git-ignored, so nothing secret ends up
+# in this file.
+oidc_providers:
+  google:
+    client_id: set-in-.env
+    client_secret: set-in-.env
+    issuer: https://accounts.google.com
+    redirect_uri: http://localhost:8080/oidc/google/callback

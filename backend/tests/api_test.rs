@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use std::collections::HashMap;
 use tower::ServiceExt;
 use weaveauth::config::Config;
 use weaveauth::server::app;
@@ -18,6 +19,9 @@ fn test_config() -> Config {
         login_session_ttl_secs: 60,
         access_token_ttl_secs: 900,
         refresh_token_ttl_secs: 2_592_000,
+        oidc_state_ttl_secs: 300,
+        pending_oidc_link_ttl_secs: 600,
+        oidc_providers: HashMap::new(),
     }
 }
 
@@ -38,14 +42,14 @@ fn location(resp: &axum::response::Response) -> String {
 
 /// Registers (idempotent-ish for test purposes) and logs in a user, returning
 /// the `login_session` token `/oauth/authorize` requires.
-async fn login_session(app: axum::Router, identifier: &str, password: &str) -> String {
+async fn login_session(app: axum::Router, email: &str, password: &str) -> String {
     let _ = app
         .clone()
         .oneshot(
             Request::post("/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"identifier": identifier, "password": password})
+                    serde_json::json!({"email": email, "password": password})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -58,7 +62,7 @@ async fn login_session(app: axum::Router, identifier: &str, password: &str) -> S
             Request::post("/oauth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"identifier": identifier, "password": password})
+                    serde_json::json!({"email": email, "password": password})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -103,7 +107,7 @@ fn challenge_for(verifier: &str) -> String {
 
 #[tokio::test]
 async fn token_exchange_full_round_trip() {
-    let app = app(&test_config()).expect("test app builds");
+    let app = app(&test_config()).await.expect("test app builds");
     let verifier = "correct-verifier";
     let challenge = challenge_for(verifier);
     let code = issue_code(app.clone(), &challenge).await;
@@ -132,7 +136,7 @@ async fn token_exchange_full_round_trip() {
 async fn token_exchange_rejects_expired_code() {
     let mut config = test_config();
     config.pkce_code_ttl_secs = -1; // already "expired" the instant it's issued
-    let app = app(&config).expect("test app builds");
+    let app = app(&config).await.expect("test app builds");
     let verifier = "correct-verifier";
     let challenge = challenge_for(verifier);
     let code = issue_code(app.clone(), &challenge).await;

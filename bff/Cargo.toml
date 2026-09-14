@@ -19,13 +19,13 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
-reqwest = { workspace = true, features = ["form", "json"] }
+reqwest = { workspace = true, features = ["form", "json", "query"] }
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
 url = "2"
-serde_yaml = { workspace = true }
 figment = { workspace = true }
+dotenvy = { workspace = true }
 tower_governor = "0.8"
 
 [dev-dependencies]

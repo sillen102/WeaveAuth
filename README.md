@@ -60,11 +60,12 @@ Login (authorization-code + PKCE) flow — the browser only ever talks to `login
    original `redirect_uri` with a `Set-Cookie: wa_session=...; HttpOnly` header — no
    token in the URL, and no browser-visible hop through backend at any point.
 
-Registration follows the same shape: `register.html` posts identifier/password
-straight to bff's `POST /register`, which forwards to backend's `POST /register`
-(Argon2-hashes the password, saves the user) and 303s the browser back to `next` (the
-login page, supplied by the form) — `?error=1` appended on failure, e.g. a taken
-identifier.
+Registration follows the same shape: `register.html` posts email/password straight to
+bff's `POST /register`, which forwards to backend's `POST /register` (Argon2-hashes the
+password, saves the user with `email_verified: false`), then immediately drives the same
+login flow as step 3 onward above using those same credentials — one form submission
+ends with a session cookie set and the browser on `redirect_uri`, no separate "now sign
+in" step. Registration failure (e.g. a taken email) 303s back to `next?error=1` instead.
 
 Because `/oauth/login` and `/oauth/authorize` are separate, independently callable
 endpoints, the `login_session` requirement on `/oauth/authorize` is what prevents a
@@ -72,18 +73,52 @@ future direct caller (e.g. an SPA built straight against backend, bypassing bff)
 skipping authentication by calling things in the wrong order — the ordering is enforced
 by backend's own state, not by convention.
 
+### Third-party login (OIDC) and account linking
+
+`GET /oauth/oidc/{provider}/login` / `GET /oauth/oidc/{provider}/callback` (backend) let
+a user sign in via Google/LinkedIn/Apple etc. instead of a password; bff proxies both
+(see its own `/oidc/{provider}/*` routes below) since backend isn't internet-exposed.
+Accounts are linked across providers, and to a password account, **by email** — sign in
+with Google today, LinkedIn tomorrow, same account, as long as the email matches. Each
+`User` has an `email_verified` flag: `false` for a plain password registration (this app
+sends no verification email), `true` once an OIDC provider has confirmed it.
+
+The linking decision (`UserStorage::resolve_oidc_login`) never merges an OIDC identity
+into an account whose email isn't already verified — an unverified account could belong
+to an attacker who pre-registered a victim's email with a password of their own choosing;
+merging into it on email match alone would hand that attacker a login path into the real
+owner's account. So:
+
+- New email, or the matching account is already verified → the identity links
+  immediately, no extra step.
+- Matching account exists but `email_verified: false` → backend returns
+  `password_confirmation_required` instead of a session. The caller must submit that
+  account's *current* password to `POST /oauth/oidc/confirm-link`; only on success does
+  the account become `email_verified: true` and the identity link. (There's currently no
+  password-reset flow, so if the matching account was squatted by someone else and the
+  real owner never had its password, they're stuck — see TODO ledger.)
+
+The email itself is only trusted as proof when it comes with independent confirmation —
+`resolve_oidc_login` takes a `VerifiedEmail`, a type that can only be constructed by
+naming what verified it (e.g. `claims.email_verified() == Some(true)` from a signature-
+checked OIDC id_token). This is enforced by the type system, not just a doc comment, so a
+future caller can't accidentally pass an unconfirmed email and reopen the same
+account-takeover hole for the "already verified" merge path.
+
 bff routes. Two independent per-IP rate-limit buckets (`tower_governor`, see TODO
 ledger) sit in front: one shared by `/login` + `/register`, one shared by every
 proxied route — hammering one side can't burn the other's budget. `/health` is
 exempt (a cheap liveness check infra commonly polls, shouldn't get caught in either
 bucket):
 
-| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                     |
-|--------|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                        |
-| POST   | `/login`                     | Form `{identifier, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing |
-| POST   | `/register`                  | Form `{identifier, password, next}`. Forwards to backend, 303 → `next` (success) or `next?error=1` (failure, e.g. taken identifier); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                          |
-| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                |
+| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                                         |
+|--------|------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                                            |
+| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                          |
+| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted |
+| GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; `404` for an unknown provider                                                                                                                                             |
+| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend, then finishes the login like `/login` would; failure → 303 → `next?error=1`; `400` if the flow cookies are missing/expired                                                                          |
+| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                                    |
 
 login routes:
 
@@ -96,18 +131,44 @@ login routes:
 
 Backend routes:
 
-| Method | Path               | Returns                                                                                                                                               |
-|--------|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`          | `ok`                                                                                                                                                  |
-| POST   | `/oauth/login`     | Verifies identifier/password (Argon2) against `UserStorage`; `{ login_session }` on success, `401` otherwise                                          |
-| POST   | `/register`        | Hashes the password (Argon2) and saves a new user; `201`, or `409` if the identifier is taken                                                         |
-| GET    | `/oauth/authorize` | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400` |
-| POST   | `/oauth/token`     | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`                  |
+| Method | Path                              | Returns                                                                                                                                                                                                                                                                                                                                                                   |
+|--------|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`                         | `ok`                                                                                                                                                                                                                                                                                                                                                                      |
+| POST   | `/oauth/login`                    | Verifies email/password (Argon2) against `UserStorage`; `{ login_session }` on success, `401` otherwise                                                                                                                                                                                                                                                                   |
+| POST   | `/register`                       | Hashes the password (Argon2) and saves a new user (`email_verified: false`); `201`, or `409` if the email is taken                                                                                                                                                                                                                                                        |
+| GET    | `/oauth/authorize`                | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400`                                                                                                                                                                                                                     |
+| POST   | `/oauth/token`                    | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`, JWT carries `email`/`email_verified`                                                                                                                                                                                                |
+| GET    | `/oauth/oidc/{provider}/login`    | Not for the browser directly -- bff proxies this. Redirects to the provider's consent screen; `404` for an unknown `provider`                                                                                                                                                                                                                                             |
+| GET    | `/oauth/oidc/{provider}/callback` | Not for the provider directly -- bff forwards `code`+`state` here server-to-server. Resolves the OIDC identity to a user by verified email (see `UserStorage::resolve_oidc_login`); `{status: "authenticated", login_session}` on success, or `{status: "password_confirmation_required", pending_link_token, email}` if a matching account exists but isn't verified yet |
+| POST   | `/oauth/oidc/confirm-link`        | `{pending_link_token, password}`. Verifies the password against the account named in the pending link; on success marks it `email_verified` and links the identity, `{ login_session }`; `401` on wrong password, `400` if the token is invalid/expired                                                                                                                   |
 
 ## TODO ledger
 
 Open items, in priority order (highest first):
 
+- [ ] **No password-reset flow.** An OIDC login whose email matches an existing
+      but unverified local account can't merge into it automatically (would be
+      an account-takeover vector -- see `UserStorage::resolve_oidc_login`), so
+      it's routed to `/oauth/oidc/confirm-link`, which requires that account's
+      *current* password. If the account was squatted by someone else (the
+      real owner never had a password for it, e.g. an attacker pre-registered
+      their email), there is currently no way back in -- the real owner is
+      stuck. The fix is a standard email-based password-reset flow (proves
+      mailbox control independently of any password), which also needs
+      outbound email infrastructure this app doesn't have yet (no
+      SMTP/transactional-email integration anywhere in the codebase). Once
+      built, a completed reset should also flip that account's
+      `email_verified` to `true` (mailbox control is proof of ownership,
+      same as an OIDC provider's), which then lets a subsequent OIDC login
+      link automatically via the existing verified-match path -- no special
+      case needed for the reset-then-OIDC order.
+- [ ] **bff/login pages don't handle `password_confirmation_required`.**
+      `/oauth/oidc/{provider}/callback` (backend) and `/oidc/{provider}/callback`
+      (bff) can both now return that a matching unverified account exists and
+      needs its password confirmed before linking -- bff currently has no route
+      or UI for collecting that password and calling
+      `/oauth/oidc/confirm-link`. Until this is built, that case is a dead end
+      for the user (no visible error, no path forward) rather than a prompt.
 - [ ] **No server-side password policy.** `minlength="8"` on `register.html` is
       client-side only; `register.rs` accepts any length, including empty, via a
       direct API call.

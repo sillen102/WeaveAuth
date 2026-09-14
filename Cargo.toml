@@ -8,14 +8,15 @@ aide = "0.16.0-alpha.4"
 schemars = "1.2"
 argon2 = "0.6"
 jsonwebtoken = "11"
+openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "native-tls"] }
 rsa = { version = "0.9", features = ["pem"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower-http = "0.7"
 tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
+dotenvy = "0.15"
 reqwest = { version = "0.13", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
