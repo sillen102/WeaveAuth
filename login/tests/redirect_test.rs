@@ -44,6 +44,7 @@ async fn serves_static_index_page_at_root() {
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("id=\"login-form\""));
     assert!(body.contains("id=\"register-link\""));
+    assert!(body.contains("id=\"google-login-link\""));
 }
 
 #[tokio::test]
@@ -61,6 +62,7 @@ async fn serves_static_register_page() {
         .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("id=\"register-form\""));
+    assert!(body.contains("id=\"google-login-link\""));
 }
 
 #[tokio::test]

@@ -20,12 +20,19 @@ mod controller {
     use uuid::Uuid;
 
     use crate::server::AppState;
-    use crate::storage::{JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage};
+    use crate::storage::{JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage};
 
     /// Access token claims (RFC 7519).
     #[derive(Serialize)]
     struct Claims {
         sub: Uuid,
+        /// The user's email at the time this token was issued -- callers that
+        /// only see the token (not a fresh `/oauth/token` response) can still
+        /// show/log something human-readable without a lookup back through
+        /// backend. Not kept in sync if the email changes later;
+        /// re-authenticate to get a token with the new one.
+        email: String,
+        email_verified: bool,
         iat: i64,
         exp: i64,
     }
@@ -143,11 +150,15 @@ mod controller {
         user_id: Uuid,
         family_id: Uuid,
     ) -> Result<Json<TokenResponse>, TokenError> {
+        let user = state.users.get_user_by_id(user_id).await.ok_or(TokenError::UnexpectedError)?;
+
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
         let refresh_expires_at = issued_at + Duration::seconds(state.refresh_token_ttl_secs);
         let claims = Claims {
             sub: user_id,
+            email: user.email,
+            email_verified: user.email_verified,
             iat: issued_at.timestamp(),
             exp: expires_at.timestamp(),
         };
@@ -195,13 +206,15 @@ mod tests {
     use common::model::token::GrantType;
 
     use crate::model::pkce::CodeChallengeMethod;
+    use crate::model::user::User;
     use crate::server::AppState;
-    use crate::storage::PkceStorage;
+    use crate::storage::{PkceStorage, UserStorage};
     use crate::storage::in_memory::InMemoryPkceStorage;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn state() -> AppState {
         AppState {
@@ -214,7 +227,25 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
+            oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
+            pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
+            oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
         }
+    }
+
+    /// `issue_tokens` now looks the user back up (to embed `email` in the
+    /// access token), so tests exercising it need a real stored user rather
+    /// than a bare random id.
+    async fn state_with_user() -> (AppState, Uuid) {
+        let mut state = state();
+        let user = User {
+            email: "alice@example.com".to_string(),
+            ..User::default()
+        };
+        let user_id = user.id;
+        state.users.create_user(user).await;
+        (state, user_id)
     }
 
     fn challenge_for(verifier: &str) -> String {
@@ -243,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchanges_valid_code_for_tokens() {
-        let mut state = state();
+        let (mut state, user_id) = state_with_user().await;
         let verifier = "correct-verifier";
         state
             .pkce
@@ -252,7 +283,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                user_id,
             )
             .await;
         let req = code_req("code1", verifier, "http://redirect.test");
@@ -264,9 +295,8 @@ mod tests {
 
     #[tokio::test]
     async fn token_response_carries_the_user_id_the_code_was_issued_to() {
-        let mut state = state();
+        let (mut state, user_id) = state_with_user().await;
         let verifier = "correct-verifier";
-        let user_id = uuid::Uuid::new_v4();
         state
             .pkce
             .save_code_challenge(
@@ -336,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn code_is_single_use() {
-        let mut state = state();
+        let (mut state, user_id) = state_with_user().await;
         let verifier = "correct-verifier";
         state
             .pkce
@@ -345,7 +375,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                user_id,
             )
             .await;
         let first_req = code_req("code1", verifier, "http://redirect.test");
@@ -391,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_grant_exchanges_a_valid_refresh_token_for_a_new_pair() {
-        let mut state = state();
+        let (mut state, user_id) = state_with_user().await;
         let verifier = "correct-verifier";
         state
             .pkce
@@ -400,7 +430,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                user_id,
             )
             .await;
         let Json(first) = issue_token(
@@ -431,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn reusing_a_rotated_refresh_token_revokes_the_whole_family() {
-        let mut state = state();
+        let (mut state, user_id) = state_with_user().await;
         let verifier = "correct-verifier";
         state
             .pkce
@@ -440,7 +470,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                user_id,
             )
             .await;
         let Json(first) = issue_token(

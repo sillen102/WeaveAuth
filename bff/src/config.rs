@@ -55,6 +55,8 @@ impl Config {
     /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`, missing
     /// file is not an error), then `WA_*` env vars.
     pub fn load() -> Result<Self, anyhow::Error> {
+        dotenvy::dotenv().ok();
+
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
 
         let mut config: Config = Figment::from(Serialized::defaults(Config::default()))

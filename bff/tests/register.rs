@@ -1,8 +1,8 @@
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::routing::{get, post};
+use axum::{Form, Json, Router};
 use std::net::SocketAddr;
 use tower::ServiceExt;
 use weaveauth_bff::config::Config;
@@ -31,50 +31,88 @@ fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
-/// Stub backend accepting only identifier "taken" as already registered.
+/// Stub backend accepting only email "taken" as already registered.
+/// Also stands in for `/oauth/login`, `/oauth/authorize` and `/oauth/token`
+/// so the auto-login step after a successful registration has something real
+/// to drive, mirroring `pkce_flow.rs`'s `stub_backend`.
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let router = Router::new().route(
-        "/register",
-        post(|Json(body): Json<serde_json::Value>| async move {
-            if body["identifier"] == "taken" {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::CREATED
-            }
-        }),
-    );
+    let router = Router::new()
+        .route(
+            "/register",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                if body["email"] == "taken" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::CREATED
+                }
+            }),
+        )
+        .route(
+            "/oauth/login",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({"login_session": "stub-session"}))
+            }),
+        )
+        .route(
+            "/oauth/authorize",
+            get(
+                |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let redirect_uri = q.get("redirect_uri").cloned().unwrap_or_default();
+                    axum::response::Redirect::to(&format!("{redirect_uri}?code=stub-code"))
+                },
+            ),
+        )
+        .route(
+            "/oauth/token",
+            post(|Form(_body): Form<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "access_token": "test-access-token",
+                    "refresh_token": "test-refresh-token",
+                    "token_type": "Bearer",
+                    "expires_at": chrono::Utc::now() + chrono::Duration::minutes(15),
+                    "refresh_expires_at": chrono::Utc::now() + chrono::Duration::days(30),
+                    "user_id": uuid::Uuid::new_v4(),
+                }))
+            }),
+        );
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     Ok((format!("http://{addr}"), handle))
 }
 
-fn register_request(identifier: &str, next: &str) -> anyhow::Result<Request<Body>> {
+fn register_request(email: &str, redirect_uri: &str, next: &str) -> anyhow::Result<Request<Body>> {
     Ok(with_test_peer(
         Request::post("/register")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("origin", "http://login.test")
             .body(Body::from(format!(
-                "identifier={identifier}&password=hunter2&next={}",
+                "email={email}&password=hunter2&redirect_uri={}&next={}",
+                url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>(),
                 url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
             )))?,
     ))
 }
 
 #[tokio::test]
-async fn redirects_to_next_on_success() -> anyhow::Result<()> {
+async fn registering_immediately_logs_in_and_lands_on_redirect_uri() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 
     let resp = app
-        .oneshot(register_request("alice", "http://login.test/")?)
+        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
-    assert_eq!(loc, Some("http://login.test/"));
+    assert_eq!(loc, Some("http://admin.test/"));
+
+    let set_cookie = resp.headers().get("set-cookie").and_then(|v| v.to_str().ok());
+    assert!(set_cookie.is_some_and(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
     Ok(())
 }
 
@@ -84,7 +122,7 @@ async fn appends_error_query_param_when_backend_rejects() -> anyhow::Result<()> 
     let app = app(test_config(backend)).unwrap();
 
     let resp = app
-        .oneshot(register_request("taken", "http://login.test/register.html")?)
+        .oneshot(register_request("taken", "http://admin.test/", "http://login.test/register.html")?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -103,12 +141,12 @@ async fn rate_limits_repeated_attempts_from_the_same_ip() -> anyhow::Result<()> 
 
     let first = app
         .clone()
-        .oneshot(register_request("alice", "http://login.test/")?)
+        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
         .await?;
     assert_eq!(first.status(), StatusCode::SEE_OTHER);
 
     let second = app
-        .oneshot(register_request("bob", "http://login.test/")?)
+        .oneshot(register_request("bob", "http://admin.test/", "http://login.test/register.html")?)
         .await?;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
@@ -119,7 +157,7 @@ async fn returns_bad_gateway_when_backend_unreachable() -> anyhow::Result<()> {
     let app = app(test_config("http://127.0.0.1:1".into())).unwrap();
 
     let resp = app
-        .oneshot(register_request("alice", "http://login.test/")?)
+        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

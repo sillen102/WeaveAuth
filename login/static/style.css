@@ -48,6 +48,37 @@ body {
   cursor: not-allowed;
 }
 
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: #64748b;
+  font-size: 0.8rem;
+  margin: 1rem 0;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background-color: #334155;
+}
+
+.btn-google {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  background-color: #f8fafc;
+  color: #1e293b;
+  margin-bottom: 1.5rem;
+}
+
+.btn-google:hover {
+  background-color: #e2e8f0;
+}
+
 form {
   display: flex;
   flex-direction: column;

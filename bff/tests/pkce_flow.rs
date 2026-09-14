@@ -33,7 +33,7 @@ fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
 
 fn login_form_body(redirect_uri: &str) -> Body {
     Body::from(format!(
-        "identifier=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
+        "email=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
         urlencoding_encode(redirect_uri)
     ))
 }
@@ -57,7 +57,7 @@ fn urlencoding_encode(value: &str) -> String {
 /// /oauth/token, since bff drives the whole exchange server-to-server and needs
 /// a real redirect response to read `code` out of. Mirrors backend's allowlist
 /// check (only "http://admin.test" / "http://admin.test/" are allowed), accepts
-/// identifier "alice" / password "hunter2" as the only valid user, and requires
+/// email "alice" / password "hunter2" as the only valid user, and requires
 /// /oauth/authorize's `login_session` to match what /oauth/login just handed out
 /// (mirroring backend's real authenticate-before-authorize enforcement).
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
@@ -67,7 +67,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
         .route(
             "/oauth/login",
             post(|Json(body): Json<serde_json::Value>| async move {
-                if body["identifier"] == "alice" && body["password"] == "hunter2" {
+                if body["email"] == "alice" && body["password"] == "hunter2" {
                     Ok(Json(serde_json::json!({"login_session": "stub-session"})))
                 } else {
                     Err(StatusCode::UNAUTHORIZED)
@@ -179,7 +179,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() -> anyhow::
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
                 .body(Body::from(
-                    "identifier=alice&password=wrong&redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                    "email=alice&password=wrong&redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
                 ))?,
         ))
         .await?;
@@ -202,7 +202,7 @@ async fn login_requires_redirect_uri() -> anyhow::Result<()> {
             Request::post("/login")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
-                .body(Body::from("identifier=alice&password=hunter2"))?,
+                .body(Body::from("email=alice&password=hunter2"))?,
         ))
         .await?;
 

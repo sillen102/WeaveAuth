@@ -18,11 +18,11 @@ mod controller {
     use crate::storage::{LoginSessionStorage, UserStorage};
 
     /// A valid Argon2 hash of a fixed, made-up password -- verified against on the
-    /// "unknown identifier" path so it costs the same as the real
-    /// hash-and-compare below, instead of returning instantly. Without this, an
-    /// attacker can enumerate valid usernames purely from response timing (a
-    /// known identifier with a wrong password pays for a full Argon2 hash before
-    /// failing; an unknown one previously failed immediately).
+    /// "unknown email" path so it costs the same as the real hash-and-compare
+    /// below, instead of returning instantly. Without this, an attacker can
+    /// enumerate registered emails purely from response timing (a known email
+    /// with a wrong password pays for a full Argon2 hash before failing; an
+    /// unknown one previously failed immediately).
     ///
     /// A fixed literal, not computed at startup: hashing is fallible in
     /// principle (clippy denies the `expect()` that would be needed to unwrap
@@ -33,7 +33,7 @@ mod controller {
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
-        pub(super) identifier: String,
+        pub(super) email: String,
         pub(super) password: String,
     }
 
@@ -57,17 +57,18 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
-        let user = state.users.get_user_by_identifier(&req.identifier).await;
+        let user = state.users.get_user_by_email(&req.email).await;
 
-        // Always hash, even for an unknown identifier (against a fixed dummy hash)
+        // Always hash, even for an unknown email (against a fixed dummy hash)
         // -- see DUMMY_PASSWORD_HASH. Both branches pay the same Argon2 cost, so
-        // response timing can't be used to enumerate valid identifiers. Run it via
+        // response timing can't be used to enumerate registered emails. Run it via
         // spawn_blocking: Argon2 is deliberately CPU-heavy, synchronous work, and
         // doing it inline would block this tokio worker thread from servicing any
         // other task while it hashes.
         let hash_str = user
             .as_ref()
-            .map_or_else(|| DUMMY_PASSWORD_HASH.to_string(), |u| u.password.clone());
+            .and_then(|u| u.password.clone())
+            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
         let password = req.password;
         let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
             let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
@@ -89,7 +90,7 @@ mod controller {
             .id("login")
             .summary("Authenticate a user")
             .description(
-                "Checks identifier/password against stored users and, on success, returns a \
+                "Checks email/password against stored users and, on success, returns a \
                  short-lived login_session token that /oauth/authorize requires before it will \
                  issue a code -- this is what makes authentication happen before authorization \
                  regardless of what order a caller invokes the two endpoints in",
@@ -112,7 +113,7 @@ mod tests {
 
     use crate::crypto::ARGON2;
 
-    async fn state_with_user(identifier: &str, password: &str) -> AppState {
+    async fn state_with_user(email: &str, password: &str) -> AppState {
         let hash = ARGON2
             .hash_password(password.as_bytes())
             .expect("hashing a test password never fails")
@@ -121,8 +122,8 @@ mod tests {
         let mut users = InMemoryUserStorage::new();
         users
             .create_user(User {
-                identifier: identifier.to_string(),
-                password: hash,
+                email: email.to_string(),
+                password: Some(hash),
                 ..User::default()
             })
             .await;
@@ -136,14 +137,18 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
+            oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
+            pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
+            oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
         }
     }
 
     #[tokio::test]
     async fn accepts_correct_credentials_and_returns_a_login_session() {
-        let state = state_with_user("alice", "hunter2").await;
+        let state = state_with_user("alice@example.com", "hunter2").await;
         let req = LoginRequest {
-            identifier: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "hunter2".to_string(),
         };
 
@@ -154,9 +159,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_password() {
-        let state = state_with_user("alice", "hunter2").await;
+        let state = state_with_user("alice@example.com", "hunter2").await;
         let req = LoginRequest {
-            identifier: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "wrong".to_string(),
         };
 
@@ -166,10 +171,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_identifier() {
-        let state = state_with_user("alice", "hunter2").await;
+    async fn rejects_unknown_email() {
+        let state = state_with_user("alice@example.com", "hunter2").await;
         let req = LoginRequest {
-            identifier: "bob".to_string(),
+            email: "bob@example.com".to_string(),
             password: "hunter2".to_string(),
         };
 
@@ -179,14 +184,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_identifier_pays_the_same_argon2_cost_as_a_known_one() {
-        // Regression guard for the username-enumeration timing hole: an unknown
-        // identifier must still run a full Argon2 hash, not return instantly.
-        // We don't assert a tight ratio against the known-identifier path (flaky
+    async fn unknown_email_pays_the_same_argon2_cost_as_a_known_one() {
+        // Regression guard for the email-enumeration timing hole: an unknown
+        // email must still run a full Argon2 hash, not return instantly.
+        // We don't assert a tight ratio against the known-email path (flaky
         // under load); an absolute floor is enough to catch a short-circuit.
-        let state = state_with_user("alice", "hunter2").await;
+        let state = state_with_user("alice@example.com", "hunter2").await;
         let req = LoginRequest {
-            identifier: "no-such-user".to_string(),
+            email: "no-such-user@example.com".to_string(),
             password: "whatever".to_string(),
         };
 
@@ -197,8 +202,8 @@ mod tests {
         assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
         assert!(
             elapsed > std::time::Duration::from_millis(1),
-            "unknown-identifier login returned in {elapsed:?} -- looks like it short-circuited \
-             before hashing, which reopens the username-enumeration timing hole"
+            "unknown-email login returned in {elapsed:?} -- looks like it short-circuited \
+             before hashing, which reopens the email-enumeration timing hole"
         );
     }
 }

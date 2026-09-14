@@ -4,6 +4,7 @@ use crate::storage::in_memory::InMemorySessionStorage;
 use std::sync::Arc;
 
 mod api;
+pub(crate) mod cookie;
 pub(crate) mod origin_check;
 pub mod router;
 
