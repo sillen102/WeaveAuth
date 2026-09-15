@@ -13,14 +13,15 @@ pub(crate) fn extract_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<S
     })
 }
 
-pub(crate) fn build_cookie(name: &str, value: &str, path: &str, max_age_secs: i64) -> String {
+pub(crate) fn build_cookie(name: &str, value: &str, path: &str, max_age_secs: i64, secure: bool) -> String {
     let value = utf8_percent_encode(value, COOKIE_VALUE);
-    format!("{name}={value}; HttpOnly; Path={path}; SameSite=Lax; Max-Age={max_age_secs}")
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{name}={value}; HttpOnly; Path={path}; SameSite=Lax{secure}; Max-Age={max_age_secs}")
 }
 
 /// A `Set-Cookie` value that immediately expires the named cookie.
-pub(crate) fn clear_cookie(name: &str, path: &str) -> String {
-    build_cookie(name, "", path, 0)
+pub(crate) fn clear_cookie(name: &str, path: &str, secure: bool) -> String {
+    build_cookie(name, "", path, 0, secure)
 }
 
 #[cfg(test)]
@@ -63,7 +64,7 @@ mod tests {
 
     #[test]
     fn build_cookie_percent_encodes_special_characters() {
-        let set_cookie = build_cookie("next", "/x;Domain=evil.com;Max-Age=999999", "/", 60);
+        let set_cookie = build_cookie("next", "/x;Domain=evil.com;Max-Age=999999", "/", 60, false);
         assert_eq!(
             set_cookie,
             "next=%2Fx%3BDomain%3Devil.com%3BMax-Age%3D999999; HttpOnly; Path=/; SameSite=Lax; Max-Age=60"
@@ -71,9 +72,15 @@ mod tests {
     }
 
     #[test]
+    fn build_cookie_adds_secure_flag_when_requested() {
+        let set_cookie = build_cookie("wa_session", "abc", "/", 60, true);
+        assert_eq!(set_cookie, "wa_session=abc; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=60");
+    }
+
+    #[test]
     fn build_cookie_and_extract_cookie_roundtrip_a_value_with_semicolons() -> anyhow::Result<()> {
         let malicious = "/x;Domain=evil.com;Max-Age=999999";
-        let set_cookie = build_cookie("next", malicious, "/", 60);
+        let set_cookie = build_cookie("next", malicious, "/", 60, false);
         let value = set_cookie.split(';').next().unwrap().split_once('=').unwrap().1;
         let headers = headers_with_cookie(&format!("next={value}"))?;
         assert_eq!(extract_cookie(&headers, "next"), Some(malicious.to_string()));

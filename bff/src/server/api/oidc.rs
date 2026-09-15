@@ -172,9 +172,15 @@ mod controller {
             .ok_or(OidcLoginError::BackendUnavailable)?
             .to_string();
 
-        let redirect_uri_cookie =
-            build_cookie(REDIRECT_URI_COOKIE, &req.redirect_uri, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS);
-        let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS);
+        let secure = state.config.secure_cookies();
+        let redirect_uri_cookie = build_cookie(
+            REDIRECT_URI_COOKIE,
+            &req.redirect_uri,
+            FLOW_COOKIE_PATH,
+            FLOW_COOKIE_TTL_SECS,
+            secure,
+        );
+        let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
         let cookies = [
             (
                 header::SET_COOKIE,
@@ -216,9 +222,10 @@ mod controller {
             extract_cookie(&headers, REDIRECT_URI_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
         let next = extract_cookie(&headers, NEXT_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
 
+        let secure = state.config.secure_cookies();
         let clear_flow_cookies = [
-            (header::SET_COOKIE, clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH)),
-            (header::SET_COOKIE, clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH)),
+            (header::SET_COOKIE, clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH, secure)),
+            (header::SET_COOKIE, clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH, secure)),
         ];
         let error_redirect = |next: &str| -> Response {
             let sep = if next.contains('?') { '&' } else { '?' };

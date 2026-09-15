@@ -51,6 +51,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether cookies should carry the `Secure` flag -- derived from `bff_url`
+    /// so plain HTTP local dev keeps working without a separate setting.
+    pub(crate) fn secure_cookies(&self) -> bool {
+        self.bff_url.starts_with("https://")
+    }
+
     /// Loads config, layering (highest precedence last): built-in defaults,
     /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`, missing
     /// file is not an error), then `WA_*` env vars.

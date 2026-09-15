@@ -157,6 +157,12 @@ mod controller {
             .await;
 
         let max_age = (token.expires_at - Utc::now()).num_seconds().max(0);
-        Ok(build_cookie(&state.config.session_cookie_name, &session_id, "/", max_age))
+        Ok(build_cookie(
+            &state.config.session_cookie_name,
+            &session_id,
+            "/",
+            max_age,
+            state.config.secure_cookies(),
+        ))
     }
 }
