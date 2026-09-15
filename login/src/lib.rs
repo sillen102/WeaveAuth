@@ -184,10 +184,28 @@ fn render_page(
     ctx.insert("pending_link_token", &query.pending_link_token);
     ctx.insert("email", &query.email);
 
-    let tera = Tera::new(TEMPLATES_GLOB).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tera = Tera::new();
+    tera.register_filter("urlencode", urlencode_filter);
+    tera.load_from_glob(TEMPLATES_GLOB)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tera.render(template, &ctx)
         .map(Html)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Tera 2 dropped its built-in `urlencode` filter, so templates that rely on
+/// it (to safely embed `redirect_uri`/`next` in query strings) need it
+/// registered by hand.
+/// RFC 3986 unreserved characters, left unescaped like every other
+/// percent-encoding scheme (`-`, `_`, `.`, `~` alongside alphanumerics).
+const URLENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+fn urlencode_filter(value: String, _kwargs: tera::Kwargs, _state: &tera::State) -> String {
+    percent_encoding::utf8_percent_encode(&value, URLENCODE_SET).collect()
 }
 
 #[cfg(test)]

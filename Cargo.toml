@@ -25,10 +25,11 @@ thiserror = "2"
 uuid = "1"
 chrono = "0.4"
 url = "2"
+percent-encoding = "2"
 http = "1.5"
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
 strum = { version = "0.28", features = ["derive"] }
 email_address = "0.2"
-tera = "1"
+tera = { version = "2", features = ["glob_fs"] }

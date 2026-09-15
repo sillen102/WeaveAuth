@@ -70,11 +70,12 @@ async fn login_page_has_no_script_tags_and_bakes_in_bff_url() {
     assert!(body.contains("id=\"google-login-link\""));
     assert!(body.contains("action=\"http://bff.test/login\""));
     // redirect_uri is untrusted (attacker-controllable query param), so it's
-    // rendered through Tera's default HTML-escaping -- `/` becomes `&#x2F;`,
-    // which browsers decode back to `/` when parsing the attribute value.
-    assert!(body.contains("value=\"http:&#x2F;&#x2F;admin.test&#x2F;\""));
+    // rendered through Tera's default HTML-escaping. Tera doesn't escape `/`,
+    // but does escape `&`, `<`, `>`, `"` and `'`, which is sufficient to keep
+    // it safely quoted inside this attribute value.
+    assert!(body.contains("value=\"http://admin.test/\""));
     assert!(body.contains(
-        "href=\"http://bff.test/oidc/google/login?redirect_uri=http%3A//admin.test/"
+        "href=\"http://bff.test/oidc/google/login?redirect_uri=http%3A%2F%2Fadmin.test%2F"
     ));
 }
 
@@ -94,7 +95,7 @@ async fn login_page_falls_back_to_its_own_origin_when_redirect_uri_is_absent() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
-    assert!(body.contains("value=\"http:&#x2F;&#x2F;login.test&#x2F;\""));
+    assert!(body.contains("value=\"http://login.test/\""));
 }
 
 #[tokio::test]
