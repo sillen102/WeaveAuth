@@ -14,6 +14,7 @@ mod controller {
     use common_macros::ErrorResponses;
 
     use crate::crypto::ARGON2;
+    use crate::model::email::normalize_email;
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, UserStorage};
 
@@ -57,7 +58,7 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
-        let user = state.users.get_user_by_email(&req.email).await;
+        let user = state.users.get_user_by_email(&normalize_email(&req.email)).await;
 
         // Always hash, even for an unknown email (against a fixed dummy hash)
         // -- see DUMMY_PASSWORD_HASH. Both branches pay the same Argon2 cost, so

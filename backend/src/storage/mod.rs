@@ -30,8 +30,12 @@ impl VerifiedEmail {
     /// `provider_verified` is whatever the caller independently confirmed
     /// ownership with -- an OIDC id_token's `email_verified` claim, a
     /// password check, etc. `None` if that's not `true`.
+    ///
+    /// Normalizes `email` (case-folds it and strips any `+tag`) so a
+    /// provider's casing or tagging can never mismatch what was stored at
+    /// registration (storage compares emails as plain strings).
     pub(crate) fn new(email: String, provider_verified: bool) -> Option<Self> {
-        provider_verified.then_some(Self(email))
+        provider_verified.then_some(Self(crate::model::email::normalize_email(&email)))
     }
 
     pub(crate) fn as_str(&self) -> &str {

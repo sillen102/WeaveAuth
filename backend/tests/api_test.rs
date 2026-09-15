@@ -77,7 +77,7 @@ async fn login_session(app: axum::Router, email: &str, password: &str) -> String
 /// Drives a real authorize -> extracts `code` -> returns it plus the verifier
 /// whose SHA256 matches the challenge sent to /oauth/authorize.
 async fn issue_code(app: axum::Router, code_challenge: &str) -> String {
-    let login_session = login_session(app.clone(), "alice", "hunter2").await;
+    let login_session = login_session(app.clone(), "alice@example.com", "hunter2").await;
 
     let resp = app
         .oneshot(

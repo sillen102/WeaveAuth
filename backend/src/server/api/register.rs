@@ -8,6 +8,7 @@ mod controller {
     use axum::http::StatusCode;
     use axum::Json;
     use chrono::Utc;
+    use email_address::EmailAddress;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
@@ -15,6 +16,7 @@ mod controller {
     use common_macros::ErrorResponses;
 
     use crate::crypto::ARGON2;
+    use crate::model::email::normalize_email;
     use crate::model::user::User;
     use crate::server::AppState;
     use crate::storage::UserStorage;
@@ -27,6 +29,9 @@ mod controller {
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum RegisterError {
+        #[error("invalid email address")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid email address")]
+        InvalidEmail,
         #[error("email already taken")]
         #[error_response(StatusCode::CONFLICT, details = "email already taken")]
         EmailTaken,
@@ -39,6 +44,11 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<RegisterRequest>,
     ) -> Result<StatusCode, RegisterError> {
+        let email = normalize_email(&req.email);
+        if !EmailAddress::is_valid(&email) {
+            return Err(RegisterError::InvalidEmail);
+        }
+
         // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking keeps
         // it off this tokio worker thread so it doesn't stall other tasks while
         // hashing.
@@ -57,7 +67,7 @@ mod controller {
             .users
             .create_user(User {
                 id: Uuid::new_v4(),
-                email: req.email,
+                email,
                 password: Some(password_hash),
                 // This app has no verification-email flow of its own -- only
                 // an OIDC provider confirming the address (see
@@ -81,8 +91,8 @@ mod controller {
             .id("register")
             .summary("Register a new user")
             .description(
-                "Creates a user with a password hashed via Argon2; 409 if the email is \
-                 already taken",
+                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
+                 valid address, 409 if it's already taken",
             )
     }
 }
@@ -124,6 +134,19 @@ mod tests {
         let result = register(State(state.clone()), Json(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_invalid_email() {
+        let state = state();
+        let req = RegisterRequest {
+            email: "not-an-email".to_string(),
+            password: "hunter2".to_string(),
+        };
+
+        let result = register(State(state), Json(req)).await;
+
+        assert_eq!(result, Err(RegisterError::InvalidEmail));
     }
 
     #[tokio::test]

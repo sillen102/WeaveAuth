@@ -29,6 +29,7 @@ argon2 = { workspace = true }
 jsonwebtoken = { workspace = true , features = ["rust_crypto"] }
 openidconnect = { workspace = true }
 rsa = { workspace = true, features = ["pem"] }
+email_address = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
