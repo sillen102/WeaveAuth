@@ -242,6 +242,33 @@ async fn oidc_callback_bounces_to_next_when_backend_rejects_the_state() -> anyho
 }
 
 #[tokio::test]
+async fn oidc_callback_bounces_to_next_and_clears_flow_cookies_on_provider_error() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?error=access_denied")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=good-state",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=1"));
+
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn oidc_callback_rejects_a_state_that_does_not_match_the_flow_cookie() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();

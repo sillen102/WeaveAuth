@@ -45,8 +45,13 @@ mod controller {
 
     #[derive(Deserialize)]
     pub(crate) struct OidcCallbackRequest {
-        pub(super) code: String,
-        pub(super) state: String,
+        /// Absent when the provider redirects back with `?error=...` instead
+        /// (e.g. user declined consent) -- optional so that case still
+        /// deserializes into a friendly `next` bounce instead of axum
+        /// rejecting the query with a raw 422 before the handler (and its
+        /// flow-cookie cleanup) ever runs.
+        pub(super) code: Option<String>,
+        pub(super) state: Option<String>,
     }
 
     /// Mirrors backend's `OidcCallbackResponse` -- either a completed login
@@ -252,12 +257,6 @@ mod controller {
             (header::SET_COOKIE, clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure)),
         ];
 
-        // Constant-time-ness doesn't matter here -- `state` isn't a secret
-        // the attacker lacks, it's a binding check that this browser is the
-        // one that started the flow. A plain compare is fine.
-        if req.state != flow_state {
-            return Err(OidcCallbackError::StateMismatch);
-        }
         let error_redirect = |next: &str| -> Response {
             let sep = if next.contains('?') { '&' } else { '?' };
             (
@@ -268,10 +267,23 @@ mod controller {
                 .into_response()
         };
 
+        // Provider declined (e.g. `?error=access_denied`) or otherwise
+        // skipped `code`/`state` -- no exchange to attempt, bounce friendly.
+        let (Some(code), Some(req_state)) = (req.code.as_ref(), req.state.as_ref()) else {
+            return Ok(error_redirect(&next));
+        };
+
+        // Constant-time-ness doesn't matter here -- `state` isn't a secret
+        // the attacker lacks, it's a binding check that this browser is the
+        // one that started the flow. A plain compare is fine.
+        if *req_state != flow_state {
+            return Err(OidcCallbackError::StateMismatch);
+        }
+
         let backend_resp = match state
             .http_client
             .get(format!("{}/oauth/oidc/{provider}/callback", state.config.backend_url))
-            .query(&[("code", &req.code), ("state", &req.state)])
+            .query(&[("code", code), ("state", req_state)])
             .send()
             .await
         {
@@ -443,7 +455,10 @@ mod tests {
     #[tokio::test]
     async fn callback_rejects_a_path_traversal_provider_before_reading_flow_cookies() {
         let state = state_with_trusted_origins(vec!["http://login.test".to_string()]);
-        let req = OidcCallbackRequest { code: "c".to_string(), state: "s".to_string() };
+        let req = OidcCallbackRequest {
+            code: Some("c".to_string()),
+            state: Some("s".to_string()),
+        };
 
         let result =
             oidc_callback(State(state), Path("../health".to_string()), Query(req), HeaderMap::new()).await;
