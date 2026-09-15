@@ -14,7 +14,7 @@ mod controller {
 
     use crate::server::api::complete_login::{complete_login, CompleteLoginError};
     use crate::server::cookie::{build_cookie, clear_cookie, extract_cookie};
-    use crate::server::origin_check::require_trusted_origin;
+    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
     use crate::server::AppState;
 
     /// Path the flow cookies are scoped to -- covers every provider's
@@ -27,8 +27,10 @@ mod controller {
     #[derive(Deserialize)]
     pub(crate) struct OidcLoginRequest {
         pub(super) redirect_uri: String,
-        /// Where to bounce the browser back to if the flow fails -- the login
-        /// page's own URL, supplied by its own link, not user-typed input.
+        /// Where to bounce the browser back to if the flow fails. Arrives as a
+        /// plain query param on a GET link anyone can send a victim, so it's
+        /// checked with `is_safe_redirect_target` before use -- see
+        /// `OidcLoginError::InvalidNext`.
         pub(super) next: String,
     }
 
@@ -54,8 +56,8 @@ mod controller {
         pub(super) pending_link_token: String,
         pub(super) password: String,
         pub(super) redirect_uri: String,
-        /// Where to bounce the browser back to if confirmation fails -- the
-        /// login page's own URL, supplied by its form, not user-typed input.
+        /// Where to bounce the browser back to if confirmation fails. Checked
+        /// with `is_safe_redirect_target` -- see `OidcConfirmLinkError::InvalidNext`.
         pub(super) next: String,
     }
 
@@ -79,6 +81,9 @@ mod controller {
         #[error("backend returned an unexpected response")]
         #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
         BackendUnavailable,
+        #[error("next is not a same-origin path or a trusted origin")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
+        InvalidNext,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -102,6 +107,9 @@ mod controller {
         #[error("backend returned an unexpected response")]
         #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
         BackendUnavailable,
+        #[error("next is not a same-origin path or a trusted origin")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
+        InvalidNext,
     }
 
     impl From<CompleteLoginError> for OidcConfirmLinkError {
@@ -126,6 +134,10 @@ mod controller {
         Path(provider): Path<String>,
         Query(req): Query<OidcLoginRequest>,
     ) -> Result<Response, OidcLoginError> {
+        if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
+            return Err(OidcLoginError::InvalidNext);
+        }
+
         let backend_resp = state
             .http_client
             .get(format!("{}/oauth/oidc/{provider}/login", state.config.backend_url))
@@ -269,6 +281,9 @@ mod controller {
     ) -> Result<Response, OidcConfirmLinkError> {
         require_trusted_origin(&headers, &state.config.trusted_origins)
             .map_err(|_| OidcConfirmLinkError::UntrustedOrigin)?;
+        if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
+            return Err(OidcConfirmLinkError::InvalidNext);
+        }
 
         let backend_resp = state
             .http_client

@@ -38,9 +38,25 @@ pub(crate) fn require_trusted_origin(
     }
 }
 
+/// Whether `target` is safe to put in a `Location` header: either a
+/// same-origin-relative path (so no `Location` scheme/host takes over the
+/// navigation), or an absolute URL whose origin is in `trusted_origins`.
+///
+/// Guards against open redirects where `target` comes from attacker-controlled
+/// input (e.g. a `next` query param on a plain GET link) rather than a
+/// same-origin POST guarded by `require_trusted_origin`.
+pub(crate) fn is_safe_redirect_target(target: &str, trusted_origins: &[String]) -> bool {
+    if target.starts_with('/') && !target.starts_with("//") && !target.starts_with("/\\") {
+        return true;
+    }
+    url::Url::parse(target)
+        .map(|u| trusted_origins.iter().any(|t| t == &u.origin().ascii_serialization()))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::require_trusted_origin;
+    use super::{is_safe_redirect_target, require_trusted_origin};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     fn trusted() -> Vec<String> {
@@ -105,5 +121,26 @@ mod tests {
         headers.insert("referer", HeaderValue::from_static("http://evil.test/"));
 
         assert_eq!(require_trusted_origin(&headers, &trusted()), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_relative_path_as_redirect_target() {
+        assert!(is_safe_redirect_target("/dashboard?x=1", &trusted()));
+    }
+
+    #[test]
+    fn rejects_a_protocol_relative_url_as_redirect_target() {
+        // "//evil.test" has no scheme but browsers resolve it host-first.
+        assert!(!is_safe_redirect_target("//evil.test", &trusted()));
+    }
+
+    #[test]
+    fn accepts_an_absolute_url_on_a_trusted_origin() {
+        assert!(is_safe_redirect_target("http://login.test/foo", &trusted()));
+    }
+
+    #[test]
+    fn rejects_an_absolute_url_on_an_untrusted_origin() {
+        assert!(!is_safe_redirect_target("https://evil.tld", &trusted()));
     }
 }
