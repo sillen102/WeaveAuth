@@ -6,8 +6,10 @@ use crate::storage::in_memory::{
     InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
     InMemoryUserStorage,
 };
+use crate::storage::ExpiryMaintenance;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 mod api;
 pub mod router;
@@ -29,6 +31,16 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// Sweeps every TTL'd store once. Called on an interval by `app_start`;
+    /// split out so tests can drive it directly without a real timer.
+    pub(crate) async fn sweep_expired(&mut self) {
+        self.pkce.sweep_expired().await;
+        self.login_sessions.sweep_expired().await;
+        self.refresh_tokens.sweep_expired().await;
+        self.oidc_state.sweep_expired().await;
+        self.pending_oidc_links.sweep_expired().await;
+    }
+
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
         // No redirects: an OIDC provider redirecting this server-side request
         // elsewhere would be a request-forgery vector, not a legitimate flow.
@@ -61,8 +73,21 @@ pub async fn app_start(config: &Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, app(config).await?).await?;
+    let state = AppState::new(config).await?;
+    spawn_expiry_sweep(state.clone(), Duration::from_secs(config.expiry_sweep_interval_secs));
+
+    axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+fn spawn_expiry_sweep(mut state: AppState, interval: Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        loop {
+            interval.tick().await;
+            state.sweep_expired().await;
+        }
+    });
 }
 
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.

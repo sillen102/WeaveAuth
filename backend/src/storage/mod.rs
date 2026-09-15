@@ -208,6 +208,19 @@ pub(crate) trait PendingOidcLinkStorage {
     async fn take_pending_link(&mut self, token: &str) -> Option<PendingOidcLink>;
 }
 
+/// Periodic upkeep for storage backends that accumulate single-use, TTL'd
+/// entries (PKCE challenges, OIDC state, login sessions, ...): entries only
+/// ever get removed by `take_*` today, so a flow that's abandoned after
+/// `save_*` (or never even started, on an endpoint anyone can hit) leaks
+/// forever. A caller -- e.g. a scheduled task -- can call `sweep_expired` on
+/// every store on an interval to bound that.
+///
+/// Backed by a store with a native TTL (Redis `EXPIRE`, etc.) can implement
+/// this as a no-op: expiry already happens on its own.
+pub(crate) trait ExpiryMaintenance {
+    async fn sweep_expired(&mut self);
+}
+
 #[cfg(test)]
 mod tests {
     use super::VerifiedEmail;

@@ -33,6 +33,9 @@ pub struct Config {
     /// registration spam on its own.
     pub rate_limit_max_attempts: u32,
     pub rate_limit_window_secs: u64,
+    /// How often the background task sweeps expired sessions out of the
+    /// session store. Bounds how long a dead session's leftovers linger.
+    pub expiry_sweep_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             trusted_origins: vec!["http://localhost:8081".to_string()],
             rate_limit_max_attempts: 10,
             rate_limit_window_secs: 60,
+            expiry_sweep_interval_secs: 60,
         }
     }
 }
@@ -80,6 +84,7 @@ impl Config {
                         "WA_SESSION_COOKIE_NAME" => "session_cookie_name".into(),
                         "WA_RATE_LIMIT_MAX_ATTEMPTS" => "rate_limit_max_attempts".into(),
                         "WA_RATE_LIMIT_WINDOW_SECS" => "rate_limit_window_secs".into(),
+                        "WA_EXPIRY_SWEEP_INTERVAL_SECS" => "expiry_sweep_interval_secs".into(),
                         _ => "_ignored".into(),
                     })
                     .ignore(&["_ignored"]),

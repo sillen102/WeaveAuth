@@ -21,6 +21,7 @@ fn test_config() -> Config {
         refresh_token_ttl_secs: 2_592_000,
         oidc_state_ttl_secs: 300,
         pending_oidc_link_ttl_secs: 600,
+        expiry_sweep_interval_secs: 60,
         oidc_providers: HashMap::new(),
     }
 }

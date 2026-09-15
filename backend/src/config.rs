@@ -28,6 +28,10 @@ pub struct Config {
     /// `oidc_state_ttl_secs` -- this one waits on a human reading a prompt
     /// and typing a password, not just a redirect round-trip.
     pub pending_oidc_link_ttl_secs: i64,
+    /// How often the background task sweeps expired entries out of the
+    /// TTL'd stores (PKCE challenges, OIDC state, login sessions, ...).
+    /// Bounds how long an abandoned flow's leftovers linger.
+    pub expiry_sweep_interval_secs: u64,
     /// Third-party OIDC login providers, keyed by a short name used in the
     /// route path (e.g. "google" for `/oauth/oidc/google/login`). Empty by
     /// default -- third-party login is a no-op unless a provider is
@@ -62,6 +66,7 @@ impl Default for Config {
             refresh_token_ttl_secs: 2_592_000,
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
+            expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
         }
     }

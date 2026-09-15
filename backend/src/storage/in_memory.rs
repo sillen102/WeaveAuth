@@ -2,8 +2,8 @@ use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
 use crate::storage::{
-    JwkStorage, LoginSessionStorage, OidcLinkOutcome, OidcLoginState, OidcStateStorage,
-    PendingOidcLink, PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome,
+    ExpiryMaintenance, JwkStorage, LoginSessionStorage, OidcLinkOutcome, OidcLoginState,
+    OidcStateStorage, PendingOidcLink, PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome,
     RefreshTokenStorage, UserStorage, VerifiedEmail,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -171,6 +171,17 @@ impl PendingOidcLinkStorage for InMemoryPendingOidcLinkStorage {
     }
 }
 
+impl ExpiryMaintenance for InMemoryPendingOidcLinkStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.entries
+            .lock()
+            .await
+            .retain(|_, (_, _, _, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
+    }
+}
+
 /// csrf_state -> (provider, pkce_verifier, nonce, issued_at)
 type OidcStateEntries = HashMap<String, (String, String, String, DateTime<Utc>)>;
 
@@ -203,6 +214,17 @@ impl OidcStateStorage for InMemoryOidcStateStorage {
             return None;
         }
         Some(OidcLoginState { provider, pkce_verifier, nonce })
+    }
+}
+
+impl ExpiryMaintenance for InMemoryOidcStateStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.entries
+            .lock()
+            .await
+            .retain(|_, (_, _, _, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
     }
 }
 
@@ -258,6 +280,17 @@ impl PkceStorage for InMemoryPkceStorage {
     }
 }
 
+impl ExpiryMaintenance for InMemoryPkceStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.code_challenges
+            .lock()
+            .await
+            .retain(|_, (_, _, issued_at, _, _)| (now - *issued_at).num_seconds() <= ttl_secs);
+    }
+}
+
 /// session_id -> (user_id, issued_at)
 type LoginSessionEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
 
@@ -294,6 +327,17 @@ impl LoginSessionStorage for InMemoryLoginSessionStorage {
             return None;
         }
         Some(user_id)
+    }
+}
+
+impl ExpiryMaintenance for InMemoryLoginSessionStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, (_, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
     }
 }
 
@@ -354,6 +398,17 @@ impl RefreshTokenStorage for InMemoryRefreshTokenStorage {
             user_id: record.user_id,
             family_id: record.family_id,
         }
+    }
+}
+
+impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.tokens
+            .lock()
+            .await
+            .retain(|_, record| (now - record.issued_at).num_seconds() <= ttl_secs);
     }
 }
 

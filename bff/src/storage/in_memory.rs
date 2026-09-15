@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::model::session::SessionData;
-use crate::storage::SessionStorage;
+use crate::storage::{ExpiryMaintenance, SessionStorage};
+use chrono::Utc;
 
 #[derive(Clone)]
 pub(crate) struct InMemorySessionStorage {
@@ -26,6 +27,18 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Option<SessionData> {
         self.sessions.lock().await.get(session_id).cloned()
+    }
+}
+
+impl ExpiryMaintenance for InMemorySessionStorage {
+    async fn sweep_expired(&mut self) {
+        let now = Utc::now();
+        // `refresh_expires_at` is the outer bound -- the proxy can still
+        // silently refresh the access token up until then.
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, data| data.refresh_expires_at > now);
     }
 }
 

@@ -2,6 +2,14 @@
 members = ["backend", "bff", "common", "common/macros", "login"]
 resolver = "2"
 
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 0
+
 [workspace.dependencies]
 axum = "0.8"
 aide = "0.16.0-alpha.4"

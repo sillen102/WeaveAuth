@@ -18,6 +18,7 @@ fn test_config(backend_url: String) -> Config {
         trusted_origins: vec!["http://login.test".into()],
         rate_limit_max_attempts: 1000,
         rate_limit_window_secs: 60,
+        expiry_sweep_interval_secs: 60,
     }
 }
 
