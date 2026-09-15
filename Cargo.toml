@@ -30,3 +30,4 @@ sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
 strum = { version = "0.28", features = ["derive"] }
+tera = "1"

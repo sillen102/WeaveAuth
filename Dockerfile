@@ -11,6 +11,7 @@ COPY --from=builder /app/target/release/weaveauth /usr/local/bin/weaveauth
 COPY --from=builder /app/target/release/weaveauth-bff /usr/local/bin/weaveauth-bff
 COPY --from=builder /app/target/release/weaveauth-login /usr/local/bin/weaveauth-login
 COPY --from=builder /app/login/static /app/login/static
+COPY --from=builder /app/login/templates /app/login/templates
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 EXPOSE 1983 8080 8081

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WeaveAuth</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/htmx.min.js"></script>
+</head>
+<body>
+  <div id="page" hx-select="#page-content" hx-swap="innerHTML"></div>
+  <script>
+    // This shell is compiled into the login binary, so a deployer can never
+    // touch it -- only its rendered output (login.html/register.html) is
+    // replaceable, and those are server-rendered HTML/CSS with no JS of
+    // their own. It always loads login.html first, keeping the shell's own
+    // query string (redirect_uri, error, ...) intact; login.html/register.html
+    // then swap each other in via their pre-rendered hx-get links.
+    htmx.ajax("GET", "login.html" + window.location.search, "#page");
+  </script>
+</body>
+</html>

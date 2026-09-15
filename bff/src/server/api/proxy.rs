@@ -114,7 +114,7 @@ mod controller {
     /// concurrently; backend's refresh tokens are single-use, so only one of
     /// these wins and the rest fail closed (a spurious 401) instead of
     /// queueing behind the winner.
-    async fn refresh_session(
+    pub(super) async fn refresh_session(
         state: &mut AppState,
         session_id: &str,
         refresh_token: &str,
@@ -146,5 +146,40 @@ mod controller {
             .save_session(session_id.to_string(), data.clone())
             .await;
         Some(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `authenticate` itself needs a real `axum::middleware::Next`, which can
+    // only be constructed by the middleware stack -- so it's covered
+    // end-to-end via `bff/tests/proxy.rs` instead. `refresh_session` has no
+    // such constraint and is worth pinning directly: it's the one piece of
+    // this file that's a plain, directly-callable async fn.
+    use super::controller::*;
+    use crate::config::Config;
+    use crate::server::AppState;
+
+    fn state_with_backend(backend_url: &str) -> AppState {
+        AppState::new(Config {
+            port: 8080,
+            bff_url: "http://bff.test".into(),
+            backend_url: backend_url.into(),
+            session_cookie_name: "wa_session".into(),
+            routes: vec![],
+            trusted_origins: vec![],
+            rate_limit_max_attempts: 1000,
+            rate_limit_window_secs: 60,
+        })
+        .expect("valid app state")
+    }
+
+    #[tokio::test]
+    async fn refresh_session_returns_none_when_backend_is_unreachable() {
+        let mut state = state_with_backend("http://127.0.0.1:1");
+
+        let result = refresh_session(&mut state, "session-1", "refresh-token").await;
+
+        assert!(result.is_none());
     }
 }

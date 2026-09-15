@@ -11,25 +11,15 @@ fn test_config() -> Config {
     }
 }
 
-#[tokio::test]
-async fn config_js_exposes_bff_url() {
-    let app = app(test_config());
-
-    let resp = app
-        .oneshot(Request::get("/config.js").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
+async fn body_string(resp: axum::response::Response) -> String {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("window.BFF_URL = \"http://bff.test\";"));
+    String::from_utf8(body.to_vec()).unwrap()
 }
 
 #[tokio::test]
-async fn serves_static_index_page_at_root() {
+async fn serves_the_embedded_shell_at_root() {
     let app = app(test_config());
 
     let resp = app
@@ -38,31 +28,174 @@ async fn serves_static_index_page_at_root() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("id=\"login-form\""));
-    assert!(body.contains("id=\"register-link\""));
-    assert!(body.contains("id=\"google-login-link\""));
+    let body = body_string(resp).await;
+    assert!(body.contains("id=\"page\""));
+    assert!(body.contains("src=\"/htmx.min.js\""));
+    assert!(body.contains("login.html"));
+    assert!(!body.contains("<script src=\"/config.js\">"));
 }
 
 #[tokio::test]
-async fn serves_static_register_page() {
+async fn serves_the_embedded_shell_at_index_html_too() {
     let app = app(test_config());
 
     let resp = app
-        .oneshot(Request::get("/register.html").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/index.html").body(Body::empty()).unwrap())
         .await
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let body = body_string(resp).await;
+    assert!(body.contains("id=\"page\""));
+}
+
+#[tokio::test]
+async fn login_page_has_no_script_tags_and_bakes_in_bff_url() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/login.html?redirect_uri=http%3A%2F%2Fadmin.test%2F")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(!body.contains("<script"));
+    assert!(body.contains("id=\"login-form\""));
+    assert!(body.contains("id=\"register-link\""));
+    assert!(body.contains("id=\"google-login-link\""));
+    assert!(body.contains("action=\"http://bff.test/login\""));
+    // redirect_uri is untrusted (attacker-controllable query param), so it's
+    // rendered through Tera's default HTML-escaping -- `/` becomes `&#x2F;`,
+    // which browsers decode back to `/` when parsing the attribute value.
+    assert!(body.contains("value=\"http:&#x2F;&#x2F;admin.test&#x2F;\""));
+    assert!(body.contains(
+        "href=\"http://bff.test/oidc/google/login?redirect_uri=http%3A//admin.test/"
+    ));
+}
+
+#[tokio::test]
+async fn login_page_falls_back_to_its_own_origin_when_redirect_uri_is_absent() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/login.html")
+                .header("host", "login.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("value=\"http:&#x2F;&#x2F;login.test&#x2F;\""));
+}
+
+#[tokio::test]
+async fn login_page_shows_the_generic_error_message() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(Request::get("/login.html?error=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(body.contains("Incorrect email or password."));
+}
+
+#[tokio::test]
+async fn login_page_shows_the_link_failed_error_message() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/login.html?error=link_failed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(body.contains("please try Sign in with Google again"));
+    assert!(!body.contains("Incorrect email or password."));
+}
+
+#[tokio::test]
+async fn login_page_renders_the_confirm_link_form_when_a_pending_link_token_is_present() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get(
+                "/login.html?pending_link_token=tok-123&email=squatter%40example.com&redirect_uri=http%3A%2F%2Fadmin.test%2F",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(!body.contains("<script"));
+    assert!(body.contains("id=\"confirm-link-form\""));
+    assert!(body.contains("squatter@example.com"));
+    assert!(body.contains("value=\"tok-123\""));
+    assert!(body.contains("action=\"http://bff.test/oidc/confirm-link\""));
+    assert!(!body.contains("id=\"login-form\""));
+}
+
+#[tokio::test]
+async fn serves_vendored_htmx() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(Request::get("/htmx.min.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn register_page_has_no_script_tags_and_bakes_in_bff_url() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/register.html?redirect_uri=http%3A%2F%2Fadmin.test%2F")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(!body.contains("<script"));
     assert!(body.contains("id=\"register-form\""));
     assert!(body.contains("id=\"google-login-link\""));
+    assert!(body.contains("action=\"http://bff.test/register\""));
+}
+
+#[tokio::test]
+async fn register_page_shows_the_taken_email_error_message() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(Request::get("/register.html?error=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(body.contains("That email is already taken."));
 }
 
 #[tokio::test]

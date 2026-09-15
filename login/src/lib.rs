@@ -21,17 +21,30 @@
 )]
 
 use std::env;
-use axum::extract::State;
-use axum::http::header;
-use axum::response::IntoResponse;
+use axum::extract::{OriginalUri, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use figment::providers::{Env, Serialized};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
+use tera::{Context, Tera};
 use tower_http::services::ServeDir;
 
 const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
+
+/// Deployer-replaceable page templates -- see `AGENTS.md` in this crate for
+/// the rule these must follow (plain HTML/CSS, no `<script>`, no client-side
+/// logic at all). Re-globbed on every request rather than loaded once, so a
+/// deployer can drop in a new file without restarting the process, matching
+/// how the static assets in `STATIC_DIR` already behave.
+const TEMPLATES_GLOB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/*.html");
+
+/// The login shell -- compiled into the binary rather than served from
+/// `STATIC_DIR`, so a deployer replacing the static dir's contents (to
+/// reskin `login.html`/`register.html`) can't affect this routing shell.
+const INDEX_HTML: &str = include_str!("index.html");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -80,21 +93,101 @@ impl Config {
 pub fn app(config: Config) -> Router {
     let files = ServeDir::new(STATIC_DIR);
     Router::new()
-        .route("/config.js", get(config_js))
+        .route("/", get(index_page))
+        .route("/index.html", get(index_page))
+        .route("/login.html", get(login_page))
+        .route("/register.html", get(register_page))
         .nest_service("/static", files.clone())
         .fallback_service(files)
         .with_state(config)
 }
 
-/// Exposes `bff_url` to the static login/register pages, so their forms can
-/// submit straight to bff's absolute URL (a real cross-origin navigation --
-/// not a fetch, so this needs no CORS) without the deployer-replaceable HTML
-/// files having to know it themselves.
-async fn config_js(State(config): State<Config>) -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        format!("window.BFF_URL = {:?};\n", config.bff_url),
-    )
+/// Serves the compiled-in shell at `/` (and `/index.html`, for anyone linking
+/// there directly) ahead of the static-dir fallback, so it always wins over
+/// anything a deployer drops into the static dir.
+async fn index_page() -> impl IntoResponse {
+    Html(INDEX_HTML)
+}
+
+/// Query params a deployer's page template can be rendered with. All
+/// optional -- the templates handle every field being absent (a plain first
+/// visit).
+#[derive(Debug, Default, Deserialize)]
+struct PageQuery {
+    redirect_uri: Option<String>,
+    error: Option<String>,
+    pending_link_token: Option<String>,
+    email: Option<String>,
+}
+
+async fn login_page(
+    State(config): State<Config>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, StatusCode> {
+    render_page("login.html", &config, &headers, uri.path(), &query)
+}
+
+async fn register_page(
+    State(config): State<Config>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, StatusCode> {
+    render_page("register.html", &config, &headers, uri.path(), &query)
+}
+
+/// This service's own public origin, as best guessed from the request --
+/// used only as the fallback `redirect_uri` when a caller hits a page
+/// without one (e.g. visiting it directly rather than via a
+/// `?redirect_uri=...` link).
+fn own_origin(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
+}
+
+/// Renders one of the deployer-replaceable page templates, computing the
+/// same values their inline scripts used to compute client-side:
+/// `redirect_uri` (falling back to this service's own origin), and
+/// `own_url`/`next` (this page's own URL with that `redirect_uri` echoed
+/// back, so a form failure or an OIDC round-trip can bounce back here).
+fn render_page(
+    template: &str,
+    config: &Config,
+    headers: &HeaderMap,
+    path: &str,
+    query: &PageQuery,
+) -> Result<Html<String>, StatusCode> {
+    let origin = own_origin(headers);
+    let redirect_uri = query
+        .redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{origin}/"));
+    let own_url = format!(
+        "{origin}{path}?redirect_uri={}",
+        url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>(),
+    );
+
+    let mut ctx = Context::new();
+    ctx.insert("bff_url", &config.bff_url);
+    ctx.insert("redirect_uri", &redirect_uri);
+    ctx.insert("own_url", &own_url);
+    ctx.insert("error", &query.error);
+    ctx.insert("pending_link_token", &query.pending_link_token);
+    ctx.insert("email", &query.email);
+
+    let tera = Tera::new(TEMPLATES_GLOB).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tera.render(template, &ctx)
+        .map(Html)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[cfg(test)]
