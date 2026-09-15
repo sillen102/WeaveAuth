@@ -3,6 +3,7 @@ pub(crate) mod in_memory;
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
+use email_address::EmailAddress;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,9 +34,14 @@ impl VerifiedEmail {
     ///
     /// Normalizes `email` (case-folds it and strips any `+tag`) so a
     /// provider's casing or tagging can never mismatch what was stored at
-    /// registration (storage compares emails as plain strings).
+    /// registration (storage compares emails as plain strings), and returns
+    /// `None` if the result isn't a well-formed address -- `/register`
+    /// validates its own input, so without this check the OIDC path would be
+    /// the one way a malformed address could reach storage and act as a
+    /// linking key.
     pub(crate) fn new(email: String, provider_verified: bool) -> Option<Self> {
-        provider_verified.then_some(Self(crate::model::email::normalize_email(&email)))
+        let email = crate::model::email::normalize_email(&email);
+        (provider_verified && EmailAddress::is_valid(&email)).then_some(Self(email))
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -224,6 +230,12 @@ pub(crate) trait ExpiryMaintenance {
 #[cfg(test)]
 mod tests {
     use super::VerifiedEmail;
+
+    #[test]
+    fn verified_email_rejects_a_malformed_address() {
+        assert!(VerifiedEmail::new("not-an-email".to_string(), true).is_none());
+        assert!(VerifiedEmail::new("@corp.com".to_string(), true).is_none());
+    }
 
     #[test]
     fn verified_email_requires_provider_verified_true() {
