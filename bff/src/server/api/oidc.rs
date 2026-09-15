@@ -1,4 +1,5 @@
 pub(crate) use controller::oidc_callback;
+pub(crate) use controller::oidc_confirm_link;
 pub(crate) use controller::start_oidc_login;
 
 mod controller {
@@ -6,12 +7,14 @@ mod controller {
     use axum::extract::{Path, Query, State};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use axum::response::{AppendHeaders, IntoResponse, Response};
+    use axum::Form;
     use common_macros::ErrorResponses;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
     use crate::server::api::complete_login::{complete_login, CompleteLoginError};
     use crate::server::cookie::{build_cookie, clear_cookie, extract_cookie};
+    use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
 
     /// Path the flow cookies are scoped to -- covers every provider's
@@ -33,6 +36,33 @@ mod controller {
     pub(crate) struct OidcCallbackRequest {
         pub(super) code: String,
         pub(super) state: String,
+    }
+
+    /// Mirrors backend's `OidcCallbackResponse` -- either a completed login
+    /// (same shape as a password login) or a signal that this email matches
+    /// an existing, unverified account and needs `oidc_confirm_link` before
+    /// the identity is actually linked.
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum OidcCallbackResponse {
+        Authenticated { login_session: String },
+        PasswordConfirmationRequired { pending_link_token: String, email: String },
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct OidcConfirmLinkRequest {
+        pub(super) pending_link_token: String,
+        pub(super) password: String,
+        pub(super) redirect_uri: String,
+        /// Where to bounce the browser back to if confirmation fails -- the
+        /// login page's own URL, supplied by its form, not user-typed input.
+        pub(super) next: String,
+    }
+
+    #[derive(Serialize)]
+    struct ConfirmLinkBackendRequest<'a> {
+        pending_link_token: &'a str,
+        password: &'a str,
     }
 
     #[derive(Deserialize)]
@@ -61,6 +91,27 @@ mod controller {
         #[error("missing or expired oidc flow state")]
         #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired oidc flow state")]
         MissingFlowState,
+    }
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum OidcConfirmLinkError {
+        #[error("request did not come from a trusted origin")]
+        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        UntrustedOrigin,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
+    impl From<CompleteLoginError> for OidcConfirmLinkError {
+        fn from(err: CompleteLoginError) -> Self {
+            match err {
+                CompleteLoginError::InvalidRedirectUri
+                | CompleteLoginError::TokenExchangeFailed
+                | CompleteLoginError::BackendUnavailable => OidcConfirmLinkError::BackendUnavailable,
+            }
+        }
     }
 
     /// Starts a third-party OIDC login: fetches the provider's consent-screen
@@ -160,11 +211,33 @@ mod controller {
             Ok(resp) if resp.status().is_success() => resp,
             _ => return Ok(error_redirect(&next)),
         };
-        let Ok(login_session) = backend_resp.json::<LoginSessionResponse>().await else {
+        let Ok(callback_response) = backend_resp.json::<OidcCallbackResponse>().await else {
             return Ok(error_redirect(&next));
         };
 
-        let session_cookie = match complete_login(&mut state, &login_session.login_session, &redirect_uri).await {
+        let login_session = match callback_response {
+            OidcCallbackResponse::Authenticated { login_session } => login_session,
+            OidcCallbackResponse::PasswordConfirmationRequired { pending_link_token, email } => {
+                // Not a failure -- the login page renders a "confirm your
+                // password to link this account" form for this case, so it
+                // needs these on its own URL rather than a friendly error.
+                let sep = if next.contains('?') { '&' } else { '?' };
+                let location = format!(
+                    "{next}{sep}pending_link_token={}&email={}",
+                    url::form_urlencoded::byte_serialize(pending_link_token.as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>(),
+                );
+                return Ok((
+                    StatusCode::SEE_OTHER,
+                    AppendHeaders(clear_flow_cookies),
+                    [(header::LOCATION, location)],
+                    Body::empty(),
+                )
+                    .into_response());
+            }
+        };
+
+        let session_cookie = match complete_login(&mut state, &login_session, &redirect_uri).await {
             Ok(cookie) => cookie,
             Err(CompleteLoginError::InvalidRedirectUri | CompleteLoginError::TokenExchangeFailed | CompleteLoginError::BackendUnavailable) => {
                 return Ok(error_redirect(&next));
@@ -181,5 +254,117 @@ mod controller {
             Body::empty(),
         )
             .into_response())
+    }
+
+    /// Finishes an OIDC login that `oidc_callback` flagged as needing
+    /// password confirmation, once the caller has resupplied the existing
+    /// account's password. Forwards to backend's `/oauth/oidc/confirm-link`,
+    /// then completes the login exactly like a password login would --
+    /// mirroring `start_login` (trusted-origin check, `complete_login`,
+    /// session cookie, redirect to `redirect_uri`).
+    pub(crate) async fn oidc_confirm_link(
+        State(mut state): State<AppState>,
+        headers: HeaderMap,
+        Form(req): Form<OidcConfirmLinkRequest>,
+    ) -> Result<Response, OidcConfirmLinkError> {
+        require_trusted_origin(&headers, &state.config.trusted_origins)
+            .map_err(|_| OidcConfirmLinkError::UntrustedOrigin)?;
+
+        let backend_resp = state
+            .http_client
+            .post(format!("{}/oauth/oidc/confirm-link", state.config.backend_url))
+            .json(&ConfirmLinkBackendRequest {
+                pending_link_token: &req.pending_link_token,
+                password: &req.password,
+            })
+            .send()
+            .await
+            .map_err(|_| OidcConfirmLinkError::BackendUnavailable)?;
+
+        if backend_resp.status() == StatusCode::UNAUTHORIZED || backend_resp.status() == StatusCode::BAD_REQUEST {
+            // Wrong password, or the (single-use) pending-link token is
+            // already dead -- either way there's nothing to retry with, so
+            // send the browser back to the plain login page rather than
+            // re-showing a confirm-link form that can no longer succeed.
+            let sep = if req.next.contains('?') { '&' } else { '?' };
+            return Ok((
+                StatusCode::SEE_OTHER,
+                [(header::LOCATION, format!("{}{sep}error=link_failed", req.next))],
+            )
+                .into_response());
+        }
+        if !backend_resp.status().is_success() {
+            return Err(OidcConfirmLinkError::BackendUnavailable);
+        }
+        let login_session = backend_resp
+            .json::<LoginSessionResponse>()
+            .await
+            .map_err(|_| OidcConfirmLinkError::BackendUnavailable)?
+            .login_session;
+
+        let cookie = complete_login(&mut state, &login_session, &req.redirect_uri).await?;
+
+        Ok((
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)],
+            Body::empty(),
+        )
+            .into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue};
+    use axum::Form;
+
+    use crate::config::Config;
+    use crate::server::api::complete_login::CompleteLoginError;
+    use crate::server::AppState;
+
+    fn state_with_trusted_origins(trusted_origins: Vec<String>) -> AppState {
+        AppState::new(Config {
+            port: 8080,
+            bff_url: "http://bff.test".into(),
+            backend_url: "http://unused.test".into(),
+            session_cookie_name: "wa_session".into(),
+            routes: vec![],
+            trusted_origins,
+            rate_limit_max_attempts: 1000,
+            rate_limit_window_secs: 60,
+        })
+        .expect("valid app state")
+    }
+
+    #[tokio::test]
+    async fn confirm_link_rejects_an_untrusted_origin_before_contacting_backend() {
+        // backend_url above is unreachable -- a FORBIDDEN result (rather than a
+        // BAD_GATEWAY from trying to reach it) proves the origin check runs first.
+        let state = state_with_trusted_origins(vec!["http://login.test".to_string()]);
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("http://evil.test"));
+        let req = OidcConfirmLinkRequest {
+            pending_link_token: "tok".to_string(),
+            password: "hunter2".to_string(),
+            redirect_uri: "http://admin.test/".to_string(),
+            next: "http://login.test/".to_string(),
+        };
+
+        let result = oidc_confirm_link(State(state), headers, Form(req)).await;
+
+        assert_eq!(result.err(), Some(OidcConfirmLinkError::UntrustedOrigin));
+    }
+
+    #[test]
+    fn every_complete_login_error_maps_to_backend_unavailable() {
+        for err in [
+            CompleteLoginError::InvalidRedirectUri,
+            CompleteLoginError::TokenExchangeFailed,
+            CompleteLoginError::BackendUnavailable,
+        ] {
+            assert_eq!(OidcConfirmLinkError::from(err), OidcConfirmLinkError::BackendUnavailable);
+        }
     }
 }

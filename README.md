@@ -21,17 +21,25 @@ Cargo workspace (`backend/` + `bff/` + `login/`), three binaries:
   configured `path_prefix` are forwarded to `upstream_url` with the session cookie
   swapped for an `Authorization: Bearer <access_token>` header (see Configuration
   below).
-- **`weaveauth-login`** (axum + `ServeDir`, static UI) — `:8081`. Optional, thin,
-  replaceable: serves the login page, the registration page, and `/config.js` (injects
-  `window.BFF_URL` so those static pages know where to POST). Both HTML files are
-  plain, deployer-replaceable static assets — no templating, no build step.
+- **`weaveauth-login`** (axum + Tera, server-rendered UI) — `:8081`. Optional, thin,
+  replaceable: `/` serves a small shell (`index.html`, compiled into the binary) that
+  loads `login.html` by default and switches between it and `register.html` via HTMx,
+  keeping the URL's query string (`redirect_uri`, etc.) intact across the swap.
+  `login.html`/`register.html` are Tera templates rendered per-request from
+  `login/templates/` — no build step, so a deployer can drop in reskinned versions of
+  those files without touching the shell that wires them together. Per
+  `login/AGENTS.md`, these templates must stay plain HTML/CSS with **no `<script>` or
+  client-side logic at all** — every dynamic value (`redirect_uri`, the form's
+  `action`, OIDC links, error messages, the OIDC password-confirm view) is computed
+  server-side and injected via the Tera context; only the compiled-in shell is allowed
+  its own JS.
 
 Login (authorization-code + PKCE) flow — the browser only ever talks to `login` and
 `bff`; backend is never in the browser's network tab:
 
-1. Browser hits `login`'s page (`index.html`), which renders a real username/password
-   form (its `action` is set client-side to `{WA_BFF_URL}/login`, read from
-   `/config.js`) plus a link to `register.html` (same pattern, posts to
+1. Browser hits `login`'s shell (`/`), which loads `login.html`: a real
+   username/password form (server-rendered with its `action` already set to
+   `{WA_BFF_URL}/login`) plus a link to `register.html` (same pattern, posts to
    `{WA_BFF_URL}/register`).
 2. Submitting the login form does a **plain cross-origin form POST straight to bff**
    (not a `fetch`) — this is what lets bff's `Set-Cookie` response end up scoped to
@@ -111,23 +119,25 @@ proxied route — hammering one side can't burn the other's budget. `/health` is
 exempt (a cheap liveness check infra commonly polls, shouldn't get caught in either
 bucket):
 
-| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                                         |
-|--------|------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                                            |
-| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                          |
-| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted |
-| GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; `404` for an unknown provider                                                                                                                                             |
-| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend, then finishes the login like `/login` would; failure → 303 → `next?error=1`; `400` if the flow cookies are missing/expired                                                                          |
-| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                                    |
+| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                                                                                                                              |
+|--------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                                                                                                               |
+| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                      |
+| GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; `404` for an unknown provider                                                                                                                                                                                                                                  |
+| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend; on success finishes the login like `/login` would; if backend reports `password_confirmation_required`, 303 → `next?pending_link_token=...&email=...` instead (the login page's own prompt, not an error); failure → 303 → `next?error=1`; `400` if the flow cookies are missing/expired |
+| POST   | `/oidc/confirm-link`         | Form `{pending_link_token, password, redirect_uri, next}`. Forwards to backend's `/oauth/oidc/confirm-link`; on success finishes the login like `/login` does, 303 → `redirect_uri` with session cookie set; wrong password or a dead/expired token → 303 → `next?error=link_failed` (the token is single-use on backend regardless of outcome, so there's nothing to retry); `403` if `Origin`/`Referer` isn't in `trusted_origins` |
+| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                                                                                                                         |
 
 login routes:
 
-| Method | Path             | Returns                                                              |
-|--------|------------------|----------------------------------------------------------------------|
-| GET    | `/`              | Login page (`login/static/index.html`)                               |
-| GET    | `/register.html` | Registration page (`login/static/register.html`)                     |
-| GET    | `/config.js`     | `window.BFF_URL = "...";` — lets the static pages know where to POST |
-| GET    | `/static/*`      | Static assets (`login/static/`)                                      |
+| Method | Path             | Returns                                                                                                                                                 |
+|--------|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GET    | `/`              | Login shell (`login/src/index.html`, compiled into the binary) — loads `login.html` via HTMx                                                            |
+| GET    | `/index.html`    | Same shell, for anyone linking there directly                                                                                                           |
+| GET    | `/login.html`    | Login page, server-rendered from `login/templates/login.html` — also renders the OIDC password-confirm prompt when `?pending_link_token=...` is present |
+| GET    | `/register.html` | Registration page, server-rendered from `login/templates/register.html`                                                                                 |
+| GET    | `/static/*`      | Static assets (`login/static/`) — stylesheet, vendored `htmx.min.js`                                                                                    |
 
 Backend routes:
 
@@ -162,13 +172,6 @@ Open items, in priority order (highest first):
       same as an OIDC provider's), which then lets a subsequent OIDC login
       link automatically via the existing verified-match path -- no special
       case needed for the reset-then-OIDC order.
-- [ ] **bff/login pages don't handle `password_confirmation_required`.**
-      `/oauth/oidc/{provider}/callback` (backend) and `/oidc/{provider}/callback`
-      (bff) can both now return that a matching unverified account exists and
-      needs its password confirmed before linking -- bff currently has no route
-      or UI for collecting that password and calling
-      `/oauth/oidc/confirm-link`. Until this is built, that case is a dead end
-      for the user (no visible error, no path forward) rather than a prompt.
 - [ ] **No server-side password policy.** `minlength="8"` on `register.html` is
       client-side only; `register.rs` accepts any length, including empty, via a
       direct API call.
@@ -370,14 +373,16 @@ members):
   (registration forwarding + its `next`/`?error=1` redirect), and `bff/tests/proxy.rs`
   (bearer-swap, prefix matching, query/body forwarding, auth failures).
 - `login`: unit tests inline (`Config::load()`) plus `login/tests/redirect_test.rs`
-  (`/config.js`, and that both the login and registration static pages, plus other
-  static assets, still serve correctly).
+  (the embedded shell, that `login.html`/`register.html` render with `bff_url` baked in
+  and no `<script>` tags, the OIDC password-confirm view, error-message rendering, and
+  that static assets like `htmx.min.js` still serve correctly).
 
 ## Docker
 
 Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim` builder compiles all
 three binaries (`--release -p weaveauth -p weaveauth-bff -p weaveauth-login`); the
-`debian:bookworm-slim` runtime copies the three binaries plus `/app/login/static` and
+`debian:bookworm-slim` runtime copies the three binaries plus `/app/login/static`,
+`/app/login/templates`, and
 `entrypoint.sh`, which launches all three processes.
 
 ```bash

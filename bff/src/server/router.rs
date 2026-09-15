@@ -1,6 +1,6 @@
 use crate::server::api::{
-    health::health, login::start_login, oidc::oidc_callback, oidc::start_oidc_login,
-    proxy::proxy_router, register::start_register,
+    health::health, login::start_login, oidc::oidc_callback, oidc::oidc_confirm_link,
+    oidc::start_oidc_login, proxy::proxy_router, register::start_register,
 };
 use crate::server::AppState;
 use axum::routing::{get, post};
@@ -35,6 +35,7 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
         .route("/register", post(start_register))
         .route("/oidc/{provider}/login", get(start_oidc_login))
         .route("/oidc/{provider}/callback", get(oidc_callback))
+        .route("/oidc/confirm-link", post(oidc_confirm_link))
         .layer(GovernorLayer::new(build_governor()?))
         .with_state(state.clone());
 

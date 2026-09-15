@@ -67,14 +67,30 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                     if provider != "google" {
                         return Err(StatusCode::NOT_FOUND);
                     }
-                    if q.get("code").map(String::as_str) != Some("good-code")
-                        || q.get("state").map(String::as_str) != Some("good-state")
-                    {
-                        return Err(StatusCode::BAD_REQUEST);
+                    match (q.get("code").map(String::as_str), q.get("state").map(String::as_str)) {
+                        (Some("good-code"), Some("good-state")) => Ok(Json(
+                            serde_json::json!({"status": "authenticated", "login_session": "stub-session"}),
+                        )),
+                        (Some("unverified-code"), Some("unverified-state")) => Ok(Json(serde_json::json!({
+                            "status": "password_confirmation_required",
+                            "pending_link_token": "stub-pending-link-token",
+                            "email": "squatter@example.com",
+                        }))),
+                        _ => Err(StatusCode::BAD_REQUEST),
                     }
-                    Ok(Json(serde_json::json!({"login_session": "stub-session"})))
                 },
             ),
+        )
+        .route(
+            "/oauth/oidc/confirm-link",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                if body["pending_link_token"] == "stub-pending-link-token" && body["password"] == "correct-password"
+                {
+                    Ok(Json(serde_json::json!({"login_session": "stub-session"})))
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }),
         )
         .route(
             "/oauth/authorize",
@@ -220,5 +236,109 @@ async fn oidc_callback_bounces_to_next_when_backend_rejects_the_state() -> anyho
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/?error=1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmation_is_required(
+) -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=unverified-code&state=unverified-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .context("missing location header")?;
+    assert_eq!(
+        loc,
+        "http://login.test/?pending_link_token=stub-pending-link-token&email=squatter%40example.com"
+    );
+
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_confirm_link_completes_login_with_the_correct_password() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::post("/oidc/confirm-link")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
+                .body(Body::from(
+                    "pending_link_token=stub-pending-link-token&password=correct-password\
+                     &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                ))?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://admin.test/"));
+
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::post("/oidc/confirm-link")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
+                .body(Body::from(
+                    "pending_link_token=stub-pending-link-token&password=wrong-password\
+                     &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                ))?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=link_failed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_confirm_link_rejects_an_untrusted_origin() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::post("/oidc/confirm-link")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://evil.test")
+                .body(Body::from(
+                    "pending_link_token=stub-pending-link-token&password=correct-password\
+                     &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                ))?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     Ok(())
 }

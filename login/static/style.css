@@ -12,6 +12,8 @@ body {
 }
 
 .card {
+  width: 22rem;
+  max-width: 100%;
   text-align: center;
   background-color: #1e293b;
   padding: 2.5rem 3rem;

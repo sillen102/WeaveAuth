@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WeaveAuth</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="page-content">
+  {% if pending_link_token %}
+  <main class="card">
+    <h1>Confirm it's you</h1>
+    <p>
+      An account already exists for <strong>{{ email }}</strong> but its email
+      isn't verified yet. Enter that account's password to link your Google
+      sign-in to it.
+    </p>
+    <form id="confirm-link-form" method="post" action="{{ bff_url | safe }}/oidc/confirm-link">
+      <div>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+      </div>
+      <input type="hidden" name="pending_link_token" value="{{ pending_link_token }}">
+      <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+      <input type="hidden" name="next" value="{{ own_url }}">
+      <button class="btn" type="submit">Confirm and link account</button>
+    </form>
+  </main>
+  {% else %}
+  <main class="card">
+    <h1>WeaveAuth</h1>
+    <p>Sign in with your account to continue.</p>
+    {% if error == "link_failed" %}
+    <p class="error">That didn't work -- please try Sign in with Google again.</p>
+    {% elif error %}
+    <p class="error">Incorrect email or password.</p>
+    {% else %}
+    <p class="error"></p>
+    {% endif %}
+    <form id="login-form" method="post" action="{{ bff_url | safe }}/login">
+      <div>
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" autocomplete="email" required>
+      </div>
+      <div>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+      </div>
+      <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+      <input type="hidden" name="next" value="{{ own_url }}">
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+    <div class="divider"><span>or</span></div>
+    <a id="google-login-link" class="btn btn-google"
+       href="{{ bff_url | safe }}/oidc/google/login?redirect_uri={{ redirect_uri | urlencode | safe }}&next={{ own_url | urlencode | safe }}">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+        <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/>
+        <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/>
+        <path fill="#FBBC05" d="M3.964 10.706A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.706V4.962H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.038l3.007-2.332z"/>
+        <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.962L3.964 7.294C4.672 5.167 6.656 3.58 9 3.58z"/>
+      </svg>
+      Sign in with Google
+    </a>
+    <p class="secondary">
+      No account yet?
+      <a id="register-link" href="register.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-get="register.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-target="#page" hx-select="#page-content" hx-push-url="true">Create one</a>
+    </p>
+  </main>
+  {% endif %}
+  </div>
+</body>
+</html>
