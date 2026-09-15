@@ -1,14 +1,20 @@
 use axum::http::{header, HeaderMap};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+
+/// Encodes everything but unreserved characters, so the value can never contain
+/// `;` or other characters that are meaningful in a `Cookie`/`Set-Cookie` header.
+const COOKIE_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
 pub(crate) fn extract_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie_header.split(';').find_map(|pair| {
         let (name, value) = pair.trim().split_once('=')?;
-        (name == cookie_name).then(|| value.to_string())
+        (name == cookie_name).then(|| percent_decode_str(value).decode_utf8_lossy().into_owned())
     })
 }
 
 pub(crate) fn build_cookie(name: &str, value: &str, path: &str, max_age_secs: i64) -> String {
+    let value = utf8_percent_encode(value, COOKIE_VALUE);
     format!("{name}={value}; HttpOnly; Path={path}; SameSite=Lax; Max-Age={max_age_secs}")
 }
 
@@ -52,6 +58,25 @@ mod tests {
     fn extract_cookie_handles_a_single_cookie_with_no_semicolons() -> anyhow::Result<()> {
         let headers = headers_with_cookie("wa_session=only-one")?;
         assert_eq!(extract_cookie(&headers, "wa_session"), Some("only-one".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn build_cookie_percent_encodes_special_characters() {
+        let set_cookie = build_cookie("next", "/x;Domain=evil.com;Max-Age=999999", "/", 60);
+        assert_eq!(
+            set_cookie,
+            "next=%2Fx%3BDomain%3Devil.com%3BMax-Age%3D999999; HttpOnly; Path=/; SameSite=Lax; Max-Age=60"
+        );
+    }
+
+    #[test]
+    fn build_cookie_and_extract_cookie_roundtrip_a_value_with_semicolons() -> anyhow::Result<()> {
+        let malicious = "/x;Domain=evil.com;Max-Age=999999";
+        let set_cookie = build_cookie("next", malicious, "/", 60);
+        let value = set_cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        let headers = headers_with_cookie(&format!("next={value}"))?;
+        assert_eq!(extract_cookie(&headers, "next"), Some(malicious.to_string()));
         Ok(())
     }
 }
