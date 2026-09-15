@@ -24,6 +24,14 @@ mod controller {
     const REDIRECT_URI_COOKIE: &str = "wa_oidc_redirect_uri";
     const NEXT_COOKIE: &str = "wa_oidc_next";
 
+    /// `provider` is interpolated into the backend URL below; axum
+    /// percent-decodes path params, so without this check a value like
+    /// `..%2Fhealth` could steer the server-to-server request at arbitrary
+    /// backend GET routes.
+    fn is_valid_provider(provider: &str) -> bool {
+        !provider.is_empty() && provider.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+
     #[derive(Deserialize)]
     pub(crate) struct OidcLoginRequest {
         pub(super) redirect_uri: String,
@@ -96,6 +104,9 @@ mod controller {
         #[error("missing or expired oidc flow state")]
         #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired oidc flow state")]
         MissingFlowState,
+        #[error("unknown oidc provider")]
+        #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
+        UnknownProvider,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -136,6 +147,9 @@ mod controller {
     ) -> Result<Response, OidcLoginError> {
         if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
             return Err(OidcLoginError::InvalidNext);
+        }
+        if !is_valid_provider(&provider) {
+            return Err(OidcLoginError::UnknownProvider);
         }
 
         let backend_resp = state
@@ -195,6 +209,9 @@ mod controller {
         Query(req): Query<OidcCallbackRequest>,
         headers: HeaderMap,
     ) -> Result<Response, OidcCallbackError> {
+        if !is_valid_provider(&provider) {
+            return Err(OidcCallbackError::UnknownProvider);
+        }
         let redirect_uri =
             extract_cookie(&headers, REDIRECT_URI_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
         let next = extract_cookie(&headers, NEXT_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
@@ -331,7 +348,7 @@ mod controller {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::extract::State;
+    use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue};
     use axum::Form;
 
@@ -370,6 +387,30 @@ mod tests {
         let result = oidc_confirm_link(State(state), headers, Form(req)).await;
 
         assert_eq!(result.err(), Some(OidcConfirmLinkError::UntrustedOrigin));
+    }
+
+    #[tokio::test]
+    async fn login_rejects_a_path_traversal_provider_before_contacting_backend() {
+        let state = state_with_trusted_origins(vec!["http://login.test".to_string()]);
+        let req = OidcLoginRequest {
+            redirect_uri: "http://login.test/".to_string(),
+            next: "http://login.test/".to_string(),
+        };
+
+        let result = start_oidc_login(State(state), Path("../health".to_string()), Query(req)).await;
+
+        assert_eq!(result.err(), Some(OidcLoginError::UnknownProvider));
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_a_path_traversal_provider_before_reading_flow_cookies() {
+        let state = state_with_trusted_origins(vec!["http://login.test".to_string()]);
+        let req = OidcCallbackRequest { code: "c".to_string(), state: "s".to_string() };
+
+        let result =
+            oidc_callback(State(state), Path("../health".to_string()), Query(req), HeaderMap::new()).await;
+
+        assert_eq!(result.err(), Some(OidcCallbackError::UnknownProvider));
     }
 
     #[test]
