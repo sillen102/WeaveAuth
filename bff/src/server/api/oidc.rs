@@ -23,6 +23,7 @@ mod controller {
     const FLOW_COOKIE_TTL_SECS: i64 = 300;
     const REDIRECT_URI_COOKIE: &str = "wa_oidc_redirect_uri";
     const NEXT_COOKIE: &str = "wa_oidc_next";
+    const STATE_COOKIE: &str = "wa_oidc_state";
 
     /// `provider` is interpolated into the backend URL below; axum
     /// percent-decodes path params, so without this check a value like
@@ -104,6 +105,14 @@ mod controller {
         #[error("missing or expired oidc flow state")]
         #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired oidc flow state")]
         MissingFlowState,
+        /// The `state` query param the provider sent back doesn't match the
+        /// value stashed in the flow cookie at `start_oidc_login` -- this
+        /// browser never started this flow (classic login-CSRF: an attacker
+        /// with their own valid code+state gets a victim's browser to hit
+        /// this callback and land logged in as the attacker).
+        #[error("oidc state does not match the browser's flow cookie")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "oidc state does not match the browser's flow cookie")]
+        StateMismatch,
         #[error("unknown oidc provider")]
         #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
         UnknownProvider,
@@ -171,6 +180,14 @@ mod controller {
             .and_then(|v| v.to_str().ok())
             .ok_or(OidcLoginError::BackendUnavailable)?
             .to_string();
+        // Pulled back out of the redirect so it can be bound to this browser
+        // below -- backend only keeps the CSRF state server-side, so without
+        // this the state token proves "some flow was started", not "this
+        // browser started it" (see `oidc_callback`'s state-cookie check).
+        let csrf_state = url::Url::parse(&provider_auth_url)
+            .ok()
+            .and_then(|url| url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()))
+            .ok_or(OidcLoginError::BackendUnavailable)?;
 
         let secure = state.config.secure_cookies();
         let redirect_uri_cookie = build_cookie(
@@ -181,6 +198,7 @@ mod controller {
             secure,
         );
         let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
+        let state_cookie = build_cookie(STATE_COOKIE, &csrf_state, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
         let cookies = [
             (
                 header::SET_COOKIE,
@@ -189,6 +207,10 @@ mod controller {
             (
                 header::SET_COOKIE,
                 HeaderValue::from_str(&next_cookie).map_err(|_| OidcLoginError::BackendUnavailable)?,
+            ),
+            (
+                header::SET_COOKIE,
+                HeaderValue::from_str(&state_cookie).map_err(|_| OidcLoginError::BackendUnavailable)?,
             ),
         ];
 
@@ -221,12 +243,21 @@ mod controller {
         let redirect_uri =
             extract_cookie(&headers, REDIRECT_URI_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
         let next = extract_cookie(&headers, NEXT_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
+        let flow_state = extract_cookie(&headers, STATE_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
 
         let secure = state.config.secure_cookies();
         let clear_flow_cookies = [
             (header::SET_COOKIE, clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH, secure)),
             (header::SET_COOKIE, clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH, secure)),
+            (header::SET_COOKIE, clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure)),
         ];
+
+        // Constant-time-ness doesn't matter here -- `state` isn't a secret
+        // the attacker lacks, it's a binding check that this browser is the
+        // one that started the flow. A plain compare is fine.
+        if req.state != flow_state {
+            return Err(OidcCallbackError::StateMismatch);
+        }
         let error_redirect = |next: &str| -> Response {
             let sep = if next.contains('?') { '&' } else { '?' };
             (

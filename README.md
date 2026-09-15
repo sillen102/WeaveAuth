@@ -179,8 +179,6 @@ Open items, in priority order (highest first):
       `client_id`/`client_secret` fields (currently always `None`); wiring real
       client credentials into the backend's `/oauth/token` is future work for
       defense in depth alongside PKCE.
-- [ ] **Cookie `Secure` attribute** — bff's session cookie has no `Secure` flag yet
-      (local HTTP dev); needed before any real HTTPS deployment.
 - [ ] **No CSRF token on the authenticated proxy layer.** Once a user has the
       `wa_session` cookie, any state-changing request `proxy.rs` forwards is the
       classic CSRF shape (ambient cookie auth, attached automatically regardless of
@@ -192,65 +190,6 @@ Open items, in priority order (highest first):
       state-changing proxied requests) would add real defense-in-depth here,
       independent of browser SameSite support. Lower priority than the items
       above -- SameSite=Lax is a working mitigation today, this is belt-and-suspenders.
-
-Done:
-
-- [x] **PKCE verification** — backend stores `code_challenge` at `/oauth/authorize`
-      and checks `code_verifier` against it at `/oauth/token`.
-- [x] **`redirect_uri` allowlist** — backend-only: bff forwards whatever
-      `redirect_uri` a caller passes to `/login` straight through to backend's
-      `/oauth/authorize` as-is; backend is the single place that allowlists it, and
-      refuses to issue a code (so bff can't hand out a token) for anything not
-      listed. Deliberately not duplicated in bff — one allowlist, one place it can
-      drift.
-- [x] **Token delivery** — bff sets an HttpOnly session cookie instead of a
-      query-string access token.
-- [x] **State/code single-use + expiry** — backend's PKCE store enforces single-use
-      + TTL (bff no longer needs its own pending-auth store — the whole exchange
-      with backend happens inside one request, see the login flow above).
-- [x] **Real user authentication** — `POST /oauth/login` verifies
-      identifier/password (Argon2) against `UserStorage` and returns a single-use
-      `login_session` that `/oauth/authorize` requires before it will issue a code,
-      so authentication is enforced server-side regardless of caller order.
-      `POST /register` creates users. `login`'s static pages have real
-      login/register forms.
-- [x] **Access tokens now carry user identity.** `/oauth/authorize` threads the
-      `user_id` `take_session` resolves into the PKCE record (`PkceStorage` now
-      stores/returns it alongside `code_challenge`/`method`/`redirect_uri`);
-      `/oauth/token`'s `TokenResponse` carries it as `user_id`, and bff's
-      `SessionData` carries it through to its own session store. A valid token can
-      now be attributed to the user who authenticated for it — this was the
-      prerequisite for JWKS/JWT work (a JWT can now get a real `sub` claim).
-- [x] **Username enumeration via login timing fixed.** `login.rs` now always
-      hashes: an unknown `identifier` verifies against a fixed dummy Argon2 hash
-      (`DUMMY_PASSWORD_HASH`, generated once and cached) instead of returning
-      immediately, so an unknown identifier costs the same as a known one with a
-      wrong password. Response timing no longer distinguishes the two. Both this
-      and the token-identity fix's Argon2 calls run inside `spawn_blocking` (CPU-
-      heavy synchronous work off the tokio worker thread), via one shared,
-      lazily-built `Argon2` instance (`crate::crypto::ARGON2`).
-- [x] **Uniqueness check on `identifier` at registration.** `UserStorage::create_user`
-      now checks-and-inserts atomically under one lock (`InMemoryUserStorage`), so a
-      second registration for a taken `identifier` is rejected (`409`) instead of
-      silently coexisting with the first under an undefined "which one wins" order.
-- [x] **Login/register CSRF fixed.** `POST /login` and `POST /register` now check
-      the request's `Origin` header (falling back to `Referer`) against
-      `trusted_origins` (`WA_TRUSTED_ORIGINS`) before doing anything else —
-      `403` if it's missing or not on the list. A hostile site can no longer
-      auto-submit a login/register form to bff and have it processed.
-- [x] **Rate limiting on bff's auth endpoints and proxy layer.** Per-IP limiting via
-      [`tower_governor`](https://crates.io/crates/tower_governor) (a GCRA/leaky-bucket
-      limiter built on the widely-used `governor` crate — chosen over rolling a
-      custom limiter or reaching for a younger/unproven crate; see commit history
-      for the comparison), applied as two independent `tower` layers, each with its
-      own bucket per peer IP (`WA_RATE_LIMIT_MAX_ATTEMPTS` / `WA_RATE_LIMIT_WINDOW_SECS`,
-      default 10 attempts/60s for both): one shared by `/login` + `/register`, one
-      shared by every proxied route — hammering the proxy layer can't burn the auth
-      bucket or vice versa. `/health` is exempt from both (a cheap liveness check
-      infra commonly polls at its own cadence). Only bff needed this — backend's
-      `/oauth/login`, `/register`, `/oauth/token` aren't directly internet-reachable
-      (see Architecture above), so bff is the only actual attack surface for
-      credential-stuffing/registration-spam volume.
 
 ## Prerequisites
 

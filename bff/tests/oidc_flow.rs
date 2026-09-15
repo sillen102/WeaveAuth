@@ -156,6 +156,7 @@ async fn oidc_login_relays_the_provider_redirect_and_sets_flow_cookies() -> anyh
     let cookies = set_cookie_values(&resp);
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Path=/oidc")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Path=/oidc")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=good-state") && c.contains("Path=/oidc")));
     Ok(())
 }
 
@@ -185,7 +186,7 @@ async fn oidc_callback_completes_login_and_clears_flow_cookies() -> anyhow::Resu
             Request::get("/oidc/google/callback?code=good-code&state=good-state")
                 .header(
                     "cookie",
-                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=good-state",
                 )
                 .body(Body::empty())?,
         ))
@@ -199,6 +200,7 @@ async fn oidc_callback_completes_login_and_clears_flow_cookies() -> anyhow::Resu
     assert!(cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
     Ok(())
 }
 
@@ -227,7 +229,7 @@ async fn oidc_callback_bounces_to_next_when_backend_rejects_the_state() -> anyho
             Request::get("/oidc/google/callback?code=good-code&state=wrong-state")
                 .header(
                     "cookie",
-                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=wrong-state",
                 )
                 .body(Body::empty())?,
         ))
@@ -236,6 +238,26 @@ async fn oidc_callback_bounces_to_next_when_backend_rejects_the_state() -> anyho
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/?error=1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_a_state_that_does_not_match_the_flow_cookie() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=good-code&state=good-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=attacker-state",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 
@@ -250,7 +272,7 @@ async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmat
             Request::get("/oidc/google/callback?code=unverified-code&state=unverified-state")
                 .header(
                     "cookie",
-                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=unverified-state",
                 )
                 .body(Body::empty())?,
         ))
