@@ -6,13 +6,13 @@ mod controller {
     use axum::Form;
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
-    use common_macros::ErrorResponses;
-    use serde::{Deserialize, Serialize};
-    use thiserror::Error;
+    use serde::Deserialize;
 
-    use crate::server::api::complete_login::{complete_login, CompleteLoginError};
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
+
+    use super::service::{self, LoginOutcome};
+    pub(crate) use super::service::LoginError;
 
     #[derive(Deserialize)]
     pub(crate) struct LoginRequest {
@@ -23,6 +23,48 @@ mod controller {
         /// page's own URL, supplied by its form, not user-typed input.
         pub(super) next: String,
     }
+
+    /// A plain form POST, not a fetch -- so a friendly bounce back to the
+    /// login page (rather than a bare 401 body) is what the browser shows on
+    /// wrong credentials, and the browser only ever talks to bff and never
+    /// sees backend (it POSTs its login form straight to bff's absolute URL,
+    /// so the session cookie ends up scoped to bff's origin, not the login
+    /// page's).
+    pub(crate) async fn start_login(
+        State(mut state): State<AppState>,
+        headers: HeaderMap,
+        Form(req): Form<LoginRequest>,
+    ) -> Result<Response, LoginError> {
+        require_trusted_origin(&headers, &state.config.trusted_origins)
+            .map_err(|_| LoginError::UntrustedOrigin)?;
+
+        match service::login(&mut state, &req.email, &req.password, &req.redirect_uri).await? {
+            LoginOutcome::Rejected => {
+                let sep = if req.next.contains('?') { '&' } else { '?' };
+                Ok((
+                    StatusCode::SEE_OTHER,
+                    [(header::LOCATION, format!("{}{sep}error=1", req.next))],
+                )
+                    .into_response())
+            }
+            LoginOutcome::Authenticated(cookie) => Ok((
+                StatusCode::SEE_OTHER,
+                [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)],
+                Body::empty(),
+            )
+                .into_response()),
+        }
+    }
+}
+
+mod service {
+    use axum::http::StatusCode;
+    use common_macros::ErrorResponses;
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    use crate::server::api::complete_login::{complete_login, CompleteLoginError};
+    use crate::server::AppState;
 
     #[derive(Serialize)]
     struct VerifyLoginRequest<'a> {
@@ -62,11 +104,16 @@ mod controller {
         }
     }
 
+    pub(crate) enum LoginOutcome {
+        /// `Set-Cookie` header value for the new session.
+        Authenticated(String),
+        /// Wrong credentials.
+        Rejected,
+    }
+
     /// Verifies the submitted credentials against backend's `/oauth/login`, then
     /// drives the whole authorization-code + PKCE exchange server-to-server in
-    /// one request, so the browser only ever talks to bff and never sees backend
-    /// (it POSTs its login form straight to bff's absolute URL, so the session
-    /// cookie below ends up scoped to bff's origin, not the login page's).
+    /// one request.
     ///
     /// Per RFC 6749 4.1.1, authenticating the resource owner happens before a
     /// code is issued: `/oauth/login`'s response carries a single-use
@@ -78,35 +125,21 @@ mod controller {
     /// refuses to issue a code for anything not listed. bff never navigates the
     /// browser there itself during this hop (redirects aren't followed), so
     /// there's no open-redirect exposure in sending the real value through.
-    pub(crate) async fn start_login(
-        State(mut state): State<AppState>,
-        headers: HeaderMap,
-        Form(req): Form<LoginRequest>,
-    ) -> Result<Response, LoginError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|_| LoginError::UntrustedOrigin)?;
-
-        let redirect_uri = req.redirect_uri;
-
+    pub(crate) async fn login(
+        state: &mut AppState,
+        email: &str,
+        password: &str,
+        redirect_uri: &str,
+    ) -> Result<LoginOutcome, LoginError> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
-            .json(&VerifyLoginRequest {
-                email: &req.email,
-                password: &req.password,
-            })
+            .json(&VerifyLoginRequest { email, password })
             .send()
             .await
             .map_err(|_| LoginError::BackendUnavailable)?;
         if verify_resp.status() == StatusCode::UNAUTHORIZED {
-            // A plain form POST, not a fetch -- so a friendly bounce back to the
-            // login page (rather than a bare 401 body) is what the browser shows.
-            let sep = if req.next.contains('?') { '&' } else { '?' };
-            return Ok((
-                StatusCode::SEE_OTHER,
-                [(header::LOCATION, format!("{}{sep}error=1", req.next))],
-            )
-                .into_response());
+            return Ok(LoginOutcome::Rejected);
         }
         if !verify_resp.status().is_success() {
             return Err(LoginError::BackendUnavailable);
@@ -117,14 +150,8 @@ mod controller {
             .map_err(|_| LoginError::BackendUnavailable)?
             .login_session;
 
-        let cookie = complete_login(&mut state, &login_session, &redirect_uri).await?;
-
-        Ok((
-            StatusCode::SEE_OTHER,
-            [(header::LOCATION, redirect_uri), (header::SET_COOKIE, cookie)],
-            Body::empty(),
-        )
-            .into_response())
+        let cookie = complete_login(state, &login_session, redirect_uri).await?;
+        Ok(LoginOutcome::Authenticated(cookie))
     }
 }
 

@@ -4,19 +4,15 @@ pub(crate) use controller::authorize_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use axum::extract::{Query, State};
-    use axum::http::StatusCode;
     use axum::response::Redirect;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    use rand::RngExt;
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
-    use crate::storage::{LoginSessionStorage, PkceStorage};
+
+    use super::service;
+    pub(crate) use super::service::AuthorizeError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct AuthorizeRequest {
@@ -30,53 +26,19 @@ mod controller {
         pub(super) login_session: String,
     }
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum AuthorizeError {
-        #[error("invalid login session")]
-        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid login session")]
-        InvalidLoginSession,
-        #[error("invalid redirect uri")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid redirect uri")]
-        InvalidRedirectUri,
-    }
-
     pub(crate) async fn authorize(
         State(mut state): State<AppState>,
         Query(req): Query<AuthorizeRequest>,
     ) -> Result<Redirect, AuthorizeError> {
-        let user_id = state
-            .login_sessions
-            .take_session(&req.login_session)
-            .await
-            .ok_or(AuthorizeError::InvalidLoginSession)?;
-
-        if !state
-            .redirect_uri_allowlist
-            .iter()
-            .any(|allowed| allowed == &req.redirect_uri)
-        {
-            return Err(AuthorizeError::InvalidRedirectUri);
-        }
-
-        let mut code_bytes = [0u8; 32];
-        rand::rng().fill(&mut code_bytes);
-        let auth_code = URL_SAFE_NO_PAD.encode(code_bytes);
-
-        state
-            .pkce
-            .save_code_challenge(
-                auth_code.clone(),
-                req.code_challenge,
-                req.code_challenge_method,
-                req.redirect_uri.clone(),
-                user_id,
-            )
-            .await;
-
-        let location = match req.state {
-            Some(s) => format!("{}?code={}&state={}", req.redirect_uri, auth_code, s),
-            None => format!("{}?code={}", req.redirect_uri, auth_code),
-        };
+        let location = service::authorize(
+            &mut state,
+            req.redirect_uri,
+            req.code_challenge,
+            req.code_challenge_method,
+            req.state,
+            req.login_session,
+        )
+        .await?;
         Ok(Redirect::to(&location))
     }
 
@@ -91,6 +53,76 @@ mod controller {
     }
 }
 
+mod service {
+    use axum::http::StatusCode;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngExt;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
+
+    use crate::model::pkce::CodeChallengeMethod;
+    use crate::server::AppState;
+    use crate::storage::{LoginSessionStorage, PkceStorage};
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum AuthorizeError {
+        #[error("invalid login session")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid login session")]
+        InvalidLoginSession,
+        #[error("invalid redirect uri")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid redirect uri")]
+        InvalidRedirectUri,
+    }
+
+    /// Binds a single-use `auth_code` to the given PKCE code_challenge for a
+    /// user already authenticated via `login_session`, and returns the
+    /// redirect location the caller should be sent to.
+    pub(crate) async fn authorize(
+        state: &mut AppState,
+        redirect_uri: String,
+        code_challenge: String,
+        code_challenge_method: CodeChallengeMethod,
+        query_state: Option<String>,
+        login_session: String,
+    ) -> Result<String, AuthorizeError> {
+        let user_id = state
+            .login_sessions
+            .take_session(&login_session)
+            .await
+            .ok_or(AuthorizeError::InvalidLoginSession)?;
+
+        if !state
+            .redirect_uri_allowlist
+            .iter()
+            .any(|allowed| allowed == &redirect_uri)
+        {
+            return Err(AuthorizeError::InvalidRedirectUri);
+        }
+
+        let mut code_bytes = [0u8; 32];
+        rand::rng().fill(&mut code_bytes);
+        let auth_code = URL_SAFE_NO_PAD.encode(code_bytes);
+
+        state
+            .pkce
+            .save_code_challenge(
+                auth_code.clone(),
+                code_challenge,
+                code_challenge_method,
+                redirect_uri.clone(),
+                user_id,
+            )
+            .await;
+
+        let location = match query_state {
+            Some(s) => format!("{}?code={}&state={}", redirect_uri, auth_code, s),
+            None => format!("{}?code={}", redirect_uri, auth_code),
+        };
+        Ok(location)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::controller::*;
@@ -99,7 +131,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::model::pkce::CodeChallengeMethod;
-    use crate::server::api::authorize::controller::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
+    use crate::server::api::authorize::service::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, PkceStorage};
 

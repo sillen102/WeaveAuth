@@ -1,18 +1,64 @@
 pub(crate) use controller::proxy_router;
 
 mod controller {
-    use crate::model::session::SessionData;
     use crate::server::cookie::extract_cookie;
     use crate::server::AppState;
-    use crate::storage::SessionStorage;
     use axum::Router;
     use axum::extract::{Request, State};
-    use axum::http::{StatusCode, header};
+    use axum::http::header;
     use axum::middleware::{self, Next};
     use axum::response::Response;
     use axum_reverse_proxy::ReverseProxy;
-    use chrono::{DateTime, Utc};
     use common::model::token::TokenType;
+
+    use super::service;
+    pub(crate) use super::service::ProxyError;
+
+    /// One `axum-reverse-proxy` service per configured route, merged, gated by
+    /// session auth. The proxy crate handles path stripping, header/body
+    /// forwarding, and hop-by-hop header removal.
+    pub(crate) fn proxy_router(state: AppState) -> Router {
+        let routes = state
+            .config
+            .routes
+            .iter()
+            .fold(Router::new(), |router, route| {
+                let upstream: Router = ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
+                router.merge(upstream)
+            });
+
+        routes
+            .layer(middleware::from_fn_with_state(state, authenticate))
+            .fallback(axum::http::StatusCode::NOT_FOUND)
+    }
+
+    /// Swaps the session cookie for the upstream `Authorization: Bearer <token>`
+    /// header before handing the request to the reverse proxy.
+    async fn authenticate(
+        State(mut state): State<AppState>,
+        mut req: Request,
+        next: Next,
+    ) -> Result<Response, ProxyError> {
+        let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
+            .ok_or(ProxyError::Unauthenticated)?;
+        let access_token = service::resolve_bearer_token(&mut state, &session_id).await?;
+
+        let auth_value = format!("{} {}", TokenType::Bearer, access_token)
+            .parse()
+            .map_err(|_| ProxyError::Unauthenticated)?;
+        req.headers_mut().remove(header::COOKIE);
+        req.headers_mut().insert(header::AUTHORIZATION, auth_value);
+
+        Ok(next.run(req).await)
+    }
+}
+
+mod service {
+    use crate::model::session::SessionData;
+    use crate::server::AppState;
+    use crate::storage::SessionStorage;
+    use axum::http::StatusCode;
+    use chrono::{DateTime, Utc};
     use common_macros::ErrorResponses;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -48,58 +94,27 @@ mod controller {
         user_id: Uuid,
     }
 
-    /// One `axum-reverse-proxy` service per configured route, merged, gated by
-    /// session auth. The proxy crate handles path stripping, header/body
-    /// forwarding, and hop-by-hop header removal.
-    pub(crate) fn proxy_router(state: AppState) -> Router {
-        let routes = state
-            .config
-            .routes
-            .iter()
-            .fold(Router::new(), |router, route| {
-                let upstream: Router = ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
-                router.merge(upstream)
-            });
-
-        routes
-            .layer(middleware::from_fn_with_state(state, authenticate))
-            .fallback(StatusCode::NOT_FOUND)
-    }
-
-    /// Swaps the session cookie for the upstream `Authorization: Bearer <token>`
-    /// header before handing the request to the reverse proxy. If the access
-    /// token has expired but the refresh token hasn't, transparently redeems
-    /// it via `refresh_session` first -- the caller never sees the expiry.
-    async fn authenticate(
-        State(mut state): State<AppState>,
-        mut req: Request,
-        next: Next,
-    ) -> Result<Response, ProxyError> {
-        let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
-            .ok_or(ProxyError::Unauthenticated)?;
+    /// Resolves the given session cookie value into an access token to
+    /// forward upstream, transparently refreshing it first if it has expired
+    /// (or is about to) but the session's refresh token hasn't.
+    pub(crate) async fn resolve_bearer_token(state: &mut AppState, session_id: &str) -> Result<String, ProxyError> {
         let session = state
             .sessions
-            .get_session(&session_id)
+            .get_session(session_id)
             .await
             .ok_or(ProxyError::Unauthenticated)?;
 
         let session = if session.expires_at > Utc::now() + ACCESS_TOKEN_REFRESH_LEEWAY {
             session
         } else if session.refresh_expires_at > Utc::now() {
-            refresh_session(&mut state, &session_id, &session.refresh_token)
+            refresh_session(state, session_id, &session.refresh_token)
                 .await
                 .ok_or(ProxyError::Unauthenticated)?
         } else {
             return Err(ProxyError::Unauthenticated);
         };
 
-        let auth_value = format!("{} {}", TokenType::Bearer, session.access_token)
-            .parse()
-            .map_err(|_| ProxyError::Unauthenticated)?;
-        req.headers_mut().remove(header::COOKIE);
-        req.headers_mut().insert(header::AUTHORIZATION, auth_value);
-
-        Ok(next.run(req).await)
+        Ok(session.access_token)
     }
 
     /// Redeems `session.refresh_token` for a fresh token pair against
@@ -114,7 +129,7 @@ mod controller {
     /// concurrently; backend's refresh tokens are single-use, so only one of
     /// these wins and the rest fail closed (a spurious 401) instead of
     /// queueing behind the winner.
-    pub(super) async fn refresh_session(
+    pub(crate) async fn refresh_session(
         state: &mut AppState,
         session_id: &str,
         refresh_token: &str,
@@ -156,7 +171,7 @@ mod tests {
     // end-to-end via `bff/tests/proxy.rs` instead. `refresh_session` has no
     // such constraint and is worth pinning directly: it's the one piece of
     // this file that's a plain, directly-callable async fn.
-    use super::controller::*;
+    use super::service::*;
     use crate::config::Config;
     use crate::server::AppState;
 

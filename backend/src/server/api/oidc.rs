@@ -7,19 +7,112 @@ pub(crate) use controller::oidc_login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::password_hash::phc::PasswordHash;
-    use argon2::PasswordVerifier;
     use axum::extract::{Path, Query, State};
-    use axum::http::StatusCode;
     use axum::response::Redirect;
     use axum::Json;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+
+    use crate::server::AppState;
+
+    use super::service;
+    pub(crate) use super::service::OidcError;
+
+    #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct OidcCallbackQuery {
+        pub(super) code: String,
+        pub(super) state: String,
+    }
+
+    #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct OidcConfirmLinkRequest {
+        pub(super) pending_link_token: String,
+        pub(super) password: String,
+    }
+
+    #[derive(Serialize, JsonSchema)]
+    pub(crate) struct OidcConfirmLinkResponse {
+        /// Same shape as a successful `/oauth/login` response.
+        pub(super) login_session: String,
+    }
+
+    pub(crate) async fn oidc_login(
+        State(mut state): State<AppState>,
+        Path(provider): Path<String>,
+    ) -> Result<Redirect, OidcError> {
+        let auth_url = service::oidc_login(&mut state, provider).await?;
+        Ok(Redirect::to(&auth_url))
+    }
+
+    pub(crate) async fn oidc_callback(
+        State(mut state): State<AppState>,
+        Path(provider): Path<String>,
+        Query(query): Query<OidcCallbackQuery>,
+    ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
+        let response = service::oidc_callback(&mut state, provider, query.code, query.state).await?;
+        Ok(Json(response))
+    }
+
+    /// Finishes linking an OIDC identity that `oidc_callback` flagged as
+    /// `PasswordConfirmationRequired`, once the caller has supplied the
+    /// existing account's password.
+    pub(crate) async fn oidc_confirm_link(
+        State(mut state): State<AppState>,
+        Json(req): Json<OidcConfirmLinkRequest>,
+    ) -> Result<Json<OidcConfirmLinkResponse>, OidcError> {
+        let login_session = service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password).await?;
+        Ok(Json(OidcConfirmLinkResponse { login_session }))
+    }
+
+    pub(crate) fn oidc_login_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("oidc_login")
+            .summary("Start a third-party OIDC login")
+            .description(
+                "Not meant to be called by the browser directly -- bff proxies this \
+                 server-to-server and relays the redirect. `provider` is one of the keys \
+                 configured under `oidc_providers`, e.g. \"google\".",
+            )
+    }
+
+    pub(crate) fn oidc_callback_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("oidc_callback")
+            .summary("Complete a third-party OIDC login")
+            .description(
+                "Not meant to be called by the provider directly -- backend isn't \
+                 internet-exposed, so bff receives the provider's redirect at its own public \
+                 URL and forwards code+state here server-to-server. Returns either an \
+                 Authenticated login_session (same shape as a successful /oauth/login), or a \
+                 PasswordConfirmationRequired response if this email matches an existing but \
+                 unverified account -- see /oauth/oidc/confirm-link.",
+            )
+    }
+
+    pub(crate) fn oidc_confirm_link_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("oidc_confirm_link")
+            .summary("Finish linking an OIDC identity into an unverified account")
+            .description(
+                "Call after /oauth/oidc/{provider}/callback returns \
+                 PasswordConfirmationRequired, supplying that account's password. On success, \
+                 the account is marked email_verified and the identity is linked, exactly as if \
+                 the email had already been verified at callback time.",
+            )
+    }
+}
+
+mod service {
+    use argon2::password_hash::phc::PasswordHash;
+    use argon2::PasswordVerifier;
+    use axum::http::StatusCode;
     use openidconnect::core::CoreAuthenticationFlow;
     use openidconnect::{
         AuthorizationCode, CsrfToken, Nonce, PkceCodeChallenge, PkceCodeVerifier, Scope,
         TokenResponse,
     };
     use schemars::JsonSchema;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
@@ -28,12 +121,6 @@ mod controller {
     use crate::storage::{
         LoginSessionStorage, OidcLinkOutcome, OidcStateStorage, PendingOidcLinkStorage, UserStorage, VerifiedEmail,
     };
-
-    #[derive(Deserialize, JsonSchema)]
-    pub(crate) struct OidcCallbackQuery {
-        pub(super) code: String,
-        pub(super) state: String,
-    }
 
     #[derive(Serialize, JsonSchema)]
     #[serde(tag = "status", rename_all = "snake_case")]
@@ -47,18 +134,6 @@ mod controller {
         /// `pending_link_token` to finish linking; the OIDC login isn't
         /// authenticated yet.
         PasswordConfirmationRequired { pending_link_token: String, email: String },
-    }
-
-    #[derive(Deserialize, JsonSchema)]
-    pub(crate) struct OidcConfirmLinkRequest {
-        pub(super) pending_link_token: String,
-        pub(super) password: String,
-    }
-
-    #[derive(Serialize, JsonSchema)]
-    pub(crate) struct OidcConfirmLinkResponse {
-        /// Same shape as a successful `/oauth/login` response.
-        pub(super) login_session: String,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -96,10 +171,9 @@ mod controller {
         PasswordConfirmationFailed,
     }
 
-    pub(crate) async fn oidc_login(
-        State(mut state): State<AppState>,
-        Path(provider): Path<String>,
-    ) -> Result<Redirect, OidcError> {
+    /// Starts a third-party OIDC login for `provider`, returning the
+    /// provider's consent-screen URL to redirect the caller to.
+    pub(crate) async fn oidc_login(state: &mut AppState, provider: String) -> Result<String, OidcError> {
         let client = state
             .oidc_providers
             .get(&provider)
@@ -127,19 +201,20 @@ mod controller {
             )
             .await;
 
-        Ok(Redirect::to(auth_url.as_str()))
+        Ok(auth_url.to_string())
     }
 
     pub(crate) async fn oidc_callback(
-        State(mut state): State<AppState>,
-        Path(provider): Path<String>,
-        Query(query): Query<OidcCallbackQuery>,
-    ) -> Result<Json<OidcCallbackResponse>, OidcError> {
+        state: &mut AppState,
+        provider: String,
+        code: String,
+        query_state: String,
+    ) -> Result<OidcCallbackResponse, OidcError> {
         let login_state = state
             .oidc_state
-            .take_state(&query.state)
+            .take_state(&query_state)
             .await
-            .filter(|state| state.provider == provider)
+            .filter(|s| s.provider == provider)
             .ok_or(OidcError::InvalidState)?;
         let stored_provider = login_state.provider;
 
@@ -149,7 +224,7 @@ mod controller {
             .ok_or(OidcError::UnknownProvider)?;
 
         let token_response = client
-            .exchange_code(AuthorizationCode::new(query.code))
+            .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier))
             .request_async(&*state.oidc_http_client)
             .await
@@ -189,19 +264,20 @@ mod controller {
             }
         };
 
-        Ok(Json(response))
+        Ok(response)
     }
 
     /// Finishes linking an OIDC identity that `oidc_callback` flagged as
     /// `PasswordConfirmationRequired`, once the caller has supplied the
     /// existing account's password.
     pub(crate) async fn oidc_confirm_link(
-        State(mut state): State<AppState>,
-        Json(req): Json<OidcConfirmLinkRequest>,
-    ) -> Result<Json<OidcConfirmLinkResponse>, OidcError> {
+        state: &mut AppState,
+        pending_link_token: &str,
+        password: String,
+    ) -> Result<String, OidcError> {
         let pending_link = state
             .pending_oidc_links
-            .take_pending_link(&req.pending_link_token)
+            .take_pending_link(pending_link_token)
             .await
             .ok_or(OidcError::InvalidPendingLink)?;
 
@@ -217,7 +293,6 @@ mod controller {
         // no dummy-hash timing guard here: `pending_link_token` already reveals
         // that a matching account exists (that's the whole reason this
         // endpoint is being called), so there's no identifier to enumerate.
-        let password = req.password;
         let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
             let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
             Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
@@ -237,44 +312,7 @@ mod controller {
             .ok_or(OidcError::PasswordConfirmationFailed)?;
         let login_session = state.login_sessions.create_session(user.id).await;
 
-        Ok(Json(OidcConfirmLinkResponse { login_session }))
-    }
-
-    pub(crate) fn oidc_login_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("oidc_login")
-            .summary("Start a third-party OIDC login")
-            .description(
-                "Not meant to be called by the browser directly -- bff proxies this \
-                 server-to-server and relays the redirect. `provider` is one of the keys \
-                 configured under `oidc_providers`, e.g. \"google\".",
-            )
-    }
-
-    pub(crate) fn oidc_callback_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("oidc_callback")
-            .summary("Complete a third-party OIDC login")
-            .description(
-                "Not meant to be called by the provider directly -- backend isn't \
-                 internet-exposed, so bff receives the provider's redirect at its own public \
-                 URL and forwards code+state here server-to-server. Returns either an \
-                 Authenticated login_session (same shape as a successful /oauth/login), or a \
-                 PasswordConfirmationRequired response if this email matches an existing but \
-                 unverified account -- see /oauth/oidc/confirm-link.",
-            )
-    }
-
-    pub(crate) fn oidc_confirm_link_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("oidc_confirm_link")
-            .summary("Finish linking an OIDC identity into an unverified account")
-            .description(
-                "Call after /oauth/oidc/{provider}/callback returns \
-                 PasswordConfirmationRequired, supplying that account's password. On success, \
-                 the account is marked email_verified and the identity is linked, exactly as if \
-                 the email had already been verified at callback time.",
-            )
+        Ok(login_session)
     }
 }
 

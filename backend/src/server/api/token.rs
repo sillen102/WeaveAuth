@@ -5,16 +5,68 @@ mod controller {
     use aide::transform::TransformOperation;
     use axum::Json;
     use axum::extract::{Form, State};
+    use common::model::token::GrantType;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    use crate::server::AppState;
+
+    use super::service::{self, AuthorizationCodeGrant};
+    pub(crate) use super::service::{TokenError, TokenResponse};
+
+    #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct TokenRequest {
+        pub(super) grant_type: GrantType,
+        pub(super) code: Option<String>,
+        pub(super) code_verifier: Option<String>,
+        pub(super) redirect_uri: Option<String>,
+        pub(super) refresh_token: Option<String>,
+    }
+
+    pub(crate) async fn issue_token(
+        State(mut state): State<AppState>,
+        Form(req): Form<TokenRequest>,
+    ) -> Result<Json<TokenResponse>, TokenError> {
+        let response = match req.grant_type {
+            GrantType::AuthorizationCode => {
+                let grant = match (req.code, req.code_verifier, req.redirect_uri) {
+                    (Some(code), Some(code_verifier), Some(redirect_uri)) => {
+                        Some(AuthorizationCodeGrant { code, code_verifier, redirect_uri })
+                    }
+                    _ => None,
+                };
+                service::issue_token_for_authorization_code(&mut state, grant).await?
+            }
+            GrantType::RefreshToken => {
+                service::issue_token_for_refresh_token(&mut state, req.refresh_token).await?
+            }
+        };
+        Ok(Json(response))
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn issue_token_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("token")
+            .summary("Exchange an authorization code for tokens")
+            .description(
+                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
+                 and that redirect_uri matches the one the code was issued for",
+            )
+    }
+}
+
+mod service {
     use axum::http::StatusCode;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Duration, Utc};
-    use common::model::token::{GrantType, TokenType};
+    use common::model::token::TokenType;
     use common_macros::ErrorResponses;
     use jsonwebtoken::{Algorithm, Header};
     use rand::RngExt;
     use schemars::JsonSchema;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use sha2::{Digest, Sha256};
     use thiserror::Error;
     use uuid::Uuid;
@@ -37,25 +89,22 @@ mod controller {
         exp: i64,
     }
 
-    #[derive(Deserialize, JsonSchema)]
-    pub(crate) struct TokenRequest {
-        pub(super) grant_type: GrantType,
-        pub(super) code: Option<String>,
-        pub(super) code_verifier: Option<String>,
-        pub(super) redirect_uri: Option<String>,
-        pub(super) refresh_token: Option<String>,
+    pub(crate) struct AuthorizationCodeGrant {
+        pub(crate) code: String,
+        pub(crate) code_verifier: String,
+        pub(crate) redirect_uri: String,
     }
 
     #[derive(Serialize, JsonSchema)]
     pub(crate) struct TokenResponse {
-        pub(super) access_token: String,
-        pub(super) refresh_token: String,
+        pub(crate) access_token: String,
+        pub(crate) refresh_token: String,
         token_type: TokenType,
         expires_at: DateTime<Utc>,
-        pub(super) refresh_expires_at: DateTime<Utc>,
+        pub(crate) refresh_expires_at: DateTime<Utc>,
         /// The user this token was issued to -- carried through from the
         /// `login_session` `/oauth/login` created, via the auth code.
-        pub(super) user_id: Uuid,
+        pub(crate) user_id: Uuid,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -89,56 +138,47 @@ mod controller {
         UnexpectedError,
     }
 
-    pub(crate) async fn issue_token(
-        State(mut state): State<AppState>,
-        Form(req): Form<TokenRequest>,
-    ) -> Result<Json<TokenResponse>, TokenError> {
-        match req.grant_type {
-            GrantType::AuthorizationCode => {
-                let (code, code_verifier, redirect_uri) =
-                    match (req.code, req.code_verifier, req.redirect_uri) {
-                        (Some(code), Some(code_verifier), Some(redirect_uri)) => {
-                            (code, code_verifier, redirect_uri)
-                        }
-                        _ => return Err(TokenError::MissingParameters),
-                    };
+    pub(crate) async fn issue_token_for_authorization_code(
+        state: &mut AppState,
+        grant: Option<AuthorizationCodeGrant>,
+    ) -> Result<TokenResponse, TokenError> {
+        let AuthorizationCodeGrant { code, code_verifier, redirect_uri } =
+            grant.ok_or(TokenError::MissingParameters)?;
 
-                let (challenge, _method, issued_redirect_uri, user_id) = state
-                    .pkce
-                    .take_code_challenge(&code)
-                    .await
-                    .ok_or(TokenError::InvalidCode)?;
+        let (challenge, _method, issued_redirect_uri, user_id) = state
+            .pkce
+            .take_code_challenge(&code)
+            .await
+            .ok_or(TokenError::InvalidCode)?;
 
-                // Binds the code to the redirect_uri it was issued for (RFC 6749
-                // 4.1.3) -- without this, a code obtained for one redirect_uri
-                // could be redeemed while claiming a different one.
-                if redirect_uri != issued_redirect_uri {
-                    return Err(TokenError::RedirectUriMismatch);
-                }
+        // Binds the code to the redirect_uri it was issued for (RFC 6749
+        // 4.1.3) -- without this, a code obtained for one redirect_uri
+        // could be redeemed while claiming a different one.
+        if redirect_uri != issued_redirect_uri {
+            return Err(TokenError::RedirectUriMismatch);
+        }
 
-                let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-                if computed != challenge {
-                    return Err(TokenError::InvalidCodeVerifier);
-                }
+        let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+        if computed != challenge {
+            return Err(TokenError::InvalidCodeVerifier);
+        }
 
-                issue_tokens(&mut state, user_id, Uuid::new_v4()).await
-            }
-            GrantType::RefreshToken => {
-                let refresh_token = req.refresh_token.ok_or(TokenError::MissingParameters)?;
+        issue_tokens(state, user_id, Uuid::new_v4()).await
+    }
 
-                match state.refresh_tokens.take_refresh_token(&refresh_token).await {
-                    RefreshTokenOutcome::Valid { user_id, family_id } => {
-                        issue_tokens(&mut state, user_id, family_id).await
-                    }
-                    // Already-used token: the storage layer has revoked the
-                    // whole family as a side effect. Wrong/unknown token: same
-                    // client-facing error either way, so the response doesn't
-                    // leak which case it was.
-                    RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => {
-                        Err(TokenError::InvalidRefreshToken)
-                    }
-                }
-            }
+    pub(crate) async fn issue_token_for_refresh_token(
+        state: &mut AppState,
+        refresh_token: Option<String>,
+    ) -> Result<TokenResponse, TokenError> {
+        let refresh_token = refresh_token.ok_or(TokenError::MissingParameters)?;
+
+        match state.refresh_tokens.take_refresh_token(&refresh_token).await {
+            RefreshTokenOutcome::Valid { user_id, family_id } => issue_tokens(state, user_id, family_id).await,
+            // Already-used token: the storage layer has revoked the
+            // whole family as a side effect. Wrong/unknown token: same
+            // client-facing error either way, so the response doesn't
+            // leak which case it was.
+            RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => Err(TokenError::InvalidRefreshToken),
         }
     }
 
@@ -149,7 +189,7 @@ mod controller {
         state: &mut AppState,
         user_id: Uuid,
         family_id: Uuid,
-    ) -> Result<Json<TokenResponse>, TokenError> {
+    ) -> Result<TokenResponse, TokenError> {
         let user = state.users.get_user_by_id(user_id).await.ok_or(TokenError::UnexpectedError)?;
 
         let issued_at = Utc::now();
@@ -176,25 +216,14 @@ mod controller {
             .save_refresh_token(refresh_token.clone(), user_id, family_id)
             .await;
 
-        Ok(Json(TokenResponse {
+        Ok(TokenResponse {
             access_token,
             refresh_token,
             token_type: TokenType::Bearer,
             expires_at,
             refresh_expires_at,
             user_id,
-        }))
-    }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn issue_token_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("token")
-            .summary("Exchange an authorization code for tokens")
-            .description(
-                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
-                 and that redirect_uri matches the one the code was issued for",
-            )
+        })
     }
 }
 

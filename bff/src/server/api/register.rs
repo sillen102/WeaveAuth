@@ -5,13 +5,13 @@ mod controller {
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::Form;
-    use common_macros::ErrorResponses;
-    use serde::{Deserialize, Serialize};
-    use thiserror::Error;
+    use serde::Deserialize;
 
-    use crate::server::api::complete_login::complete_login;
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
+
+    use super::service::{self, RegisterOutcome};
+    pub(crate) use super::service::RegisterError;
 
     #[derive(Deserialize)]
     pub(crate) struct RegisterRequest {
@@ -23,6 +23,55 @@ mod controller {
         /// supplied by the login page's own form, not user-typed input.
         pub(super) next: String,
     }
+
+    /// Forwards registration to backend's `/register`, then -- since the
+    /// credentials were just typed in and verified by backend -- immediately
+    /// logs the new user in the same way `start_login` would, landing on
+    /// `redirect_uri` with a session cookie already set instead of bouncing
+    /// back to the login page to ask for the same password again.
+    ///
+    /// Registration failing (bad/taken email) bounces to `next` (the
+    /// registration page) with `?error=1`, as before. If registration
+    /// succeeds but the auto-login step fails for some other reason, the
+    /// account still exists -- rather than surface a confusing error, this
+    /// falls back to `next` without `?error=1` so the user can just sign in
+    /// manually.
+    pub(crate) async fn start_register(
+        State(mut state): State<AppState>,
+        headers: HeaderMap,
+        Form(req): Form<RegisterRequest>,
+    ) -> Result<Response, RegisterError> {
+        require_trusted_origin(&headers, &state.config.trusted_origins)
+            .map_err(|_| RegisterError::UntrustedOrigin)?;
+
+        match service::register(&mut state, &req.email, &req.password).await? {
+            RegisterOutcome::Rejected => {
+                let sep = if req.next.contains('?') { '&' } else { '?' };
+                let location = format!("{}{sep}error=1", req.next);
+                Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
+            }
+            RegisterOutcome::Created => {
+                let response = match service::auto_login(&mut state, &req.email, &req.password, &req.redirect_uri).await {
+                    Some(cookie) => {
+                        (StatusCode::SEE_OTHER, [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)])
+                            .into_response()
+                    }
+                    None => (StatusCode::SEE_OTHER, [(header::LOCATION, req.next)]).into_response(),
+                };
+                Ok(response)
+            }
+        }
+    }
+}
+
+mod service {
+    use axum::http::StatusCode;
+    use common_macros::ErrorResponses;
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    use crate::server::api::complete_login::complete_login;
+    use crate::server::AppState;
 
     #[derive(Serialize)]
     struct BackendCredentials<'a> {
@@ -46,63 +95,42 @@ mod controller {
         BackendUnavailable,
     }
 
-    /// Forwards registration to backend's `/register`, then -- since the
-    /// credentials were just typed in and verified by backend -- immediately
-    /// logs the new user in the same way `start_login` would, landing on
-    /// `redirect_uri` with a session cookie already set instead of bouncing
-    /// back to the login page to ask for the same password again.
-    ///
-    /// Registration failing (bad/taken email) bounces to `next` (the
-    /// registration page) with `?error=1`, as before. If registration
-    /// succeeds but the auto-login step fails for some other reason, the
-    /// account still exists -- rather than surface a confusing error, this
-    /// falls back to `next` without `?error=1` so the user can just sign in
-    /// manually.
-    pub(crate) async fn start_register(
-        State(mut state): State<AppState>,
-        headers: HeaderMap,
-        Form(req): Form<RegisterRequest>,
-    ) -> Result<Response, RegisterError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|_| RegisterError::UntrustedOrigin)?;
+    pub(crate) enum RegisterOutcome {
+        Created,
+        /// Backend rejected the registration (bad or taken email).
+        Rejected,
+    }
 
+    /// Forwards registration to backend's `/register`.
+    pub(crate) async fn register(state: &mut AppState, email: &str, password: &str) -> Result<RegisterOutcome, RegisterError> {
         let resp = state
             .http_client
             .post(format!("{}/register", state.config.backend_url))
-            .json(&BackendCredentials {
-                email: &req.email,
-                password: &req.password,
-            })
+            .json(&BackendCredentials { email, password })
             .send()
             .await
             .map_err(|_| RegisterError::BackendUnavailable)?;
 
         if resp.status().is_client_error() {
-            let sep = if req.next.contains('?') { '&' } else { '?' };
-            let location = format!("{}{sep}error=1", req.next);
-            return Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response());
+            return Ok(RegisterOutcome::Rejected);
         }
         if !resp.status().is_success() {
             return Err(RegisterError::BackendUnavailable);
         }
 
-        Ok(auto_login(&mut state, &req).await.unwrap_or_else(|| {
-            (StatusCode::SEE_OTHER, [(header::LOCATION, req.next.clone())]).into_response()
-        }))
+        Ok(RegisterOutcome::Created)
     }
 
     /// Verifies the just-registered credentials against backend's
     /// `/oauth/login`, then drives the same PKCE exchange `start_login` uses.
     /// `None` on any failure -- the caller falls back to sending the user to
-    /// the login page instead.
-    async fn auto_login(state: &mut AppState, req: &RegisterRequest) -> Option<Response> {
+    /// the login page instead. Returns the `Set-Cookie` header value for the
+    /// new session.
+    pub(crate) async fn auto_login(state: &mut AppState, email: &str, password: &str, redirect_uri: &str) -> Option<String> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
-            .json(&BackendCredentials {
-                email: &req.email,
-                password: &req.password,
-            })
+            .json(&BackendCredentials { email, password })
             .send()
             .await
             .ok()?;
@@ -111,15 +139,7 @@ mod controller {
         }
         let login_session = verify_resp.json::<LoginSessionResponse>().await.ok()?.login_session;
 
-        let cookie = complete_login(state, &login_session, &req.redirect_uri).await.ok()?;
-
-        Some(
-            (
-                StatusCode::SEE_OTHER,
-                [(header::LOCATION, req.redirect_uri.clone()), (header::SET_COOKIE, cookie)],
-            )
-                .into_response(),
-        )
+        complete_login(state, &login_session, redirect_uri).await.ok()
     }
 }
 

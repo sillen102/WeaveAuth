@@ -3,14 +3,48 @@ pub(crate) use controller::register_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::PasswordHasher;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::Json;
-    use chrono::Utc;
-    use email_address::EmailAddress;
     use schemars::JsonSchema;
     use serde::Deserialize;
+
+    use crate::server::AppState;
+
+    use super::service;
+    pub(crate) use super::service::RegisterError;
+
+    #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct RegisterRequest {
+        pub(super) email: String,
+        pub(super) password: String,
+    }
+
+    pub(crate) async fn register(
+        State(mut state): State<AppState>,
+        Json(req): Json<RegisterRequest>,
+    ) -> Result<StatusCode, RegisterError> {
+        service::register(&mut state, req.email, req.password).await?;
+        Ok(StatusCode::CREATED)
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("register")
+            .summary("Register a new user")
+            .description(
+                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
+                 valid address, 409 if it's already taken",
+            )
+    }
+}
+
+mod service {
+    use argon2::PasswordHasher;
+    use axum::http::StatusCode;
+    use chrono::Utc;
+    use email_address::EmailAddress;
     use thiserror::Error;
     use uuid::Uuid;
     use common_macros::ErrorResponses;
@@ -20,12 +54,6 @@ mod controller {
     use crate::model::user::User;
     use crate::server::AppState;
     use crate::storage::{CreateUserOutcome, UserStorage};
-
-    #[derive(Deserialize, JsonSchema)]
-    pub(crate) struct RegisterRequest {
-        pub(super) email: String,
-        pub(super) password: String,
-    }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum RegisterError {
@@ -40,11 +68,8 @@ mod controller {
         UnexpectedError,
     }
 
-    pub(crate) async fn register(
-        State(mut state): State<AppState>,
-        Json(req): Json<RegisterRequest>,
-    ) -> Result<StatusCode, RegisterError> {
-        let email = normalize_email(&req.email);
+    pub(crate) async fn register(state: &mut AppState, email: String, password: String) -> Result<(), RegisterError> {
+        let email = normalize_email(&email);
         if !EmailAddress::is_valid(&email) {
             return Err(RegisterError::InvalidEmail);
         }
@@ -52,7 +77,6 @@ mod controller {
         // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking keeps
         // it off this tokio worker thread so it doesn't stall other tasks while
         // hashing.
-        let password = req.password;
         let password_hash = tokio::task::spawn_blocking(move || {
             ARGON2
                 .hash_password(password.as_bytes())
@@ -79,20 +103,9 @@ mod controller {
             .await;
 
         match outcome {
-            CreateUserOutcome::Created => Ok(StatusCode::CREATED),
+            CreateUserOutcome::Created => Ok(()),
             CreateUserOutcome::EmailTaken => Err(RegisterError::EmailTaken),
         }
-    }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("register")
-            .summary("Register a new user")
-            .description(
-                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
-                 valid address, 409 if it's already taken",
-            )
     }
 }
 

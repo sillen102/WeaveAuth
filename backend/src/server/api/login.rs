@@ -3,13 +3,54 @@ pub(crate) use controller::login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::password_hash::phc::PasswordHash;
-    use argon2::PasswordVerifier;
     use axum::extract::State;
-    use axum::http::StatusCode;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+
+    use crate::server::AppState;
+
+    use super::service;
+    pub(crate) use super::service::LoginError;
+
+    #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct LoginRequest {
+        pub(super) email: String,
+        pub(super) password: String,
+    }
+
+    #[derive(Serialize, JsonSchema)]
+    pub(crate) struct LoginResponse {
+        /// Single-use proof of this authentication, required by `/oauth/authorize`.
+        pub(super) login_session: String,
+    }
+
+    pub(crate) async fn login(
+        State(mut state): State<AppState>,
+        Json(req): Json<LoginRequest>,
+    ) -> Result<Json<LoginResponse>, LoginError> {
+        let login_session = service::login(&mut state, &req.email, req.password).await?;
+        Ok(Json(LoginResponse { login_session }))
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("login")
+            .summary("Authenticate a user")
+            .description(
+                "Checks email/password against stored users and, on success, returns a \
+                 short-lived login_session token that /oauth/authorize requires before it will \
+                 issue a code -- this is what makes authentication happen before authorization \
+                 regardless of what order a caller invokes the two endpoints in",
+            )
+    }
+}
+
+mod service {
+    use argon2::password_hash::phc::PasswordHash;
+    use argon2::PasswordVerifier;
+    use axum::http::StatusCode;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
@@ -32,18 +73,6 @@ mod controller {
     /// at build time or once at first request.
     const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$+asaoNd4judQBozzpttaCQ$WFrspw+VJ+HAPOXqRwravZFYap0GT3yyfgRf5ZVv6qc";
 
-    #[derive(Deserialize, JsonSchema)]
-    pub(crate) struct LoginRequest {
-        pub(super) email: String,
-        pub(super) password: String,
-    }
-
-    #[derive(Serialize, JsonSchema)]
-    pub(crate) struct LoginResponse {
-        /// Single-use proof of this authentication, required by `/oauth/authorize`.
-        pub(super) login_session: String,
-    }
-
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum LoginError {
         #[error("invalid credentials")]
@@ -54,11 +83,8 @@ mod controller {
         UnexpectedError,
     }
 
-    pub(crate) async fn login(
-        State(mut state): State<AppState>,
-        Json(req): Json<LoginRequest>,
-    ) -> Result<Json<LoginResponse>, LoginError> {
-        let user = state.users.get_user_by_email(&normalize_email(&req.email)).await;
+    pub(crate) async fn login(state: &mut AppState, email: &str, password: String) -> Result<String, LoginError> {
+        let user = state.users.get_user_by_email(&normalize_email(email)).await;
 
         // Always hash, even for an unknown email (against a fixed dummy hash)
         // -- see DUMMY_PASSWORD_HASH. Both branches pay the same Argon2 cost, so
@@ -70,7 +96,6 @@ mod controller {
             .as_ref()
             .and_then(|u| u.password.clone())
             .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
-        let password = req.password;
         let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
             let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
             Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
@@ -82,20 +107,7 @@ mod controller {
         let user = user.filter(|_| verified).ok_or(LoginError::InvalidCredentials)?;
 
         let login_session = state.login_sessions.create_session(user.id).await;
-        Ok(Json(LoginResponse { login_session }))
-    }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("login")
-            .summary("Authenticate a user")
-            .description(
-                "Checks email/password against stored users and, on success, returns a \
-                 short-lived login_session token that /oauth/authorize requires before it will \
-                 issue a code -- this is what makes authentication happen before authorization \
-                 regardless of what order a caller invokes the two endpoints in",
-            )
+        Ok(login_session)
     }
 }
 

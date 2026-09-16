@@ -8,7 +8,12 @@ mod controller {
     use serde_json::Value;
 
     use crate::server::AppState;
-    use crate::storage::JwkStorage;
+
+    use super::service;
+
+    pub(crate) async fn jwks(State(state): State<AppState>) -> Json<Value> {
+        Json(service::jwk_set(&state).await)
+    }
 
     pub(crate) fn jwks_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
@@ -16,8 +21,16 @@ mod controller {
             .summary("JSON Web Key Set")
             .description("Public keys used to verify access token signatures (RFC 7517).")
     }
+}
 
-    pub(crate) async fn jwks(State(state): State<AppState>) -> Json<Value> {
-        Json(state.jwt_keys.jwk_set().await)
+
+mod service {
+    use serde_json::Value;
+
+    use crate::server::AppState;
+    use crate::storage::JwkStorage;
+
+    pub(crate) async fn jwk_set(state: &AppState) -> Value {
+        state.jwt_keys.jwk_set().await
     }
 }

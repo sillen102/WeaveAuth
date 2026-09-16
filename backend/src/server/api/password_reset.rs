@@ -5,22 +5,16 @@ pub(crate) use controller::request_password_reset_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use argon2::PasswordHasher;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use thiserror::Error;
-    use common_macros::ErrorResponses;
 
-    use crate::crypto::ARGON2;
-    use crate::model::email::normalize_email;
     use crate::server::AppState;
-    use crate::storage::{
-        LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, RevokeOutcome,
-        SetPasswordOutcome, UserStorage,
-    };
+
+    use super::service;
+    pub(crate) use super::service::PasswordResetConfirmError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct PasswordResetRequestRequest {
@@ -33,98 +27,20 @@ mod controller {
         pub(super) new_password: String,
     }
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum PasswordResetConfirmError {
-        #[error("invalid or expired password reset token")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired password reset token")]
-        InvalidOrExpiredToken,
-        #[error("internal error")]
-        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
-        UnexpectedError,
-    }
-
-    /// Issues a single-use password reset token for the account matching
-    /// `email`, if any.
-    ///
-    /// The token is deliberately not surfaced anywhere in this response (nor
-    /// logged) -- delivering it to the account owner is the caller's job
-    /// (e.g. by email), never this endpoint's.
     pub(crate) async fn request_password_reset(
         State(mut state): State<AppState>,
         Json(req): Json<PasswordResetRequestRequest>,
     ) -> StatusCode {
-        let email = normalize_email(&req.email);
-        if let Some(user) = state.users.get_user_by_email(&email).await {
-            let _token = state.password_reset_tokens.save_reset_token(user.id).await;
-        }
-
-        // Same response whether or not `email` matched an account -- an
-        // account-existence oracle here would let a caller enumerate
-        // registered addresses, the same concern `/oauth/login`'s dummy-hash
-        // check (see login.rs) exists to close off.
+        service::request_password_reset(&mut state, &req.email).await;
         StatusCode::ACCEPTED
     }
 
-    /// Redeems a password reset token, setting a new password on the account
-    /// it was issued for.
     pub(crate) async fn confirm_password_reset(
         State(mut state): State<AppState>,
         Json(req): Json<PasswordResetConfirmRequest>,
     ) -> Result<StatusCode, PasswordResetConfirmError> {
-        let user_id = state
-            .password_reset_tokens
-            .take_reset_token(&req.token)
-            .await
-            .ok_or(PasswordResetConfirmError::InvalidOrExpiredToken)?;
-
-        // A password reset is the standard remediation for "my account may
-        // be compromised" -- that only actually remediates anything if it
-        // also kills any refresh token or login session an attacker already
-        // holds. Revoked once *before* the password changes (so nothing an
-        // attacker already held survives this call) and once *after* (so a
-        // token/session created in the narrow window between this line and
-        // `set_password` below -- e.g. a concurrent login racing this
-        // request -- doesn't survive it either). Neither revocation is
-        // allowed to fail silently: `RevokeOutcome::Failed` here means a
-        // durable backend's delete errored, which is exactly the case this
-        // whole flow exists to not paper over with a 200.
-        revoke_everything_for(&mut state, user_id).await?;
-
-        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking
-        // keeps it off this tokio worker thread, same as /register.
-        let new_password = req.new_password;
-        let password_hash = tokio::task::spawn_blocking(move || {
-            ARGON2
-                .hash_password(new_password.as_bytes())
-                .map(|h| h.to_string())
-        })
-        .await
-        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?
-        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
-
-        match state.users.set_password(user_id, password_hash).await {
-            SetPasswordOutcome::Ok => {}
-            // The token was valid a moment ago but the account is gone now --
-            // vanishingly unlikely (nothing in this codebase deletes users),
-            // but report it as the same not-found-shaped error rather than a
-            // 500, since from the caller's perspective the token just doesn't
-            // resolve to anything anymore.
-            SetPasswordOutcome::UserNotFound => return Err(PasswordResetConfirmError::InvalidOrExpiredToken),
-        }
-
-        revoke_everything_for(&mut state, user_id).await?;
-
+        service::confirm_password_reset(&mut state, &req.token, req.new_password).await?;
         Ok(StatusCode::OK)
-    }
-
-    async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmError> {
-        if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmError::UnexpectedError);
-        }
-        if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmError::UnexpectedError);
-        }
-        Ok(())
     }
 
     pub(crate) fn request_password_reset_doc(op: TransformOperation) -> TransformOperation {
@@ -148,6 +64,111 @@ mod controller {
                  outstanding refresh token and login session for that account; 400 if the \
                  token is unknown, expired, or already used.",
             )
+    }
+}
+
+mod service {
+    use argon2::PasswordHasher;
+    use axum::http::StatusCode;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
+
+    use crate::crypto::ARGON2;
+    use crate::model::email::normalize_email;
+    use crate::server::AppState;
+    use crate::storage::{
+        LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, RevokeOutcome,
+        SetPasswordOutcome, UserStorage,
+    };
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum PasswordResetConfirmError {
+        #[error("invalid or expired password reset token")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired password reset token")]
+        InvalidOrExpiredToken,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
+    }
+
+    /// Issues a single-use password reset token for the account matching
+    /// `email`, if any.
+    ///
+    /// The token is deliberately not surfaced anywhere in this response (nor
+    /// logged) -- delivering it to the account owner is the caller's job
+    /// (e.g. by email), never this endpoint's.
+    pub(crate) async fn request_password_reset(state: &mut AppState, email: &str) {
+        let email = normalize_email(email);
+        if let Some(user) = state.users.get_user_by_email(&email).await {
+            let _token = state.password_reset_tokens.save_reset_token(user.id).await;
+        }
+
+        // Same response whether or not `email` matched an account -- an
+        // account-existence oracle here would let a caller enumerate
+        // registered addresses, the same concern `/oauth/login`'s dummy-hash
+        // check (see login.rs) exists to close off.
+    }
+
+    /// Redeems a password reset token, setting a new password on the account
+    /// it was issued for.
+    pub(crate) async fn confirm_password_reset(
+        state: &mut AppState,
+        token: &str,
+        new_password: String,
+    ) -> Result<(), PasswordResetConfirmError> {
+        let user_id = state
+            .password_reset_tokens
+            .take_reset_token(token)
+            .await
+            .ok_or(PasswordResetConfirmError::InvalidOrExpiredToken)?;
+
+        // A password reset is the standard remediation for "my account may
+        // be compromised" -- that only actually remediates anything if it
+        // also kills any refresh token or login session an attacker already
+        // holds. Revoked once *before* the password changes (so nothing an
+        // attacker already held survives this call) and once *after* (so a
+        // token/session created in the narrow window between this line and
+        // `set_password` below -- e.g. a concurrent login racing this
+        // request -- doesn't survive it either). Neither revocation is
+        // allowed to fail silently: `RevokeOutcome::Failed` here means a
+        // durable backend's delete errored, which is exactly the case this
+        // whole flow exists to not paper over with a 200.
+        revoke_everything_for(state, user_id).await?;
+
+        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking
+        // keeps it off this tokio worker thread, same as /register.
+        let password_hash = tokio::task::spawn_blocking(move || {
+            ARGON2
+                .hash_password(new_password.as_bytes())
+                .map(|h| h.to_string())
+        })
+        .await
+        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?
+        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
+
+        match state.users.set_password(user_id, password_hash).await {
+            SetPasswordOutcome::Ok => {}
+            // The token was valid a moment ago but the account is gone now --
+            // vanishingly unlikely (nothing in this codebase deletes users),
+            // but report it as the same not-found-shaped error rather than a
+            // 500, since from the caller's perspective the token just doesn't
+            // resolve to anything anymore.
+            SetPasswordOutcome::UserNotFound => return Err(PasswordResetConfirmError::InvalidOrExpiredToken),
+        }
+
+        revoke_everything_for(state, user_id).await?;
+
+        Ok(())
+    }
+
+    async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmError> {
+        if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
+            return Err(PasswordResetConfirmError::UnexpectedError);
+        }
+        if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
+            return Err(PasswordResetConfirmError::UnexpectedError);
+        }
+        Ok(())
     }
 }
 

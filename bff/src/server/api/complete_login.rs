@@ -1,7 +1,7 @@
-pub(crate) use controller::complete_login;
-pub(crate) use controller::CompleteLoginError;
+pub(crate) use service::complete_login;
+pub(crate) use service::CompleteLoginError;
 
-mod controller {
+mod service {
     use axum::http::{header, StatusCode};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
