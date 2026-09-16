@@ -10,7 +10,7 @@ mod controller {
     use axum::Form;
     use serde::Deserialize;
 
-    use crate::server::cookie::{build_cookie, clear_cookie, extract_cookie};
+    use crate::server::cookie::{build_cookie, build_cross_site_cookie, clear_cookie, extract_cookie};
     use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
     use crate::server::AppState;
 
@@ -28,6 +28,12 @@ mod controller {
     /// instead of the URL -- it's half a credential (paired with the account
     /// password), and a URL leaks into browser history, Referer headers, and
     /// access logs in a way a short-lived HttpOnly cookie doesn't.
+    ///
+    /// `oidc_confirm_link` is reached by the login page's own form POSTing
+    /// to this service, which is cross-site whenever login and bff aren't
+    /// deployed same-site -- so this is the one flow cookie built with
+    /// `build_cross_site_cookie` (`SameSite=None`) instead of `build_cookie`
+    /// (`SameSite=Lax`), which browsers withhold from a cross-site POST.
     const PENDING_LINK_TOKEN_COOKIE: &str = "wa_oidc_pending_link_token";
 
     #[derive(Deserialize)]
@@ -180,7 +186,8 @@ mod controller {
         match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri).await {
             OidcCallbackOutcome::Failed => Ok(error_redirect(&next)),
             OidcCallbackOutcome::PasswordConfirmationRequired { pending_link_token, email } => {
-                // `email` (not sensitive) goes on the URL for display, but
+                // `email` (not sensitive, and also what the login page gates
+                // the confirm-link form on) goes on the URL, but
                 // `pending_link_token` (half a credential) goes in a
                 // short-lived cookie instead -- see PENDING_LINK_TOKEN_COOKIE.
                 let sep = if next.contains('?') { '&' } else { '?' };
@@ -188,7 +195,7 @@ mod controller {
                     "{next}{sep}email={}",
                     url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>(),
                 );
-                let pending_link_cookie = build_cookie(
+                let pending_link_cookie = build_cross_site_cookie(
                     PENDING_LINK_TOKEN_COOKIE,
                     &pending_link_token,
                     FLOW_COOKIE_PATH,
@@ -233,8 +240,6 @@ mod controller {
         if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
             return Err(OidcConfirmLinkError::InvalidNext);
         }
-        let pending_link_token = extract_cookie(&headers, PENDING_LINK_TOKEN_COOKIE)
-            .ok_or(OidcConfirmLinkError::MissingPendingLinkToken)?;
 
         // Single-use regardless of outcome, so it's cleared on every path
         // below rather than only on success.
@@ -243,17 +248,29 @@ mod controller {
             clear_cookie(PENDING_LINK_TOKEN_COOKIE, FLOW_COOKIE_PATH, state.config.secure_cookies()),
         );
 
+        // `req.next` is already validated above, so both a missing/expired
+        // pending-link cookie (nothing to bounce back to but the login page)
+        // and a wrong password bounce there with `error=link_failed`, instead
+        // of the former surfacing as a bare 400.
+        let link_failed_redirect = || -> Response {
+            let sep = if req.next.contains('?') { '&' } else { '?' };
+            (
+                StatusCode::SEE_OTHER,
+                [clear_pending_link_cookie.clone()],
+                [(header::LOCATION, format!("{}{sep}error=link_failed", req.next))],
+            )
+                .into_response()
+        };
+
+        let Some(pending_link_token) = extract_cookie(&headers, PENDING_LINK_TOKEN_COOKIE) else {
+            return Ok(link_failed_redirect());
+        };
+
         match service::confirm_oidc_link(&mut state, &pending_link_token, &req.password, &req.redirect_uri).await? {
             ConfirmLinkOutcome::Failed => {
                 // Send the browser back to the plain login page rather than
                 // re-showing a confirm-link form that can no longer succeed.
-                let sep = if req.next.contains('?') { '&' } else { '?' };
-                Ok((
-                    StatusCode::SEE_OTHER,
-                    [clear_pending_link_cookie],
-                    [(header::LOCATION, format!("{}{sep}error=link_failed", req.next))],
-                )
-                    .into_response())
+                Ok(link_failed_redirect())
             }
             ConfirmLinkOutcome::Authenticated { cookie } => Ok((
                 StatusCode::SEE_OTHER,
@@ -342,11 +359,6 @@ mod service {
         #[error("next is not a same-origin path or a trusted origin")]
         #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
         InvalidNext,
-        /// The pending-link cookie set by `oidc_callback` is gone (expired,
-        /// or this endpoint was hit without going through that first).
-        #[error("missing or expired pending link token")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired pending link token")]
-        MissingPendingLinkToken,
     }
 
     impl From<CompleteLoginError> for OidcConfirmLinkError {

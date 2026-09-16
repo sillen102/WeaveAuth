@@ -8,7 +8,7 @@
 </head>
 <body>
   <div id="page-content">
-  {% if pending_link_token %}
+  {% if email %}
   <main class="card">
     <h1>Confirm it's you</h1>
     <p>
@@ -21,7 +21,6 @@
         <label for="password">Password</label>
         <input type="password" id="password" name="password" autocomplete="current-password" required>
       </div>
-      <input type="hidden" name="pending_link_token" value="{{ pending_link_token }}">
       <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
       <input type="hidden" name="next" value="{{ own_url }}">
       <button class="btn" type="submit">Confirm and link account</button>

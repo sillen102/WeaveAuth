@@ -147,13 +147,13 @@ async fn login_page_shows_the_link_failed_error_message() {
 }
 
 #[tokio::test]
-async fn login_page_renders_the_confirm_link_form_when_a_pending_link_token_is_present() {
+async fn login_page_renders_the_confirm_link_form_when_email_is_present() {
     let app = app(test_config());
 
     let resp = app
         .oneshot(
             Request::get(
-                "/login.html?pending_link_token=tok-123&email=squatter%40example.com&redirect_uri=http%3A%2F%2Fadmin.test%2F",
+                "/login.html?email=squatter%40example.com&redirect_uri=http%3A%2F%2Fadmin.test%2F",
             )
             .body(Body::empty())
             .unwrap(),
@@ -165,7 +165,6 @@ async fn login_page_renders_the_confirm_link_form_when_a_pending_link_token_is_p
     assert!(!body.contains("<script"));
     assert!(body.contains("id=\"confirm-link-form\""));
     assert!(body.contains("squatter@example.com"));
-    assert!(body.contains("value=\"tok-123\""));
     assert!(body.contains("action=\"http://bff.test/oidc/confirm-link\""));
     assert!(!body.contains("id=\"login-form\""));
 }

@@ -386,6 +386,30 @@ async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
 }
 
 #[tokio::test]
+async fn oidc_confirm_link_bounces_to_login_with_link_failed_when_the_pending_link_cookie_is_missing_or_expired(
+) -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::post("/oidc/confirm-link")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
+                .body(Body::from(
+                    "password=correct-password\
+                     &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
+                ))?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=link_failed"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn oidc_confirm_link_rejects_an_untrusted_origin() -> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();

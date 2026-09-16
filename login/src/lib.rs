@@ -119,7 +119,6 @@ async fn index_page() -> impl IntoResponse {
 struct PageQuery {
     redirect_uri: Option<String>,
     error: Option<String>,
-    pending_link_token: Option<String>,
     email: Option<String>,
 }
 
@@ -165,7 +164,6 @@ fn render_page(
     ctx.insert("redirect_uri", &redirect_uri);
     ctx.insert("own_url", &own_url);
     ctx.insert("error", &query.error);
-    ctx.insert("pending_link_token", &query.pending_link_token);
     ctx.insert("email", &query.email);
 
     let mut tera = Tera::new();

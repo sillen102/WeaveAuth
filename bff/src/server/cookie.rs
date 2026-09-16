@@ -19,6 +19,20 @@ pub(crate) fn build_cookie(name: &str, value: &str, path: &str, max_age_secs: i6
     format!("{name}={value}; HttpOnly; Path={path}; SameSite=Lax{secure}; Max-Age={max_age_secs}")
 }
 
+/// Like `build_cookie`, but `SameSite=None` instead of `Lax` -- for a cookie
+/// that must survive a cross-site top-level POST (a login-page form
+/// submitting to a bff on a different registrable domain), which `Lax`
+/// blocks. `SameSite=None` is only valid with `Secure`; browsers reject it
+/// otherwise, so this falls back to the ordinary `Lax` cookie when `secure`
+/// is false (plain-http dev, where login and bff are same-site anyway).
+pub(crate) fn build_cross_site_cookie(name: &str, value: &str, path: &str, max_age_secs: i64, secure: bool) -> String {
+    if !secure {
+        return build_cookie(name, value, path, max_age_secs, secure);
+    }
+    let value = utf8_percent_encode(value, COOKIE_VALUE);
+    format!("{name}={value}; HttpOnly; Path={path}; SameSite=None; Secure; Max-Age={max_age_secs}")
+}
+
 /// A `Set-Cookie` value that immediately expires the named cookie.
 pub(crate) fn clear_cookie(name: &str, path: &str, secure: bool) -> String {
     build_cookie(name, "", path, 0, secure)
@@ -75,6 +89,20 @@ mod tests {
     fn build_cookie_adds_secure_flag_when_requested() {
         let set_cookie = build_cookie("wa_session", "abc", "/", 60, true);
         assert_eq!(set_cookie, "wa_session=abc; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=60");
+    }
+
+    #[test]
+    fn build_cross_site_cookie_uses_samesite_none_when_secure() {
+        let set_cookie = build_cross_site_cookie("wa_pending", "tok", "/oidc", 300, true);
+        assert_eq!(set_cookie, "wa_pending=tok; HttpOnly; Path=/oidc; SameSite=None; Secure; Max-Age=300");
+    }
+
+    #[test]
+    fn build_cross_site_cookie_falls_back_to_lax_without_secure() {
+        // SameSite=None is invalid without Secure -- browsers reject it. Plain
+        // http (dev) keeps the ordinary Lax cookie instead.
+        let set_cookie = build_cross_site_cookie("wa_pending", "tok", "/oidc", 300, false);
+        assert_eq!(set_cookie, "wa_pending=tok; HttpOnly; Path=/oidc; SameSite=Lax; Max-Age=300");
     }
 
     #[test]
