@@ -217,6 +217,10 @@ async fn oidc_callback_without_flow_cookies_is_bad_request() -> anyhow::Result<(
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
     Ok(())
 }
 
@@ -286,6 +290,10 @@ async fn oidc_callback_rejects_a_state_that_does_not_match_the_flow_cookie() -> 
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
     Ok(())
 }
 

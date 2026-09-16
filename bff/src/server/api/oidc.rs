@@ -245,17 +245,34 @@ mod controller {
         if !is_valid_provider(&provider) {
             return Err(OidcCallbackError::UnknownProvider);
         }
-        let redirect_uri =
-            extract_cookie(&headers, REDIRECT_URI_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
-        let next = extract_cookie(&headers, NEXT_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
-        let flow_state = extract_cookie(&headers, STATE_COOKIE).ok_or(OidcCallbackError::MissingFlowState)?;
-
         let secure = state.config.secure_cookies();
         let clear_flow_cookies = [
             (header::SET_COOKIE, clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH, secure)),
             (header::SET_COOKIE, clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH, secure)),
             (header::SET_COOKIE, clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure)),
         ];
+
+        // These bail with the flow cookies cleared rather than `?` straight
+        // to `OidcCallbackError` -- otherwise the stale redirect_uri/next/state
+        // survive for the rest of `FLOW_COOKIE_TTL_SECS` and get reused by the
+        // next callback attempt.
+        let with_cleared_cookies = |err: OidcCallbackError| -> Response {
+            let mut resp = err.into_response();
+            for (name, value) in &clear_flow_cookies {
+                if let Ok(value) = HeaderValue::from_str(value) {
+                    resp.headers_mut().append(name, value);
+                }
+            }
+            resp
+        };
+
+        let (Some(redirect_uri), Some(next), Some(flow_state)) = (
+            extract_cookie(&headers, REDIRECT_URI_COOKIE),
+            extract_cookie(&headers, NEXT_COOKIE),
+            extract_cookie(&headers, STATE_COOKIE),
+        ) else {
+            return Ok(with_cleared_cookies(OidcCallbackError::MissingFlowState));
+        };
 
         let error_redirect = |next: &str| -> Response {
             let sep = if next.contains('?') { '&' } else { '?' };
@@ -277,20 +294,10 @@ mod controller {
         // the attacker lacks, it's a binding check that this browser is the
         // one that started the flow. A plain compare is fine.
         if *req_state != flow_state {
-            return Err(OidcCallbackError::StateMismatch);
+            return Ok(with_cleared_cookies(OidcCallbackError::StateMismatch));
         }
 
-        let backend_resp = match state
-            .http_client
-            .get(format!("{}/oauth/oidc/{provider}/callback", state.config.backend_url))
-            .query(&[("code", code), ("state", req_state)])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => resp,
-            _ => return Ok(error_redirect(&next)),
-        };
-        let Ok(callback_response) = backend_resp.json::<OidcCallbackResponse>().await else {
+        let Some(callback_response) = fetch_callback_response(&state, &provider, code, req_state).await else {
             return Ok(error_redirect(&next));
         };
 
@@ -333,6 +340,29 @@ mod controller {
             Body::empty(),
         )
             .into_response())
+    }
+
+    /// Server-to-server half of the code exchange: hands `code`/`state` to
+    /// backend and parses its response. `None` covers every failure mode
+    /// (network, non-2xx, bad body) since the caller treats them all the
+    /// same way -- bounce to `next` with `?error=1`.
+    async fn fetch_callback_response(
+        state: &AppState,
+        provider: &str,
+        code: &str,
+        req_state: &str,
+    ) -> Option<OidcCallbackResponse> {
+        let resp = state
+            .http_client
+            .get(format!("{}/oauth/oidc/{provider}/callback", state.config.backend_url))
+            .query(&[("code", code), ("state", req_state)])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json().await.ok()
     }
 
     /// Finishes an OIDC login that `oidc_callback` flagged as needing
