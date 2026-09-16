@@ -3,8 +3,8 @@ use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
     InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
-    InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
-    InMemoryUserStorage,
+    InMemoryPasswordResetTokenStorage, InMemoryPendingOidcLinkStorage, InMemoryPkceStorage,
+    InMemoryRefreshTokenStorage, InMemoryUserStorage,
 };
 use crate::storage::ExpiryMaintenance;
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ pub(crate) struct AppState {
     pub(crate) oidc_state: InMemoryOidcStateStorage,
     pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
+    pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
 }
 
 impl AppState {
@@ -39,6 +40,7 @@ impl AppState {
         self.refresh_tokens.sweep_expired().await;
         self.oidc_state.sweep_expired().await;
         self.pending_oidc_links.sweep_expired().await;
+        self.password_reset_tokens.sweep_expired().await;
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
@@ -64,6 +66,7 @@ impl AppState {
             oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
             pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
             oidc_http_client,
+            password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
         })
     }
 }

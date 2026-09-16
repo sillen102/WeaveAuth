@@ -63,12 +63,21 @@ pub(crate) enum OidcLinkOutcome {
     RequiresPasswordConfirmation { existing_user_id: Uuid },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum CreateUserOutcome {
+    Created,
+    /// Nothing was saved -- an account with this email already exists.
+    EmailTaken,
+}
+
 pub(crate) trait UserStorage {
     /// Saves `user` unless its `email` is already taken, in which case
-    /// nothing is saved and `false` is returned. The check and the insert must
-    /// happen atomically (one lock acquisition) so two concurrent registrations
-    /// for the same email can't both pass the check before either inserts.
-    async fn create_user(&mut self, user: User) -> bool;
+    /// nothing is saved and `EmailTaken` is returned. The check and the
+    /// insert must happen atomically (one lock acquisition) so two
+    /// concurrent registrations for the same email can't both pass the
+    /// check before either inserts.
+    async fn create_user(&mut self, user: User) -> CreateUserOutcome;
     async fn get_user_by_email(&self, email: &str) -> Option<User>;
     async fn get_user_by_id(&self, id: Uuid) -> Option<User>;
     /// Resolves an OIDC login to a user, without ever silently merging into
@@ -108,6 +117,17 @@ pub(crate) trait UserStorage {
     /// so skipping that proof is exactly the account-takeover vector
     /// `resolve_oidc_login` refuses to do on its own.
     async fn link_verified_oidc_identity(&mut self, user_id: Uuid, provider: &str, subject: &str) -> Option<User>;
+    /// Overwrites `user_id`'s password hash (used by `/oauth/password-reset/confirm`
+    /// and, later, a "change password" endpoint). `UserNotFound` if `user_id`
+    /// doesn't exist.
+    async fn set_password(&mut self, user_id: Uuid, password_hash: String) -> SetPasswordOutcome;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum SetPasswordOutcome {
+    Ok,
+    UserNotFound,
 }
 
 /// A short-lived, single-use proof that `/oauth/login` already authenticated
@@ -121,6 +141,22 @@ pub(crate) trait LoginSessionStorage {
     /// Consumes the session token; returns the user id if it existed and
     /// hasn't expired.
     async fn take_session(&mut self, token: &str) -> Option<Uuid>;
+    /// Invalidates every outstanding session for `user_id`. Called around a
+    /// password reset -- see `RefreshTokenStorage::revoke_all_for_user`.
+    ///
+    /// Returns `RevokeOutcome::Failed` if the revocation itself failed (e.g.
+    /// a durable backend's delete errored) -- implementations MUST NOT
+    /// swallow such a failure and report `Ok`. The in-memory implementation
+    /// can't fail, so it always returns `Ok`; a caller relying on this for
+    /// account-takeover remediation needs to know when that's not true.
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum RevokeOutcome {
+    Ok,
+    Failed,
 }
 
 pub(crate) trait PkceStorage {
@@ -166,6 +202,17 @@ pub(crate) enum RefreshTokenOutcome {
 pub(crate) trait RefreshTokenStorage {
     async fn save_refresh_token(&mut self, token: String, user_id: Uuid, family_id: Uuid);
     async fn take_refresh_token(&mut self, token: &str) -> RefreshTokenOutcome;
+    /// Revokes every refresh token belonging to `user_id`, across every
+    /// family -- a password reset is the standard remediation for "my
+    /// account may be compromised", which only actually remediates anything
+    /// if it also kills any refresh token (and login session, see
+    /// `LoginSessionStorage::revoke_all_for_user`) an attacker already holds.
+    ///
+    /// Returns `RevokeOutcome::Failed` if the revocation itself failed --
+    /// implementations MUST NOT swallow such a failure and report `Ok`,
+    /// since the caller treats `Ok` here as its guarantee that no stale
+    /// token survived.
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
 }
 
 /// What `/oauth/oidc/{provider}/login` stashed for a single in-flight
@@ -212,6 +259,20 @@ pub(crate) trait PendingOidcLinkStorage {
     /// bound on guessing given each attempt already costs a full provider
     /// round-trip to obtain a new token.
     async fn take_pending_link(&mut self, token: &str) -> Option<PendingOidcLink>;
+}
+
+/// A short-lived, single-use token proving whoever presents it controls the
+/// email inbox `/oauth/password-reset/request` sent it to -- redeeming it via
+/// `/oauth/password-reset/confirm` sets a new password on the account it was
+/// issued for. There's no email-sending yet (see `request`'s doc comment), so
+/// this doesn't prove anything in practice until that's wired up, but the
+/// storage contract is the same one a real send would need.
+pub(crate) trait PasswordResetTokenStorage {
+    async fn save_reset_token(&mut self, user_id: Uuid) -> String;
+    /// Consumes the token; returns the user id it was issued for if it
+    /// existed and hasn't expired. Single-use, same rationale as
+    /// `PendingOidcLinkStorage::take_pending_link`.
+    async fn take_reset_token(&mut self, token: &str) -> Option<Uuid>;
 }
 
 /// Periodic upkeep for storage backends that accumulate single-use, TTL'd

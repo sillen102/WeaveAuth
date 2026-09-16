@@ -305,6 +305,7 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
+            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
         }
     }
 
@@ -417,7 +418,7 @@ mod tests {
             ..User::default()
         };
         let user_id = user.id;
-        state.users.create_user(user).await;
+        let _ = state.users.create_user(user).await;
         let token = state
             .pending_oidc_links
             .save_pending_link("google".to_string(), "sub-123".to_string(), user_id)
@@ -452,7 +453,7 @@ mod tests {
             ..User::default()
         };
         let user_id = user.id;
-        state.users.create_user(user).await;
+        let _ = state.users.create_user(user).await;
         let token = state
             .pending_oidc_links
             .save_pending_link("google".to_string(), "sub-123".to_string(), user_id)

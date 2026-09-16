@@ -28,6 +28,11 @@ pub struct Config {
     /// `oidc_state_ttl_secs` -- this one waits on a human reading a prompt
     /// and typing a password, not just a redirect round-trip.
     pub pending_oidc_link_ttl_secs: i64,
+    /// How long a `/oauth/password-reset/request` token stays redeemable via
+    /// `/oauth/password-reset/confirm`. Longer than `oidc_state_ttl_secs` --
+    /// this one waits on a human reading an email and clicking a link, not
+    /// just a redirect round-trip.
+    pub password_reset_token_ttl_secs: i64,
     /// How often the background task sweeps expired entries out of the
     /// TTL'd stores (PKCE challenges, OIDC state, login sessions, ...).
     /// Bounds how long an abandoned flow's leftovers linger.
@@ -66,6 +71,7 @@ impl Default for Config {
             refresh_token_ttl_secs: 2_592_000,
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
+            password_reset_token_ttl_secs: 1_800,
             expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
         }

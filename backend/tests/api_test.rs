@@ -21,6 +21,7 @@ fn test_config() -> Config {
         refresh_token_ttl_secs: 2_592_000,
         oidc_state_ttl_secs: 300,
         pending_oidc_link_ttl_secs: 600,
+        password_reset_token_ttl_secs: 1_800,
         expiry_sweep_interval_secs: 60,
         oidc_providers: HashMap::new(),
     }
@@ -131,6 +132,45 @@ async fn token_exchange_full_round_trip() {
     assert!(body["refresh_token"].is_string());
     assert_eq!(body["token_type"], "Bearer");
     assert!(body["expires_at"].is_string());
+}
+
+#[tokio::test]
+async fn password_reset_request_returns_accepted_over_http() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(
+            Request::post("/oauth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"email": "alice@example.com"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn password_reset_confirm_rejects_an_unknown_token_over_http() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(
+            Request::post("/oauth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": "no-such-token", "new_password": "new-password"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

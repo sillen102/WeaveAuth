@@ -125,6 +125,7 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
         };
         (state, login_session, user_id)
     }

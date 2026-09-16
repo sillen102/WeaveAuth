@@ -231,6 +231,7 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
         }
     }
 
@@ -244,7 +245,7 @@ mod tests {
             ..User::default()
         };
         let user_id = user.id;
-        state.users.create_user(user).await;
+        let _ = state.users.create_user(user).await;
         (state, user_id)
     }
 

@@ -2,14 +2,16 @@ use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::User;
 use crate::storage::{
-    ExpiryMaintenance, JwkStorage, LoginSessionStorage, OidcLinkOutcome, OidcLoginState,
-    OidcStateStorage, PendingOidcLink, PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome,
-    RefreshTokenStorage, UserStorage, VerifiedEmail,
+    CreateUserOutcome, ExpiryMaintenance, JwkStorage, LoginSessionStorage, OidcLinkOutcome,
+    OidcLoginState, OidcStateStorage, PasswordResetTokenStorage, PendingOidcLink,
+    PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, RevokeOutcome,
+    SetPasswordOutcome, UserStorage, VerifiedEmail,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use rand::RngExt;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -62,13 +64,13 @@ impl InMemoryUserStorage {
 }
 
 impl UserStorage for InMemoryUserStorage {
-    async fn create_user(&mut self, user: User) -> bool {
+    async fn create_user(&mut self, user: User) -> CreateUserOutcome {
         let mut inner = self.inner.lock().await;
         if inner.users.values().any(|u| u.email == user.email) {
-            return false;
+            return CreateUserOutcome::EmailTaken;
         }
         inner.users.insert(user.id, user);
-        true
+        CreateUserOutcome::Created
     }
 
     async fn get_user_by_email(&self, email: &str) -> Option<User> {
@@ -130,6 +132,16 @@ impl UserStorage for InMemoryUserStorage {
         inner.oidc_identities.insert((provider.to_string(), subject.to_string()), user_id);
         Some(user)
     }
+
+    async fn set_password(&mut self, user_id: Uuid, password_hash: String) -> SetPasswordOutcome {
+        let mut inner = self.inner.lock().await;
+        let Some(user) = inner.users.get_mut(&user_id) else {
+            return SetPasswordOutcome::UserNotFound;
+        };
+        user.password = Some(password_hash);
+        user.updated_at = Utc::now();
+        SetPasswordOutcome::Ok
+    }
 }
 
 /// token -> (provider, subject, existing_user_id, issued_at)
@@ -179,6 +191,81 @@ impl ExpiryMaintenance for InMemoryPendingOidcLinkStorage {
             .lock()
             .await
             .retain(|_, (_, _, _, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
+    }
+}
+
+/// sha256(token) -> (user_id, issued_at). Keyed by the token's hash, not the
+/// token itself -- this trait's contract is what a future durable (e.g.
+/// Postgres) implementation follows too, and a table of directly-usable
+/// plaintext reset tokens would turn a single read of that table into
+/// account takeover for every pending reset. Hashing costs nothing here and
+/// is awkward to retrofit later.
+type PasswordResetTokenEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
+
+#[derive(Clone)]
+pub(crate) struct InMemoryPasswordResetTokenStorage {
+    entries: Arc<Mutex<PasswordResetTokenEntries>>,
+    ttl_secs: i64,
+}
+
+impl InMemoryPasswordResetTokenStorage {
+    pub fn new(ttl_secs: i64) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
+        }
+    }
+
+    /// How many outstanding (not necessarily unexpired) tokens exist across
+    /// every user -- there's no way to observe token issuance through the
+    /// `PasswordResetTokenStorage` trait itself (the token value is only
+    /// ever handed to whoever asked for it), so tests that need to confirm
+    /// `/oauth/password-reset/request` actually issued something use this
+    /// instead of the token they were never given.
+    #[cfg(test)]
+    pub(crate) async fn token_count(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+}
+
+fn hash_reset_token(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+impl PasswordResetTokenStorage for InMemoryPasswordResetTokenStorage {
+    async fn save_reset_token(&mut self, user_id: Uuid) -> String {
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill(&mut token_bytes);
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
+
+        let mut entries = self.entries.lock().await;
+        // A fresh request supersedes any reset link already sent to this
+        // user -- otherwise every unexpired token from earlier requests
+        // stays independently redeemable, which both widens the window an
+        // old leaked link stays dangerous and lets an unauthenticated caller
+        // grow this table without bound by re-requesting the same email.
+        entries.retain(|_, (existing_user_id, _)| *existing_user_id != user_id);
+        entries.insert(hash_reset_token(&token), (user_id, Utc::now()));
+        token
+    }
+
+    async fn take_reset_token(&mut self, token: &str) -> Option<Uuid> {
+        let (user_id, issued_at) = self.entries.lock().await.remove(&hash_reset_token(token))?;
+        if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
+            return None;
+        }
+        Some(user_id)
+    }
+}
+
+impl ExpiryMaintenance for InMemoryPasswordResetTokenStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.entries
+            .lock()
+            .await
+            .retain(|_, (_, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
     }
 }
 
@@ -328,6 +415,11 @@ impl LoginSessionStorage for InMemoryLoginSessionStorage {
         }
         Some(user_id)
     }
+
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome {
+        self.sessions.lock().await.retain(|_, (uid, _)| *uid != user_id);
+        RevokeOutcome::Ok
+    }
 }
 
 impl ExpiryMaintenance for InMemoryLoginSessionStorage {
@@ -399,6 +491,11 @@ impl RefreshTokenStorage for InMemoryRefreshTokenStorage {
             family_id: record.family_id,
         }
     }
+
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome {
+        self.tokens.lock().await.retain(|_, record| record.user_id != user_id);
+        RevokeOutcome::Ok
+    }
 }
 
 impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
@@ -418,12 +515,13 @@ mod tests {
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::User;
     use crate::storage::in_memory::{
-        InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPkceStorage,
-        InMemoryRefreshTokenStorage, InMemoryUserStorage,
+        InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
+        InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
     };
     use crate::storage::{
-        LoginSessionStorage, OidcLinkOutcome, OidcLoginState, OidcStateStorage, PkceStorage,
-        RefreshTokenOutcome, RefreshTokenStorage, UserStorage, VerifiedEmail,
+        CreateUserOutcome, LoginSessionStorage, OidcLinkOutcome, OidcLoginState, OidcStateStorage,
+        PasswordResetTokenStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
+        SetPasswordOutcome, UserStorage, VerifiedEmail,
     };
 
     fn verified(email: &str) -> VerifiedEmail {
@@ -436,7 +534,7 @@ mod tests {
         let mut user = User::default();
         user.email = "carol".to_string();
         let user_id = user.id;
-        assert!(storage.create_user(user).await);
+        assert_eq!(storage.create_user(user).await, CreateUserOutcome::Created);
         let retrieved_user = storage.get_user_by_email("carol").await;
         assert_eq!(retrieved_user.map(|u| u.id), Some(user_id));
     }
@@ -447,11 +545,11 @@ mod tests {
         let mut first = User::default();
         first.email = "carol".to_string();
         let first_id = first.id;
-        assert!(storage.create_user(first).await);
+        assert_eq!(storage.create_user(first).await, CreateUserOutcome::Created);
 
         let mut second = User::default();
         second.email = "carol".to_string();
-        assert!(!storage.create_user(second).await);
+        assert_eq!(storage.create_user(second).await, CreateUserOutcome::EmailTaken);
 
         // The original registration is untouched -- no shadowing, no overwrite.
         let retrieved = storage.get_user_by_email("carol").await;
@@ -463,7 +561,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let mut user = User::default();
         user.email = "alice".to_string();
-        storage.create_user(user).await;
+        let _ = storage.create_user(user).await;
 
         let found = storage.get_user_by_email("alice").await;
         assert_eq!(found.map(|u| u.email), Some("alice".to_string()));
@@ -509,7 +607,7 @@ mod tests {
             email_verified: true,
             ..User::default()
         };
-        storage.create_user(local_user.clone()).await;
+        let _ = storage.create_user(local_user.clone()).await;
 
         let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
 
@@ -560,7 +658,7 @@ mod tests {
             email_verified: false,
             ..User::default()
         };
-        storage.create_user(squatter.clone()).await;
+        let _ = storage.create_user(squatter.clone()).await;
 
         let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
 
@@ -582,7 +680,7 @@ mod tests {
             email_verified: false,
             ..User::default()
         };
-        storage.create_user(squatter.clone()).await;
+        let _ = storage.create_user(squatter.clone()).await;
 
         let linked = storage
             .link_verified_oidc_identity(squatter.id, "google", "sub-123")
@@ -608,6 +706,83 @@ mod tests {
         let result = storage.link_verified_oidc_identity(Uuid::new_v4(), "google", "sub-123").await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_password_overwrites_the_hash_and_bumps_updated_at() {
+        let mut storage = InMemoryUserStorage::new();
+        let mut user = User::default();
+        user.email = "carol".to_string();
+        user.password = Some("old-hash".to_string());
+        let user_id = user.id;
+        let original_updated_at = user.updated_at;
+        let _ = storage.create_user(user).await;
+
+        assert_eq!(
+            storage.set_password(user_id, "new-hash".to_string()).await,
+            SetPasswordOutcome::Ok
+        );
+
+        let updated = storage.get_user_by_id(user_id).await.unwrap();
+        assert_eq!(updated.password.as_deref(), Some("new-hash"));
+        assert!(updated.updated_at >= original_updated_at);
+    }
+
+    #[tokio::test]
+    async fn set_password_returns_user_not_found_for_an_unknown_user() {
+        let mut storage = InMemoryUserStorage::new();
+        assert_eq!(
+            storage.set_password(Uuid::new_v4(), "new-hash".to_string()).await,
+            SetPasswordOutcome::UserNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_round_trips_to_the_user_it_was_issued_for() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let token = storage.save_reset_token(user_id).await;
+
+        assert_eq!(storage.take_reset_token(&token).await, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_is_single_use() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(60);
+        let token = storage.save_reset_token(Uuid::new_v4()).await;
+
+        storage.take_reset_token(&token).await;
+        assert_eq!(storage.take_reset_token(&token).await, None);
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_rejects_unknown_token() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(60);
+        assert_eq!(storage.take_reset_token("no-such-token").await, None);
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_rejects_expired_entries() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(-1);
+        let token = storage.save_reset_token(Uuid::new_v4()).await;
+
+        assert_eq!(storage.take_reset_token(&token).await, None);
+    }
+
+    #[tokio::test]
+    async fn issuing_a_new_password_reset_token_invalidates_the_users_previous_one() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let other_user_id = Uuid::new_v4();
+        let stale_token = storage.save_reset_token(user_id).await;
+        let other_users_token = storage.save_reset_token(other_user_id).await;
+
+        let fresh_token = storage.save_reset_token(user_id).await;
+
+        assert_eq!(storage.take_reset_token(&stale_token).await, None);
+        assert_eq!(storage.take_reset_token(&fresh_token).await, Some(user_id));
+        // A different user's outstanding token is untouched.
+        assert_eq!(storage.take_reset_token(&other_users_token).await, Some(other_user_id));
     }
 
     #[tokio::test]
@@ -763,6 +938,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_session_revoke_all_for_user_kills_only_that_users_sessions() {
+        let mut storage = InMemoryLoginSessionStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let other_user_id = Uuid::new_v4();
+        let token = storage.create_session(user_id).await;
+        let other_token = storage.create_session(other_user_id).await;
+
+        let _ = storage.revoke_all_for_user(user_id).await;
+
+        assert_eq!(storage.take_session(&token).await, None);
+        assert_eq!(storage.take_session(&other_token).await, Some(other_user_id));
+    }
+
+    #[tokio::test]
     async fn refresh_token_round_trips_to_the_user_and_family_it_was_saved_with() {
         let mut storage = InMemoryRefreshTokenStorage::new(60);
         let user_id = Uuid::new_v4();
@@ -828,5 +1017,30 @@ mod tests {
             storage.take_refresh_token("token1").await,
             RefreshTokenOutcome::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_revoke_all_for_user_kills_every_family_for_that_user_only() {
+        let mut storage = InMemoryRefreshTokenStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let other_user_id = Uuid::new_v4();
+        storage
+            .save_refresh_token("token1".to_string(), user_id, Uuid::new_v4())
+            .await;
+        storage
+            .save_refresh_token("token2".to_string(), user_id, Uuid::new_v4())
+            .await;
+        storage
+            .save_refresh_token("other-token".to_string(), other_user_id, Uuid::new_v4())
+            .await;
+
+        let _ = storage.revoke_all_for_user(user_id).await;
+
+        assert_eq!(storage.take_refresh_token("token1").await, RefreshTokenOutcome::NotFound);
+        assert_eq!(storage.take_refresh_token("token2").await, RefreshTokenOutcome::NotFound);
+        assert!(matches!(
+            storage.take_refresh_token("other-token").await,
+            RefreshTokenOutcome::Valid { .. }
+        ));
     }
 }

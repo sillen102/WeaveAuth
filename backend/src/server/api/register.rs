@@ -19,7 +19,7 @@ mod controller {
     use crate::model::email::normalize_email;
     use crate::model::user::User;
     use crate::server::AppState;
-    use crate::storage::UserStorage;
+    use crate::storage::{CreateUserOutcome, UserStorage};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
@@ -63,7 +63,7 @@ mod controller {
         .map_err(|_| RegisterError::UnexpectedError)?;
 
         let now = Utc::now();
-        let saved = state
+        let outcome = state
             .users
             .create_user(User {
                 id: Uuid::new_v4(),
@@ -78,11 +78,10 @@ mod controller {
             })
             .await;
 
-        if !saved {
-            return Err(RegisterError::EmailTaken);
+        match outcome {
+            CreateUserOutcome::Created => Ok(StatusCode::CREATED),
+            CreateUserOutcome::EmailTaken => Err(RegisterError::EmailTaken),
         }
-
-        Ok(StatusCode::CREATED)
     }
 
     // OpenAPI documentation for this route.
@@ -120,6 +119,7 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
         }
     }
 
