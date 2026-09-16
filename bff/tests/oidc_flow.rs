@@ -38,11 +38,11 @@ fn set_cookie_values(resp: &axum::response::Response) -> Vec<String> {
         .collect()
 }
 
-/// Stands in for backend's full oidc + password-login surface: `/oauth/oidc/google/login`
-/// (redirects to a fake provider), `/oauth/oidc/google/callback` (accepts code=good-code
-/// state=good-state, mirroring what bff forwards), plus `/oauth/authorize` and
-/// `/oauth/token` -- `complete_login` drives those the same way it would after a
-/// password login, once it has a login_session.
+/// Stands in for backend's full oidc + password-login surface:
+/// `/oauth/oidc/google/login` (redirects to a fake provider),
+/// `/oauth/oidc/google/callback` (accepts the code/state bff forwards), plus
+/// `/oauth/authorize` and `/oauth/token` -- driven the same way a password
+/// login would drive them, once there's a login_session.
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

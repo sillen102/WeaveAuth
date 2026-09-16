@@ -14,9 +14,9 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
     // built on `governor`) -- allows a burst of `max_attempts`, then
     // replenishes one attempt every `window_secs / max_attempts` seconds,
     // approximating "max_attempts per window_secs" without a fixed-window
-    // reset spike. Two independent buckets per client IP: one shared by the
-    // auth endpoints (/login, /register), one shared by every proxied route
-    // -- so a flood against one side can't burn the other's budget. /health
+    // reset spike. Two independent buckets per client IP: one shared by every
+    // route under `auth_routes` below, one shared by every proxied route --
+    // so a flood against one side can't burn the other's budget. /health
     // is exempt (cheap liveness check, commonly polled by infra that
     // shouldn't get caught in either bucket).
     let per_second =

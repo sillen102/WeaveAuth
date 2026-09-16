@@ -48,19 +48,18 @@ fn login_request(redirect_uri: &str) -> anyhow::Result<Request<Body>> {
     ))
 }
 
-/// Minimal `application/x-www-form-urlencoded` value escaping -- just enough
-/// for the URLs these tests send, avoids pulling in a whole crate for it.
+/// `application/x-www-form-urlencoded` value escaping for the URLs these
+/// tests send.
 fn urlencoding_encode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 /// Stands in for backend: a real (in-process) /oauth/login + /oauth/authorize +
 /// /oauth/token, since bff drives the whole exchange server-to-server and needs
-/// a real redirect response to read `code` out of. Mirrors backend's allowlist
-/// check (only "http://admin.test" / "http://admin.test/" are allowed), accepts
-/// email "alice" / password "hunter2" as the only valid user, and requires
-/// /oauth/authorize's `login_session` to match what /oauth/login just handed out
-/// (mirroring backend's real authenticate-before-authorize enforcement).
+/// a real redirect response to read `code` out of. Mirrors backend's redirect-uri
+/// allowlist check, single-valid-user login, and requires /oauth/authorize's
+/// `login_session` to match what /oauth/login just handed out (mirroring
+/// backend's real authenticate-before-authorize enforcement).
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

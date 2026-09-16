@@ -264,9 +264,7 @@ pub(crate) trait PendingOidcLinkStorage {
 /// A short-lived, single-use token proving whoever presents it controls the
 /// email inbox `/oauth/password-reset/request` sent it to -- redeeming it via
 /// `/oauth/password-reset/confirm` sets a new password on the account it was
-/// issued for. There's no email-sending yet (see `request`'s doc comment), so
-/// this doesn't prove anything in practice until that's wired up, but the
-/// storage contract is the same one a real send would need.
+/// issued for.
 pub(crate) trait PasswordResetTokenStorage {
     async fn save_reset_token(&mut self, user_id: Uuid) -> String;
     /// Consumes the token; returns the user id it was issued for if it

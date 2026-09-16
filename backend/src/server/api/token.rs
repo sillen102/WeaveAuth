@@ -235,9 +235,9 @@ mod tests {
         }
     }
 
-    /// `issue_tokens` now looks the user back up (to embed `email` in the
-    /// access token), so tests exercising it need a real stored user rather
-    /// than a bare random id.
+    /// `issue_tokens` looks the user back up to embed `email` in the access
+    /// token, so tests exercising it need a real stored user rather than a
+    /// bare random id.
     async fn state_with_user() -> (AppState, Uuid) {
         let mut state = state();
         let user = User {
@@ -448,8 +448,9 @@ mod tests {
 
         assert_eq!(second.user_id, first.user_id);
         // The refresh token always rotates. The access token is a JWT over
-        // {sub, iat, exp} -- if both calls land in the same second it can
-        // legitimately come out byte-identical, so that's not asserted here.
+        // `Claims`, which includes a timestamp -- if both calls land in the
+        // same second it can legitimately come out byte-identical, so that's
+        // not asserted here.
         assert_ne!(second.refresh_token, first.refresh_token);
     }
 

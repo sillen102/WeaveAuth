@@ -32,10 +32,10 @@ fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
-/// Stub backend accepting only email "taken" as already registered.
+/// Stub backend that treats one specific email as already registered.
 /// Also stands in for `/oauth/login`, `/oauth/authorize` and `/oauth/token`
 /// so the auto-login step after a successful registration has something real
-/// to drive, mirroring `pkce_flow.rs`'s `stub_backend`.
+/// to drive.
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

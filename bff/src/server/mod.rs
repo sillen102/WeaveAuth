@@ -22,8 +22,10 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             sessions: InMemorySessionStorage::new(),
-            // No auto-follow: /login needs the raw 303 from backend's
-            // /oauth/authorize to read `code` out of its Location header itself.
+            // No auto-follow: callers that hop through backend's
+            // /oauth/authorize (e.g. /login, /register's auto-login path)
+            // need the raw 303 to read `code` out of its Location header
+            // themselves.
             http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,

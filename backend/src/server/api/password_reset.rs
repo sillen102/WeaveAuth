@@ -46,13 +46,9 @@ mod controller {
     /// Issues a single-use password reset token for the account matching
     /// `email`, if any.
     ///
-    /// There's no email delivery wired up yet -- this only makes the token
-    /// exist in storage, ready for `/oauth/password-reset/confirm` to
-    /// redeem, so the request/confirm contract is settled before delivery
-    /// lands. The token is deliberately not surfaced anywhere (not in the
-    /// response, not logged) -- until a real delivery channel exists,
-    /// there's no way to retrieve it, so this endpoint is a no-op in
-    /// practice for any account. Wire up delivery before this is useful.
+    /// The token is deliberately not surfaced anywhere in this response (nor
+    /// logged) -- delivering it to the account owner is the caller's job
+    /// (e.g. by email), never this endpoint's.
     pub(crate) async fn request_password_reset(
         State(mut state): State<AppState>,
         Json(req): Json<PasswordResetRequestRequest>,
@@ -137,9 +133,9 @@ mod controller {
             .summary("Request a password reset")
             .description(
                 "Always returns 202, whether or not `email` matches an account, so the \
-                 response can't be used to enumerate registered addresses. No email delivery \
-                 is wired up yet, so the issued token isn't retrievable anywhere -- this \
-                 endpoint is a no-op in practice until delivery lands.",
+                 response can't be used to enumerate registered addresses. The issued token \
+                 is never included in the response or logged; delivering it to the account \
+                 owner is out of scope for this endpoint.",
             )
     }
 

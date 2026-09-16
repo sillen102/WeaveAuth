@@ -24,14 +24,14 @@ pub struct Config {
     pub oidc_state_ttl_secs: i64,
     /// How long a pending OIDC-to-password-account link (see
     /// `/oauth/oidc/confirm-link`) stays valid while waiting for the caller
-    /// to supply the existing account's password. Longer than
+    /// to supply the existing account's password. Deliberately roomier than
     /// `oidc_state_ttl_secs` -- this one waits on a human reading a prompt
     /// and typing a password, not just a redirect round-trip.
     pub pending_oidc_link_ttl_secs: i64,
     /// How long a `/oauth/password-reset/request` token stays redeemable via
-    /// `/oauth/password-reset/confirm`. Longer than `oidc_state_ttl_secs` --
-    /// this one waits on a human reading an email and clicking a link, not
-    /// just a redirect round-trip.
+    /// `/oauth/password-reset/confirm`. Deliberately roomier than
+    /// `oidc_state_ttl_secs` -- this one waits on a human reading an email
+    /// and clicking a link, not just a redirect round-trip.
     pub password_reset_token_ttl_secs: i64,
     /// How often the background task sweeps expired entries out of the
     /// TTL'd stores (PKCE challenges, OIDC state, login sessions, ...).

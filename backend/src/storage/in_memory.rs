@@ -144,7 +144,6 @@ impl UserStorage for InMemoryUserStorage {
     }
 }
 
-/// token -> (provider, subject, existing_user_id, issued_at)
 type PendingOidcLinkEntries = HashMap<String, (String, String, Uuid, DateTime<Utc>)>;
 
 #[derive(Clone)]
@@ -194,12 +193,11 @@ impl ExpiryMaintenance for InMemoryPendingOidcLinkStorage {
     }
 }
 
-/// sha256(token) -> (user_id, issued_at). Keyed by the token's hash, not the
-/// token itself -- this trait's contract is what a future durable (e.g.
-/// Postgres) implementation follows too, and a table of directly-usable
-/// plaintext reset tokens would turn a single read of that table into
-/// account takeover for every pending reset. Hashing costs nothing here and
-/// is awkward to retrofit later.
+/// Keyed by sha256(token), not the token itself -- this trait's contract is
+/// what a future durable (e.g. Postgres) implementation follows too, and a
+/// table of directly-usable plaintext reset tokens would turn a single read
+/// of that table into account takeover for every pending reset. Hashing
+/// costs nothing here and is awkward to retrofit later.
 type PasswordResetTokenEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
 
 #[derive(Clone)]
@@ -269,7 +267,6 @@ impl ExpiryMaintenance for InMemoryPasswordResetTokenStorage {
     }
 }
 
-/// csrf_state -> (provider, pkce_verifier, nonce, issued_at)
 type OidcStateEntries = HashMap<String, (String, String, String, DateTime<Utc>)>;
 
 #[derive(Clone)]
@@ -315,7 +312,6 @@ impl ExpiryMaintenance for InMemoryOidcStateStorage {
     }
 }
 
-/// auth_code -> (code_challenge, method, issued_at, redirect_uri, user_id)
 type PkceEntries = HashMap<String, (String, CodeChallengeMethod, DateTime<Utc>, String, Uuid)>;
 
 #[derive(Clone)]
@@ -378,7 +374,6 @@ impl ExpiryMaintenance for InMemoryPkceStorage {
     }
 }
 
-/// session_id -> (user_id, issued_at)
 type LoginSessionEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
 
 #[derive(Clone)]

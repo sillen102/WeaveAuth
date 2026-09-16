@@ -84,14 +84,10 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
     Ok((format!("http://{addr}"), handle))
 }
 
-/// Like `stub_backend`, but its `/oauth/token` route actually branches on
-/// `grant_type` so refresh-flow tests can control both the initial login's
-/// token expiries and what the refresh grant hands back. `access_expires_at`/
-/// `refresh_expires_at` seed the `authorization_code` response (used to force
-/// an "already expired" session at login time); the `refresh_token` grant
-/// always returns a fresh, far-future-valid pair (unless `refresh_should_fail`),
-/// and bumps the returned call counter each time it's hit, so tests can assert
-/// how many times backend was actually asked to refresh.
+/// Like `stub_backend`, but its `/oauth/token` route branches on `grant_type`
+/// so refresh-flow tests can control both the initial login's token expiries
+/// and what the refresh grant hands back, and counts how many times it was
+/// asked to refresh so tests can assert on that.
 async fn stub_backend_with_expiry(
     access_expires_at: chrono::DateTime<chrono::Utc>,
     refresh_expires_at: chrono::DateTime<chrono::Utc>,
