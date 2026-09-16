@@ -320,14 +320,14 @@ async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmat
         .get("location")
         .and_then(|v| v.to_str().ok())
         .context("missing location header")?;
-    assert_eq!(
-        loc,
-        "http://login.test/?pending_link_token=stub-pending-link-token&email=squatter%40example.com"
-    );
+    assert_eq!(loc, "http://login.test/?email=squatter%40example.com");
 
     let cookies = set_cookie_values(&resp);
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
+    assert!(cookies
+        .iter()
+        .any(|c| c.starts_with("wa_oidc_pending_link_token=stub-pending-link-token") && c.contains("HttpOnly")));
     Ok(())
 }
 
@@ -341,8 +341,9 @@ async fn oidc_confirm_link_completes_login_with_the_correct_password() -> anyhow
             Request::post("/oidc/confirm-link")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
+                .header("cookie", "wa_oidc_pending_link_token=stub-pending-link-token")
                 .body(Body::from(
-                    "pending_link_token=stub-pending-link-token&password=correct-password\
+                    "password=correct-password\
                      &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
                 ))?,
         ))
@@ -354,6 +355,7 @@ async fn oidc_confirm_link_completes_login_with_the_correct_password() -> anyhow
 
     let cookies = set_cookie_values(&resp);
     assert!(cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0")));
     Ok(())
 }
 
@@ -367,8 +369,9 @@ async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
             Request::post("/oidc/confirm-link")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
+                .header("cookie", "wa_oidc_pending_link_token=stub-pending-link-token")
                 .body(Body::from(
-                    "pending_link_token=stub-pending-link-token&password=wrong-password\
+                    "password=wrong-password\
                      &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
                 ))?,
         ))
@@ -377,6 +380,8 @@ async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/?error=link_failed"));
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0")));
     Ok(())
 }
 

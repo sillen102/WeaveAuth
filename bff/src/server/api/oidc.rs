@@ -24,6 +24,11 @@ mod controller {
     const REDIRECT_URI_COOKIE: &str = "wa_oidc_redirect_uri";
     const NEXT_COOKIE: &str = "wa_oidc_next";
     const STATE_COOKIE: &str = "wa_oidc_state";
+    /// Carries `pending_link_token` from `oidc_callback` to `oidc_confirm_link`
+    /// instead of the URL -- it's half a credential (paired with the account
+    /// password), and a URL leaks into browser history, Referer headers, and
+    /// access logs in a way a short-lived HttpOnly cookie doesn't.
+    const PENDING_LINK_TOKEN_COOKIE: &str = "wa_oidc_pending_link_token";
 
     /// `provider` is interpolated into the backend URL below; axum
     /// percent-decodes path params, so without this check a value like
@@ -67,7 +72,6 @@ mod controller {
 
     #[derive(Deserialize)]
     pub(crate) struct OidcConfirmLinkRequest {
-        pub(super) pending_link_token: String,
         pub(super) password: String,
         pub(super) redirect_uri: String,
         /// Where to bounce the browser back to if confirmation fails. Checked
@@ -135,6 +139,11 @@ mod controller {
         #[error("next is not a same-origin path or a trusted origin")]
         #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
         InvalidNext,
+        /// The pending-link cookie set by `oidc_callback` is gone (expired,
+        /// or this endpoint was hit without going through that first).
+        #[error("missing or expired pending link token")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired pending link token")]
+        MissingPendingLinkToken,
     }
 
     impl From<CompleteLoginError> for OidcConfirmLinkError {
@@ -305,17 +314,27 @@ mod controller {
             OidcCallbackResponse::Authenticated { login_session } => login_session,
             OidcCallbackResponse::PasswordConfirmationRequired { pending_link_token, email } => {
                 // Not a failure -- the login page renders a "confirm your
-                // password to link this account" form for this case, so it
-                // needs these on its own URL rather than a friendly error.
+                // password to link this account" form for this case, so
+                // `email` (not sensitive) goes on the URL for display, but
+                // `pending_link_token` (half a credential) goes in a
+                // short-lived cookie instead -- see PENDING_LINK_TOKEN_COOKIE.
                 let sep = if next.contains('?') { '&' } else { '?' };
                 let location = format!(
-                    "{next}{sep}pending_link_token={}&email={}",
-                    url::form_urlencoded::byte_serialize(pending_link_token.as_bytes()).collect::<String>(),
+                    "{next}{sep}email={}",
                     url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>(),
                 );
+                let pending_link_cookie = build_cookie(
+                    PENDING_LINK_TOKEN_COOKIE,
+                    &pending_link_token,
+                    FLOW_COOKIE_PATH,
+                    FLOW_COOKIE_TTL_SECS,
+                    secure,
+                );
+                let mut set_cookies = clear_flow_cookies.to_vec();
+                set_cookies.push((header::SET_COOKIE, pending_link_cookie));
                 return Ok((
                     StatusCode::SEE_OTHER,
-                    AppendHeaders(clear_flow_cookies),
+                    AppendHeaders(set_cookies),
                     [(header::LOCATION, location)],
                     Body::empty(),
                 )
@@ -381,14 +400,20 @@ mod controller {
         if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
             return Err(OidcConfirmLinkError::InvalidNext);
         }
+        let pending_link_token = extract_cookie(&headers, PENDING_LINK_TOKEN_COOKIE)
+            .ok_or(OidcConfirmLinkError::MissingPendingLinkToken)?;
+
+        // Single-use regardless of outcome, so it's cleared on every path
+        // below rather than only on success.
+        let clear_pending_link_cookie = (
+            header::SET_COOKIE,
+            clear_cookie(PENDING_LINK_TOKEN_COOKIE, FLOW_COOKIE_PATH, state.config.secure_cookies()),
+        );
 
         let backend_resp = state
             .http_client
             .post(format!("{}/oauth/oidc/confirm-link", state.config.backend_url))
-            .json(&ConfirmLinkBackendRequest {
-                pending_link_token: &req.pending_link_token,
-                password: &req.password,
-            })
+            .json(&ConfirmLinkBackendRequest { pending_link_token: &pending_link_token, password: &req.password })
             .send()
             .await
             .map_err(|_| OidcConfirmLinkError::BackendUnavailable)?;
@@ -401,6 +426,7 @@ mod controller {
             let sep = if req.next.contains('?') { '&' } else { '?' };
             return Ok((
                 StatusCode::SEE_OTHER,
+                [clear_pending_link_cookie],
                 [(header::LOCATION, format!("{}{sep}error=link_failed", req.next))],
             )
                 .into_response());
@@ -418,7 +444,8 @@ mod controller {
 
         Ok((
             StatusCode::SEE_OTHER,
-            [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)],
+            AppendHeaders([clear_pending_link_cookie, (header::SET_COOKIE, cookie)]),
+            [(header::LOCATION, req.redirect_uri)],
             Body::empty(),
         )
             .into_response())
@@ -459,7 +486,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("http://evil.test"));
         let req = OidcConfirmLinkRequest {
-            pending_link_token: "tok".to_string(),
             password: "hunter2".to_string(),
             redirect_uri: "http://admin.test/".to_string(),
             next: "http://login.test/".to_string(),
