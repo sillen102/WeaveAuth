@@ -22,7 +22,7 @@
 
 use std::env;
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
@@ -50,6 +50,7 @@ const INDEX_HTML: &str = include_str!("index.html");
 pub struct Config {
     pub port: u16,
     pub bff_url: String,
+    pub own_origin: String,
 }
 
 impl Default for Config {
@@ -57,13 +58,14 @@ impl Default for Config {
         Self {
             port: 8081,
             bff_url: "http://localhost:8080".to_string(),
+            own_origin: "http://localhost:8081".to_string(),
         }
     }
 }
 
 impl Config {
-    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` env vars, falling back
-    /// to defaults for anything unset.
+    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` / `WA_LOGIN_PUBLIC_URL` env
+    /// vars, falling back to defaults for anything unset.
     pub fn load() -> Self {
         let defaults = Config::default();
 
@@ -75,6 +77,7 @@ impl Config {
                 Env::raw()
                     .map(|k| match k.as_str() {
                         "WA_BFF_URL" => "bff_url".into(),
+                        "WA_LOGIN_PUBLIC_URL" => "own_origin".into(),
                         _ => "_ignored".into(),
                     })
                     .ignore(&["_ignored"]),
@@ -122,36 +125,18 @@ struct PageQuery {
 
 async fn login_page(
     State(config): State<Config>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Query(query): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("login.html", &config, &headers, uri.path(), &query)
+    render_page("login.html", &config, uri.path(), &query)
 }
 
 async fn register_page(
     State(config): State<Config>,
-    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Query(query): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("register.html", &config, &headers, uri.path(), &query)
-}
-
-/// This service's own public origin, as best guessed from the request --
-/// used only as the fallback `redirect_uri` when a caller hits a page
-/// without one (e.g. visiting it directly rather than via a
-/// `?redirect_uri=...` link).
-fn own_origin(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}")
+    render_page("register.html", &config, uri.path(), &query)
 }
 
 /// Renders one of the deployer-replaceable page templates, computing the
@@ -162,11 +147,10 @@ fn own_origin(headers: &HeaderMap) -> String {
 fn render_page(
     template: &str,
     config: &Config,
-    headers: &HeaderMap,
     path: &str,
     query: &PageQuery,
 ) -> Result<Html<String>, StatusCode> {
-    let origin = own_origin(headers);
+    let origin = &config.own_origin;
     let redirect_uri = query
         .redirect_uri
         .clone()
@@ -231,10 +215,12 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.set_env("WA_LOGIN_PORT", "9999");
             jail.set_env("WA_BFF_URL", "http://bff.env.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
 
             let config = Config::load();
             assert_eq!(config.port, 9999);
             assert_eq!(config.bff_url, "http://bff.env.test");
+            assert_eq!(config.own_origin, "https://login.env.test");
             Ok(())
         });
     }

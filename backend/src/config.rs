@@ -81,7 +81,19 @@ impl Config {
 
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
 
-        let mut config: Config = Figment::from(Serialized::defaults(Config::default()))
+        // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
+        // `login::Config::own_origin`) -- when the two run side by side, it's
+        // also the redirect_uri login sends by default (with a trailing `/`,
+        // matching login's own fallback), so seed the built-in default from
+        // it before the YAML file/`WA_REDIRECT_URI_ALLOWLIST` env var (below)
+        // get a chance to override it. The allowlist check is an exact
+        // string match, so the trailing slash isn't optional here.
+        let mut defaults = Config::default();
+        if let Ok(login_url) = env::var("WA_LOGIN_PUBLIC_URL") {
+            defaults.redirect_uri_allowlist = vec![format!("{login_url}/")];
+        }
+
+        let mut config: Config = Figment::from(Serialized::defaults(defaults))
             .merge(Yaml::file(&path))
             .merge(Env::prefixed("WA_").ignore(&["config_file", "redirect_uri_allowlist"]))
             .extract()?;
@@ -261,6 +273,37 @@ mod tests {
             assert_eq!(
                 config.redirect_uri_allowlist,
                 vec!["http://a.test".to_string(), "http://b.test".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn redirect_uri_allowlist_defaults_to_login_public_url_with_trailing_slash() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.redirect_uri_allowlist,
+                vec!["https://login.env.test/".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn explicit_redirect_uri_allowlist_still_wins_over_login_public_url() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+            jail.set_env("WA_REDIRECT_URI_ALLOWLIST", "https://other.test/callback");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.redirect_uri_allowlist,
+                vec!["https://other.test/callback".to_string()]
             );
             Ok(())
         });

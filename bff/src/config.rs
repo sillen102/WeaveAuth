@@ -69,7 +69,17 @@ impl Config {
 
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
 
-        let mut config: Config = Figment::from(Serialized::defaults(Config::default()))
+        // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
+        // `login::Config::own_origin`) -- when the two run side by side, it's
+        // also the one bff should trust by default, so seed the built-in
+        // default from it before the YAML file/`WA_TRUSTED_ORIGINS` env var
+        // (below) get a chance to override it.
+        let mut defaults = Config::default();
+        if let Ok(login_url) = env::var("WA_LOGIN_PUBLIC_URL") {
+            defaults.trusted_origins = vec![login_url];
+        }
+
+        let mut config: Config = Figment::from(Serialized::defaults(defaults))
             .merge(Yaml::file(&path))
             // `WA_BFF_PORT`/`WA_BACKEND_URL` etc don't map 1:1 to their field
             // names, and `routes`/`trusted_origins` need custom handling below
@@ -229,6 +239,32 @@ trusted_origins:
                 config.trusted_origins,
                 vec!["http://a.test".to_string(), "http://b.test".to_string()]
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn trusted_origins_defaults_to_login_public_url_when_unset() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.trusted_origins,
+                vec!["https://login.env.test".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn explicit_trusted_origins_still_wins_over_login_public_url() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+            jail.set_env("WA_TRUSTED_ORIGINS", "https://other.test");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.trusted_origins, vec!["https://other.test".to_string()]);
             Ok(())
         });
     }

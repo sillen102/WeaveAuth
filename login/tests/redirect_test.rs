@@ -8,6 +8,7 @@ fn test_config() -> Config {
     Config {
         port: 8081,
         bff_url: "http://bff.test".into(),
+        own_origin: "http://login.test".into(),
     }
 }
 
@@ -84,9 +85,24 @@ async fn login_page_falls_back_to_its_own_origin_when_redirect_uri_is_absent() {
     let app = app(test_config());
 
     let resp = app
+        .oneshot(Request::get("/login.html").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("value=\"http://login.test/\""));
+}
+
+#[tokio::test]
+async fn login_page_ignores_host_and_x_forwarded_proto_headers() {
+    let app = app(test_config());
+
+    let resp = app
         .oneshot(
             Request::get("/login.html")
-                .header("host", "login.test")
+                .header("host", "attacker.test")
+                .header("x-forwarded-proto", "https")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -96,6 +112,7 @@ async fn login_page_falls_back_to_its_own_origin_when_redirect_uri_is_absent() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("value=\"http://login.test/\""));
+    assert!(!body.contains("attacker.test"));
 }
 
 #[tokio::test]
