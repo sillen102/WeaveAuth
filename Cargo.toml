@@ -15,7 +15,7 @@ axum = "0.8"
 aide = "0.16.0-alpha.4"
 schemars = "1.2"
 argon2 = "0.6"
-jsonwebtoken = "11"
+jsonwebtoken = "11.1"
 openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "native-tls"] }
 rsa = { version = "0.9", features = ["pem"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
