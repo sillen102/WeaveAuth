@@ -1,4 +1,5 @@
-use crate::config::Config;
+use crate::config::{Config, ExtraDataHandlerConfig};
+use crate::extra_data::{ExtraDataHandler, WasmHandler, WebhookHandler};
 use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
@@ -30,6 +31,7 @@ pub(crate) struct AppState {
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
     pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
     pub(crate) max_bcrypt_cost: u32,
+    pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
 }
 
 impl AppState {
@@ -53,6 +55,7 @@ impl AppState {
                 .build()?,
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
+        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref())?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -69,8 +72,29 @@ impl AppState {
             oidc_http_client,
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
             max_bcrypt_cost: config.max_bcrypt_cost,
+            extra_data_handler,
         })
     }
+}
+
+fn build_extra_data_handler(
+    config: Option<&ExtraDataHandlerConfig>,
+) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
+    let handler: Arc<dyn ExtraDataHandler> = match config {
+        None => return Ok(None),
+        Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
+            Arc::new(WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
+        }
+        Some(ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb }) => {
+            let wasm_bytes = std::fs::read(path)?;
+            Arc::new(WasmHandler::load(
+                wasm_bytes,
+                std::time::Duration::from_secs(*timeout_secs),
+                *memory_max_mb,
+            )?)
+        }
+    };
+    Ok(Some(handler))
 }
 
 pub async fn app_start(config: &Config) -> anyhow::Result<()> {

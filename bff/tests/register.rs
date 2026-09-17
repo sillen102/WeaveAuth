@@ -19,6 +19,7 @@ fn test_config(backend_url: String) -> Config {
         rate_limit_max_attempts: 1000,
         rate_limit_window_secs: 60,
         expiry_sweep_interval_secs: 60,
+        docs_enabled: false,
     }
 }
 
@@ -44,6 +45,10 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
             "/register",
             post(|Json(body): Json<serde_json::Value>| async move {
                 if body["email"] == "taken" {
+                    StatusCode::BAD_REQUEST
+                } else if body["email"] == "check-extra" && body["company"] != "Acme" {
+                    // Only reachable if bff actually forwarded the extra
+                    // `company` field through to this stub backend.
                     StatusCode::BAD_REQUEST
                 } else {
                     StatusCode::CREATED
@@ -87,15 +92,31 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
 }
 
 fn register_request(email: &str, redirect_uri: &str, next: &str) -> anyhow::Result<Request<Body>> {
+    register_request_with_extra(email, redirect_uri, next, &[])
+}
+
+fn register_request_with_extra(
+    email: &str,
+    redirect_uri: &str,
+    next: &str,
+    extra: &[(&str, &str)],
+) -> anyhow::Result<Request<Body>> {
+    let mut body = format!(
+        "email={email}&password=hunter2&redirect_uri={}&next={}",
+        url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
+    );
+    for (key, value) in extra {
+        body.push('&');
+        body.push_str(key);
+        body.push('=');
+        body.push_str(&url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>());
+    }
     Ok(with_test_peer(
         Request::post("/register")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("origin", "http://login.test")
-            .body(Body::from(format!(
-                "email={email}&password=hunter2&redirect_uri={}&next={}",
-                url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>(),
-                url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
-            )))?,
+            .body(Body::from(body))?,
     ))
 }
 
@@ -129,6 +150,26 @@ async fn appends_error_query_param_when_backend_rejects() -> anyhow::Result<()> 
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/register.html?error=1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwards_extra_form_fields_to_backend() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(register_request_with_extra(
+            "check-extra",
+            "http://admin.test/",
+            "http://login.test/register.html",
+            &[("company", "Acme")],
+        )?)
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://admin.test/"));
     Ok(())
 }
 

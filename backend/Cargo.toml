@@ -32,7 +32,12 @@ jsonwebtoken = { workspace = true , features = ["rust_crypto"] }
 openidconnect = { workspace = true }
 rsa = { workspace = true, features = ["pem"] }
 email_address = { workspace = true }
+reqwest = { workspace = true }
+extism = { version = "1", default-features = false, features = ["wasmtime-default-features"] }
+async-trait = "0.1"
+url = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
-url = { workspace = true }
+wiremock = "0.6"
+wat = "1"

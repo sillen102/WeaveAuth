@@ -30,9 +30,11 @@ mod tests {
 }
 ```
 
-Unlike `backend/`, bff has no OpenAPI layer (no `aide`, no `_doc()` companion function) --
-its handlers aren't part of a documented public API surface, so the shape above is just
-`controller` + `tests`. Add a `service` or `repository` submodule next to `controller` only
+Most bff handlers aren't part of a documented public API surface, so the shape above is
+just `controller` + `tests`, with no aide `_doc()` companion function. An endpoint can add
+one (like `register.rs`'s `start_register_doc`) when it's worth documenting via
+aide/OpenAPI, the same way `backend/` does it -- see "Documented routes" below for how
+they get mounted. Add a `service` or `repository` submodule next to `controller` only
 once a slice actually grows business logic or storage access beyond what the handler itself
 does inline (`login.rs` and `proxy.rs`, for instance, stay a single `controller` module
 because there's nothing to split out yet).
@@ -66,14 +68,36 @@ status and a human-readable `details` string; several variants may share a statu
 when the reason (the variant name) is what actually disambiguates them.
 
 `#[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]` (from `common_macros`) generates
-`IntoResponse` (a JSON body via `common::responses::ErrorResponse`). Because bff has no
-OpenAPI layer, every one of these enums also carries `#[error_response_no_openapi]`,
-which skips the macro's `aide::OperationOutput` codegen -- keeping bff free of any `aide`
-dependency. Handlers return `Result<T, MyError>` directly; map fallible calls
+`IntoResponse` (a JSON body via `common::responses::ErrorResponse`). An error enum for an
+undocumented endpoint carries `#[error_response_no_openapi]`, which skips the macro's
+`aide::OperationOutput` codegen; drop that attribute for an endpoint that has a `_doc()`
+function (like `register.rs`'s `RegisterError`). Handlers return `Result<T, MyError>`
+directly; map fallible calls
 (`require_trusted_origin`, `reqwest` sends, upstream response parsing, ...) to a variant
 with `.map_err(|_| MyError::Whatever)` or `.ok_or(...)` at the call site instead of
 bubbling up a raw `StatusCode`. Tests assert against the enum variant (`result.err()`,
 `Some(MyError::Whatever)`), never against a bare `StatusCode`.
+
+## Documented routes
+
+A documented endpoint needs an `ApiRouter`, not a plain `Router` -- only the former carries
+aide's operation metadata. `router.rs` builds those routes separately and runs them through
+`common::docs::api_docs::api_docs_router`, the same helper `backend/` uses, which returns
+the routes plus a docs router serving `/docs`, `/docs/scalar.js` and `/openapi.json`.
+
+Two things about that docs router are load-bearing:
+
+- It is merged only when `Config::docs_enabled` (`WA_DOCS_ENABLED`) is set, and defaults to
+  off. bff is the internet-facing service and these endpoints are an unauthenticated
+  description of the auth surface, so a deployment opts in. Gating covers only the
+  schema-publishing endpoints -- documented routes stay mounted either way, so the flag
+  never changes how the API itself behaves (`bff/tests/docs.rs` pins this down).
+- It gets its own governor bucket, separate from the auth and proxy ones. Doc fetches are
+  cheap and repeated by tooling, so sharing the auth bucket would let them starve real
+  login/register attempts.
+
+Documented routes share the auth governor instance rather than building their own, so
+pulling an endpoint into its own `ApiRouter` doesn't hand it a second rate-limit budget.
 
 ## Where HTTP-level tests still go
 

@@ -1,11 +1,15 @@
 pub(crate) use controller::start_register;
+pub(crate) use controller::start_register_doc;
 
 mod controller {
+    use aide::transform::TransformOperation;
     use axum::extract::State;
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::Form;
+    use schemars::JsonSchema;
     use serde::Deserialize;
+    use std::collections::HashMap;
 
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
@@ -13,7 +17,7 @@ mod controller {
     use super::service::{self, RegisterOutcome};
     pub(crate) use super::service::RegisterError;
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
         pub(super) email: String,
         pub(super) password: String,
@@ -22,6 +26,12 @@ mod controller {
         /// Where to send the browser back to if registration itself fails --
         /// supplied by the login page's own form, not user-typed input.
         pub(super) next: String,
+        /// Anything beyond the fields above -- e.g. extra `<input>`s a
+        /// deployer added to `register.html`. Forwarded to backend as-is;
+        /// backend decides (via its own configured extra-data handler)
+        /// whether these are accepted at all.
+        #[serde(flatten)]
+        pub(super) extra: HashMap<String, String>,
     }
 
     /// Forwards registration to backend's `/register`, then -- since the
@@ -44,7 +54,7 @@ mod controller {
         require_trusted_origin(&headers, &state.config.trusted_origins)
             .map_err(|_| RegisterError::UntrustedOrigin)?;
 
-        match service::register(&mut state, &req.email, &req.password).await? {
+        match service::register(&mut state, &req.email, &req.password, req.extra).await? {
             RegisterOutcome::Rejected => {
                 let sep = if req.next.contains('?') { '&' } else { '?' };
                 let location = format!("{}{sep}error=1", req.next);
@@ -62,12 +72,25 @@ mod controller {
             }
         }
     }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn start_register_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("register")
+            .summary("Register a new user and log them in")
+            .description(
+                "Forwards to backend's /register, then auto-logs the new user in. Any fields \
+                 beyond email/password/redirect_uri/next are forwarded to backend as-is, which \
+                 in turn forwards them to its own configured extra-data handler.",
+            )
+    }
 }
 
 mod service {
     use axum::http::StatusCode;
     use common_macros::ErrorResponses;
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use thiserror::Error;
 
     use crate::server::api::complete_login::complete_login;
@@ -77,6 +100,8 @@ mod service {
     struct BackendCredentials<'a> {
         email: &'a str,
         password: &'a str,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -85,7 +110,6 @@ mod service {
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
     pub(crate) enum RegisterError {
         #[error("request did not come from a trusted origin")]
         #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
@@ -97,16 +121,25 @@ mod service {
 
     pub(crate) enum RegisterOutcome {
         Created,
-        /// Backend rejected the registration (bad or taken email).
+        /// Backend rejected the registration -- bad/taken email, or (since
+        /// backend now also validates extra fields) unsupported/rejected
+        /// extra data. Every case bounces to the same `?error=1` page today;
+        /// distinguishing them would need backend's error code threaded
+        /// through, which register.html's static copy doesn't support yet.
         Rejected,
     }
 
     /// Forwards registration to backend's `/register`.
-    pub(crate) async fn register(state: &mut AppState, email: &str, password: &str) -> Result<RegisterOutcome, RegisterError> {
+    pub(crate) async fn register(
+        state: &mut AppState,
+        email: &str,
+        password: &str,
+        extra: HashMap<String, String>,
+    ) -> Result<RegisterOutcome, RegisterError> {
         let resp = state
             .http_client
             .post(format!("{}/register", state.config.backend_url))
-            .json(&BackendCredentials { email, password })
+            .json(&BackendCredentials { email, password, extra })
             .send()
             .await
             .map_err(|_| RegisterError::BackendUnavailable)?;
@@ -130,7 +163,7 @@ mod service {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
-            .json(&BackendCredentials { email, password })
+            .json(&BackendCredentials { email, password, extra: HashMap::new() })
             .send()
             .await
             .ok()?;
@@ -149,6 +182,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
     use axum::Form;
+    use std::collections::HashMap;
 
     use crate::config::Config;
     use crate::server::AppState;
@@ -164,8 +198,46 @@ mod tests {
             rate_limit_max_attempts: 1000,
             rate_limit_window_secs: 60,
             expiry_sweep_interval_secs: 60,
+            docs_enabled: false,
         })
         .expect("valid app state")
+    }
+
+    // Named fields + `#[serde(flatten)] extra: HashMap<String, String>` was
+    // suspected of hitting a long-standing `serde_urlencoded` bug (flatten
+    // into a map alongside other named fields silently fails) -- checked
+    // empirically and found not to reproduce on the version this workspace
+    // resolves to. This is that check, kept as a regression test: it drives
+    // the real `Form` extractor (not a hand-rolled deserialize call), so a
+    // future dependency bump reintroducing the bug fails here directly
+    // instead of surfacing as a confusing `extra` field silently going empty.
+    #[tokio::test]
+    async fn form_extractor_flattens_extra_fields_alongside_named_ones() {
+        use axum::body::Body;
+        use axum::extract::FromRequest;
+        use axum::http::Request;
+
+        let state = state_with_trusted_origins(vec![]);
+        let request = Request::builder()
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "email=alice%40example.com&password=hunter2&redirect_uri=http%3A%2F%2Fx&next=http%3A%2F%2Fy&company=Acme&plan=pro",
+            ))
+            .expect("valid request");
+
+        let Form(req) = Form::<RegisterRequest>::from_request(request, &state)
+            .await
+            .expect("form deserializes");
+
+        assert_eq!(req.email, "alice@example.com");
+        assert_eq!(req.password, "hunter2");
+        assert_eq!(req.redirect_uri, "http://x");
+        assert_eq!(req.next, "http://y");
+        assert_eq!(
+            req.extra,
+            HashMap::from([("company".to_string(), "Acme".to_string()), ("plan".to_string(), "pro".to_string())])
+        );
     }
 
     #[tokio::test]
@@ -180,6 +252,7 @@ mod tests {
             password: "hunter2".to_string(),
             redirect_uri: "http://admin.test/".to_string(),
             next: "http://login.test/".to_string(),
+            extra: HashMap::new(),
         };
 
         let result = start_register(State(state), headers, Form(req)).await;
