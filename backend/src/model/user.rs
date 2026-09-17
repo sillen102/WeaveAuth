@@ -2,6 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A stored password hash, tagged by scheme. Only `Argon2` is ever written; `Bcrypt` exists so an imported legacy user can unlock and get upgraded.
+/// Only in-memory storage exists today, so this isn't exercised, but a future durable `UserStorage` must account for this type's serde shape when reading pre-existing rows.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum PasswordHash {
+    Argon2(String),
+    Bcrypt(String),
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct User {
     pub id: Uuid,
@@ -10,7 +18,7 @@ pub(crate) struct User {
     /// provider -- they have no local password to check. A user can hold
     /// both a password and one or more linked OIDC identities (see
     /// `storage::UserStorage::link_or_create_oidc_user`) at the same time.
-    pub password: Option<String>,
+    pub password: Option<PasswordHash>,
     /// Whether `email` is known to be owned by this user -- `true` once an
     /// OIDC provider has confirmed it (see `link_or_create_oidc_user`),
     /// `false` for a plain password registration (this app has no

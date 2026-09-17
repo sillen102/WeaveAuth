@@ -29,6 +29,7 @@ pub(crate) struct AppState {
     pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
     pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
+    pub(crate) max_bcrypt_cost: u32,
 }
 
 impl AppState {
@@ -67,6 +68,7 @@ impl AppState {
             pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
             oidc_http_client,
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
+            max_bcrypt_cost: config.max_bcrypt_cost,
         })
     }
 }

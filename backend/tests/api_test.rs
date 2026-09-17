@@ -24,6 +24,7 @@ fn test_config() -> Config {
         password_reset_token_ttl_secs: 1_800,
         expiry_sweep_interval_secs: 60,
         oidc_providers: HashMap::new(),
+        max_bcrypt_cost: 12,
     }
 }
 

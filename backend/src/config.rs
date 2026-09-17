@@ -42,6 +42,10 @@ pub struct Config {
     /// default -- third-party login is a no-op unless a provider is
     /// configured here.
     pub oidc_providers: HashMap<String, OidcProviderConfig>,
+    /// Highest bcrypt cost factor accepted when verifying an imported
+    /// legacy-user hash (see `crypto::verify_password`) -- caps how long a
+    /// single login can tie up a blocking-pool thread.
+    pub max_bcrypt_cost: u32,
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -74,6 +78,7 @@ impl Default for Config {
             password_reset_token_ttl_secs: 1_800,
             expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
+            max_bcrypt_cost: bcrypt::DEFAULT_COST,
         }
     }
 }
@@ -122,6 +127,19 @@ impl Config {
             }
         }
 
+        // bcrypt's own hard cap on the cost factor -- not exported by the
+        // `bcrypt` crate, so mirrored here. Anything above it would make the
+        // configured cap inert (bcrypt would refuse to hash at that cost anyway).
+        const BCRYPT_MAX_COST: u32 = 31;
+        if config.max_bcrypt_cost > BCRYPT_MAX_COST {
+            tracing::warn!(
+                configured = config.max_bcrypt_cost,
+                clamped_to = BCRYPT_MAX_COST,
+                "WA_MAX_BCRYPT_COST exceeds bcrypt's own maximum cost; clamping"
+            );
+            config.max_bcrypt_cost = BCRYPT_MAX_COST;
+        }
+
         Ok(config)
     }
 }
@@ -149,6 +167,31 @@ mod tests {
             assert_eq!(config.login_session_ttl_secs, 60);
             assert_eq!(config.access_token_ttl_secs, 900);
             assert_eq!(config.refresh_token_ttl_secs, 2_592_000);
+            assert_eq!(config.max_bcrypt_cost, bcrypt::DEFAULT_COST);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn max_bcrypt_cost_is_overridable_from_env() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_MAX_BCRYPT_COST", "10");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.max_bcrypt_cost, 10);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn max_bcrypt_cost_above_bcrypts_own_maximum_is_clamped() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_MAX_BCRYPT_COST", "99");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.max_bcrypt_cost, 31);
             Ok(())
         });
     }

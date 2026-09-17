@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 
-use argon2::Argon2;
+use argon2::password_hash::phc::PasswordHash as Argon2PasswordHash;
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jsonwebtoken::EncodingKey;
@@ -9,10 +10,89 @@ use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
 use serde::Serialize;
 
+use crate::model::user::PasswordHash;
+
 /// Shared, lazily-built Argon2 instance -- constructing one just fills in
 /// algorithm/version/params (no expensive setup), but there's no reason for
 /// every hash/verify call site to build its own copy.
 pub(crate) static ARGON2: LazyLock<Argon2<'static>> = LazyLock::new(Argon2::default);
+
+/// Hashes `password` with argon2, off the tokio worker thread (argon2 is
+/// deliberately CPU-heavy, synchronous work).
+pub(crate) async fn hash_password(password: String) -> anyhow::Result<String> {
+    let result = tokio::task::spawn_blocking(move || ARGON2.hash_password(password.as_bytes()).map(|h| h.to_string()))
+        .await?
+        .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"));
+
+    if let Err(e) = &result {
+        tracing::warn!(error = %e, "argon2 hashing failed");
+    }
+
+    result
+}
+
+/// A wrong password is an expected outcome, not an error -- kept out of
+/// `PasswordVerifyError` so callers aren't tempted to treat it as one.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum PasswordVerifyOutcome {
+    Verified,
+    NotVerified,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PasswordVerifyError {
+    /// Stored hash didn't parse, its bcrypt cost was rejected, or the
+    /// verification task panicked.
+    #[error("password verification errored: {0}")]
+    Error(#[from] anyhow::Error),
+}
+
+/// Verifies `password` against a stored, scheme-tagged hash. `max_bcrypt_cost`
+/// caps how expensive a `Bcrypt` hash's own cost factor is allowed to be (see
+/// `Config::max_bcrypt_cost`) -- an imported hash claiming an inflated cost
+/// could otherwise tie up a blocking-pool thread for a very long time. Note:
+/// unlike argon2 logins, bcrypt verification time still varies with the
+/// hash's cost, so it isn't covered by the dummy-hash timing guard callers
+/// use for unknown emails -- the cap bounds that leak but doesn't close it.
+pub(crate) async fn verify_password(
+    hash: PasswordHash,
+    password: String,
+    max_bcrypt_cost: u32,
+) -> Result<PasswordVerifyOutcome, PasswordVerifyError> {
+    let result = tokio::task::spawn_blocking(move || match hash {
+        PasswordHash::Argon2(s) => match Argon2PasswordHash::new(&s) {
+            Ok(parsed) if ARGON2.verify_password(password.as_bytes(), &parsed).is_ok() => {
+                Ok(PasswordVerifyOutcome::Verified)
+            }
+            Ok(_) => Ok(PasswordVerifyOutcome::NotVerified),
+            Err(e) => Err(anyhow::anyhow!("stored argon2 hash didn't parse: {e}").into()),
+        },
+        PasswordHash::Bcrypt(s) => match bcrypt_cost(&s) {
+            Some(cost) if cost <= max_bcrypt_cost => match bcrypt::verify(&password, &s) {
+                Ok(true) => Ok(PasswordVerifyOutcome::Verified),
+                Ok(false) => Ok(PasswordVerifyOutcome::NotVerified),
+                Err(e) => Err(anyhow::anyhow!("bcrypt verification failed: {e}").into()),
+            },
+            Some(cost) => Err(anyhow::anyhow!("bcrypt cost {cost} exceeds the allowed maximum").into()),
+            None => Err(anyhow::anyhow!("stored bcrypt hash didn't parse").into()),
+        },
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::Error::from(e).into()));
+
+    if let Err(PasswordVerifyError::Error(e)) = &result {
+        tracing::warn!(error = %e, "password verification errored");
+    }
+
+    result
+}
+
+/// Reads the cost factor out of a `$2b$NN$...`-shaped bcrypt hash, without
+/// running the (expensive) verification itself.
+fn bcrypt_cost(hash: &str) -> Option<u32> {
+    hash.get(4..6)?.parse().ok()
+}
 
 /// One JSON Web Key, as served at `/.well-known/jwks.json` (RFC 7517).
 #[derive(Debug, Clone, Serialize)]
@@ -102,5 +182,15 @@ mod tests {
             .expect("verifies against the published jwk");
 
         assert_eq!(decoded.claims.sub, "user-1");
+    }
+
+    #[tokio::test]
+    async fn verify_password_rejects_bcrypt_hashes_above_the_cost_cap() {
+        let max_cost = 12;
+        let inflated = format!("$2b${}$abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx", max_cost + 1);
+
+        let result = verify_password(PasswordHash::Bcrypt(inflated), "whatever".to_string(), max_cost).await;
+
+        assert!(result.is_err());
     }
 }

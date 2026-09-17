@@ -103,8 +103,6 @@ mod controller {
 }
 
 mod service {
-    use argon2::password_hash::phc::PasswordHash;
-    use argon2::PasswordVerifier;
     use axum::http::StatusCode;
     use openidconnect::core::CoreAuthenticationFlow;
     use openidconnect::{
@@ -116,7 +114,8 @@ mod service {
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
-    use crate::crypto::ARGON2;
+    use crate::crypto;
+    use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{
         LoginSessionStorage, OidcLinkOutcome, OidcStateStorage, PendingOidcLinkStorage, UserStorage, VerifiedEmail,
@@ -286,23 +285,19 @@ mod service {
             .get_user_by_id(pending_link.existing_user_id)
             .await
             .ok_or(OidcError::InvalidPendingLink)?;
-        let hash_str = user.password.ok_or(OidcError::PasswordConfirmationFailed)?;
+        let hash = user.password.ok_or(OidcError::PasswordConfirmationFailed)?;
+        let is_legacy_bcrypt = matches!(hash, PasswordHash::Bcrypt(_));
 
-        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking
-        // keeps it off this tokio worker thread. Unlike `/oauth/login`, there's
-        // no dummy-hash timing guard here: `pending_link_token` already reveals
-        // that a matching account exists (that's the whole reason this
-        // endpoint is being called), so there's no identifier to enumerate.
-        let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
-            let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
-            Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
-        })
-        .await
-        .map_err(|_| OidcError::PasswordConfirmationFailed)?
-        .map_err(|_| OidcError::PasswordConfirmationFailed)?;
+        // No dummy-hash timing guard needed: pending_link_token already reveals the account exists.
+        match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
+            Ok(crypto::PasswordVerifyOutcome::Verified) => {}
+            Ok(crypto::PasswordVerifyOutcome::NotVerified) | Err(_) => {
+                return Err(OidcError::PasswordConfirmationFailed);
+            }
+        }
 
-        if !verified {
-            return Err(OidcError::PasswordConfirmationFailed);
+        if is_legacy_bcrypt {
+            crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
         }
 
         let user = state
@@ -324,7 +319,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::model::user::User;
+    use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
     use crate::storage::{OidcStateStorage, PendingOidcLinkStorage, UserStorage};
 
@@ -344,6 +339,7 @@ mod tests {
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            max_bcrypt_cost: 12,
         }
     }
 
@@ -451,7 +447,7 @@ mod tests {
             .to_string();
         let user = User {
             email: "squatter@example.com".to_string(),
-            password: Some(hash),
+            password: Some(PasswordHash::Argon2(hash)),
             email_verified: false,
             ..User::default()
         };
@@ -486,7 +482,7 @@ mod tests {
             .to_string();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some(hash),
+            password: Some(PasswordHash::Argon2(hash)),
             email_verified: false,
             ..User::default()
         };

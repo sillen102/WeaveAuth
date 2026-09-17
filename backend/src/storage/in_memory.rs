@@ -1,6 +1,6 @@
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
-use crate::model::user::User;
+use crate::model::user::{PasswordHash, User};
 use crate::storage::{
     CreateUserOutcome, ExpiryMaintenance, JwkStorage, LoginSessionStorage, OidcLinkOutcome,
     OidcLoginState, OidcStateStorage, PasswordResetTokenStorage, PendingOidcLink,
@@ -133,7 +133,7 @@ impl UserStorage for InMemoryUserStorage {
         Some(user)
     }
 
-    async fn set_password(&mut self, user_id: Uuid, password_hash: String) -> SetPasswordOutcome {
+    async fn set_password(&mut self, user_id: Uuid, password_hash: PasswordHash) -> SetPasswordOutcome {
         let mut inner = self.inner.lock().await;
         let Some(user) = inner.users.get_mut(&user_id) else {
             return SetPasswordOutcome::UserNotFound;
@@ -508,7 +508,7 @@ impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
 mod tests {
     use uuid::Uuid;
     use crate::model::pkce::CodeChallengeMethod;
-    use crate::model::user::User;
+    use crate::model::user::{PasswordHash, User};
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
         InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
@@ -598,7 +598,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let local_user = User {
             email: "alice@example.com".to_string(),
-            password: Some("hash".to_string()),
+            password: Some(PasswordHash::Argon2("hash".to_string())),
             email_verified: true,
             ..User::default()
         };
@@ -611,7 +611,7 @@ mod tests {
         };
         assert_eq!(oidc_user.id, local_user.id);
         // The password is untouched -- the user can still log in with it too.
-        assert_eq!(oidc_user.password.as_deref(), Some("hash"));
+        assert_eq!(oidc_user.password, Some(PasswordHash::Argon2("hash".to_string())));
     }
 
     #[tokio::test]
@@ -649,7 +649,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let squatter = User {
             email: "alice@example.com".to_string(),
-            password: Some("squatter-hash".to_string()),
+            password: Some(PasswordHash::Argon2("squatter-hash".to_string())),
             email_verified: false,
             ..User::default()
         };
@@ -671,7 +671,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let squatter = User {
             email: "alice@example.com".to_string(),
-            password: Some("squatter-hash".to_string()),
+            password: Some(PasswordHash::Argon2("squatter-hash".to_string())),
             email_verified: false,
             ..User::default()
         };
@@ -708,18 +708,18 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let mut user = User::default();
         user.email = "carol".to_string();
-        user.password = Some("old-hash".to_string());
+        user.password = Some(PasswordHash::Argon2("old-hash".to_string()));
         let user_id = user.id;
         let original_updated_at = user.updated_at;
         let _ = storage.create_user(user).await;
 
         assert_eq!(
-            storage.set_password(user_id, "new-hash".to_string()).await,
+            storage.set_password(user_id, PasswordHash::Argon2("new-hash".to_string())).await,
             SetPasswordOutcome::Ok
         );
 
         let updated = storage.get_user_by_id(user_id).await.unwrap();
-        assert_eq!(updated.password.as_deref(), Some("new-hash"));
+        assert_eq!(updated.password, Some(PasswordHash::Argon2("new-hash".to_string())));
         assert!(updated.updated_at >= original_updated_at);
     }
 
@@ -727,7 +727,7 @@ mod tests {
     async fn set_password_returns_user_not_found_for_an_unknown_user() {
         let mut storage = InMemoryUserStorage::new();
         assert_eq!(
-            storage.set_password(Uuid::new_v4(), "new-hash".to_string()).await,
+            storage.set_password(Uuid::new_v4(), PasswordHash::Argon2("new-hash".to_string())).await,
             SetPasswordOutcome::UserNotFound
         );
     }

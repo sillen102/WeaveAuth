@@ -31,6 +31,7 @@ login page (`login/`, binary `weaveauth-login`, port 8081, just redirects into b
 - Formatting: use `rustfmt` with default settings.
 - Lint: code must pass `cargo clippy` with default lints.
 - Error handling: use `thiserror` to define error types; prefer `Result<T, MyError>` over panics.
+- Avoid functions that return `bool` for a success/failure outcome; return `Result<T, MyError>` with an error enum instead, so callers can match on and log the actual failure reason.
 - Async: use `async/await` with `tokio` runtime for IO-bound operations.
 - Logging: use `tracing` for structured logging; avoid logging sensitive information.
 - Never use ignore in documentation tests.
@@ -41,7 +42,11 @@ login page (`login/`, binary `weaveauth-login`, port 8081, just redirects into b
 - Write tests first before implementing new behavior. Make sure tests fail before implementing the change.
 - Prefer fast unit tests first; add integration coverage when behavior crosses IO boundaries.
 
+## Documentation
+- When a change alters a flow documented under `docs/flows/`, update that doc in the same change — it must describe the current behavior, not what it used to be.
+
 ## Comments in code
+- Inside function bodies, keep comments short and to the point; prefer a single line, and only go multi-line when truly necessary. Doc comments (`///`) above a function can be longer when needed.
 - Keep comments up to date with code changes.
 - Comment only when it adds value (explain why, not what).
 - Avoid comments that are obvious from the code itself.

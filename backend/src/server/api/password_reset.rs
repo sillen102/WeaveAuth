@@ -68,13 +68,13 @@ mod controller {
 }
 
 mod service {
-    use argon2::PasswordHasher;
     use axum::http::StatusCode;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
-    use crate::crypto::ARGON2;
+    use crate::crypto;
     use crate::model::email::normalize_email;
+    use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{
         LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, RevokeOutcome,
@@ -135,18 +135,11 @@ mod service {
         // whole flow exists to not paper over with a 200.
         revoke_everything_for(state, user_id).await?;
 
-        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking
-        // keeps it off this tokio worker thread, same as /register.
-        let password_hash = tokio::task::spawn_blocking(move || {
-            ARGON2
-                .hash_password(new_password.as_bytes())
-                .map(|h| h.to_string())
-        })
-        .await
-        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?
-        .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
+        let password_hash = crypto::hash_password(new_password)
+            .await
+            .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
 
-        match state.users.set_password(user_id, password_hash).await {
+        match state.users.set_password(user_id, PasswordHash::Argon2(password_hash)).await {
             SetPasswordOutcome::Ok => {}
             // The token was valid a moment ago but the account is gone now --
             // vanishingly unlikely (nothing in this codebase deletes users),
@@ -175,7 +168,7 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use crate::model::user::User;
+    use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage};
     use axum::extract::{Json, State};
@@ -199,6 +192,7 @@ mod tests {
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            max_bcrypt_cost: 12,
         }
     }
 
@@ -239,7 +233,7 @@ mod tests {
         let mut state = state();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some("old-hash".to_string()),
+            password: Some(PasswordHash::Argon2("old-hash".to_string())),
             ..User::default()
         };
         let user_id = user.id;
@@ -254,7 +248,7 @@ mod tests {
         assert_eq!(result, Ok(StatusCode::OK));
 
         let updated = state.users.get_user_by_id(user_id).await.unwrap();
-        assert_ne!(updated.password.as_deref(), Some("old-hash"));
+        assert_ne!(updated.password, Some(PasswordHash::Argon2("old-hash".to_string())));
 
         // Single-use: the same token can't be redeemed twice.
         let replay = PasswordResetConfirmRequest {
@@ -274,7 +268,7 @@ mod tests {
         let mut state = state();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some("old-hash".to_string()),
+            password: Some(PasswordHash::Argon2("old-hash".to_string())),
             ..User::default()
         };
         let user_id = user.id;

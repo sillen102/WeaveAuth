@@ -2,7 +2,7 @@ pub(crate) mod in_memory;
 
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
-use crate::model::user::User;
+use crate::model::user::{PasswordHash, User};
 use email_address::EmailAddress;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -120,7 +120,7 @@ pub(crate) trait UserStorage {
     /// Overwrites `user_id`'s password hash (used by `/oauth/password-reset/confirm`
     /// and, later, a "change password" endpoint). `UserNotFound` if `user_id`
     /// doesn't exist.
-    async fn set_password(&mut self, user_id: Uuid, password_hash: String) -> SetPasswordOutcome;
+    async fn set_password(&mut self, user_id: Uuid, password_hash: PasswordHash) -> SetPasswordOutcome;
 }
 
 #[derive(Debug, Eq, PartialEq)]

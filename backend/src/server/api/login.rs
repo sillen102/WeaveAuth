@@ -48,14 +48,13 @@ mod controller {
 }
 
 mod service {
-    use argon2::password_hash::phc::PasswordHash;
-    use argon2::PasswordVerifier;
     use axum::http::StatusCode;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
-    use crate::crypto::ARGON2;
+    use crate::crypto;
     use crate::model::email::normalize_email;
+    use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, UserStorage};
 
@@ -86,25 +85,22 @@ mod service {
     pub(crate) async fn login(state: &mut AppState, email: &str, password: String) -> Result<String, LoginError> {
         let user = state.users.get_user_by_email(&normalize_email(email)).await;
 
-        // Always hash, even for an unknown email (against a fixed dummy hash)
-        // -- see DUMMY_PASSWORD_HASH. Both branches pay the same Argon2 cost, so
-        // response timing can't be used to enumerate registered emails. Run it via
-        // spawn_blocking: Argon2 is deliberately CPU-heavy, synchronous work, and
-        // doing it inline would block this tokio worker thread from servicing any
-        // other task while it hashes.
-        let hash_str = user
+        // Hash even for an unknown email (DUMMY_PASSWORD_HASH) so timing can't enumerate registered emails.
+        let hash = user
             .as_ref()
             .and_then(|u| u.password.clone())
-            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
-        let verified = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
-            let hash = PasswordHash::new(&hash_str).map_err(|_| ())?;
-            Ok(ARGON2.verify_password(password.as_bytes(), &hash).is_ok())
-        })
-        .await
-        .map_err(|_| LoginError::UnexpectedError)?
-        .map_err(|_| LoginError::UnexpectedError)?;
+            .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.to_string()));
+        match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
+            Ok(crypto::PasswordVerifyOutcome::Verified) => {}
+            Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginError::InvalidCredentials),
+            Err(_) => return Err(LoginError::UnexpectedError),
+        }
 
-        let user = user.filter(|_| verified).ok_or(LoginError::InvalidCredentials)?;
+        let user = user.ok_or(LoginError::InvalidCredentials)?;
+
+        if matches!(user.password, Some(PasswordHash::Bcrypt(_))) {
+            crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
+        }
 
         let login_session = state.login_sessions.create_session(user.id).await;
         Ok(login_session)
@@ -114,7 +110,7 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use crate::model::user::User;
+    use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
@@ -126,17 +122,12 @@ mod tests {
 
     use crate::crypto::ARGON2;
 
-    async fn state_with_user(email: &str, password: &str) -> AppState {
-        let hash = ARGON2
-            .hash_password(password.as_bytes())
-            .expect("hashing a test password never fails")
-            .to_string();
-
+    async fn state_with_user_password(email: &str, password_hash: PasswordHash) -> AppState {
         let mut users = InMemoryUserStorage::new();
         let _ = users
             .create_user(User {
                 email: email.to_string(),
-                password: Some(hash),
+                password: Some(password_hash),
                 ..User::default()
             })
             .await;
@@ -155,7 +146,16 @@ mod tests {
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            max_bcrypt_cost: 12,
         }
+    }
+
+    async fn state_with_user(email: &str, password: &str) -> AppState {
+        let hash = ARGON2
+            .hash_password(password.as_bytes())
+            .expect("hashing a test password never fails")
+            .to_string();
+        state_with_user_password(email, PasswordHash::Argon2(hash)).await
     }
 
     #[tokio::test]
@@ -218,6 +218,26 @@ mod tests {
             elapsed > std::time::Duration::from_millis(1),
             "unknown-email login returned in {elapsed:?} -- looks like it short-circuited \
              before hashing, which reopens the email-enumeration timing hole"
+        );
+    }
+
+    #[tokio::test]
+    async fn logging_in_with_an_imported_bcrypt_hash_unlocks_the_account_and_upgrades_it_to_argon2() {
+        let bcrypt_hash = bcrypt::hash("hunter2", 4).expect("hashing a test password never fails");
+        let state = state_with_user_password("alice@example.com", PasswordHash::Bcrypt(bcrypt_hash)).await;
+        let req = LoginRequest {
+            email: "alice@example.com".to_string(),
+            password: "hunter2".to_string(),
+        };
+
+        let Json(body) = login(State(state.clone()), Json(req)).await.unwrap();
+        assert!(!body.login_session.is_empty());
+
+        let user = state.users.get_user_by_email("alice@example.com").await.expect("user exists");
+        assert!(
+            matches!(user.password, Some(PasswordHash::Argon2(_))),
+            "expected the bcrypt hash to have been upgraded to argon2, got {:?}",
+            user.password
         );
     }
 }

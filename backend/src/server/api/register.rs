@@ -41,7 +41,6 @@ mod controller {
 }
 
 mod service {
-    use argon2::PasswordHasher;
     use axum::http::StatusCode;
     use chrono::Utc;
     use email_address::EmailAddress;
@@ -49,9 +48,9 @@ mod service {
     use uuid::Uuid;
     use common_macros::ErrorResponses;
 
-    use crate::crypto::ARGON2;
+    use crate::crypto;
     use crate::model::email::normalize_email;
-    use crate::model::user::User;
+    use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
     use crate::storage::{CreateUserOutcome, UserStorage};
 
@@ -74,17 +73,7 @@ mod service {
             return Err(RegisterError::InvalidEmail);
         }
 
-        // Argon2 is deliberately CPU-heavy, synchronous work; spawn_blocking keeps
-        // it off this tokio worker thread so it doesn't stall other tasks while
-        // hashing.
-        let password_hash = tokio::task::spawn_blocking(move || {
-            ARGON2
-                .hash_password(password.as_bytes())
-                .map(|h| h.to_string())
-        })
-        .await
-        .map_err(|_| RegisterError::UnexpectedError)?
-        .map_err(|_| RegisterError::UnexpectedError)?;
+        let password_hash = crypto::hash_password(password).await.map_err(|_| RegisterError::UnexpectedError)?;
 
         let now = Utc::now();
         let outcome = state
@@ -92,7 +81,7 @@ mod service {
             .create_user(User {
                 id: Uuid::new_v4(),
                 email,
-                password: Some(password_hash),
+                password: Some(PasswordHash::Argon2(password_hash)),
                 // This app has no verification-email flow of its own -- only
                 // an OIDC provider confirming the address (see
                 // `UserStorage::link_or_create_oidc_user`) flips this to true.
@@ -133,6 +122,7 @@ mod tests {
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            max_bcrypt_cost: 12,
         }
     }
 
