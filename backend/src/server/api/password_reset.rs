@@ -39,7 +39,7 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<PasswordResetConfirmRequest>,
     ) -> Result<StatusCode, PasswordResetConfirmError> {
-        service::confirm_password_reset(&mut state, &req.token, req.new_password).await?;
+        service::confirm_password_reset(&mut state, &req.token, req.new_password.into()).await?;
         Ok(StatusCode::OK)
     }
 
@@ -69,6 +69,7 @@ mod controller {
 
 mod service {
     use axum::http::StatusCode;
+    use secrecy::SecretString;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
@@ -114,7 +115,7 @@ mod service {
     pub(crate) async fn confirm_password_reset(
         state: &mut AppState,
         token: &str,
-        new_password: String,
+        new_password: SecretString,
     ) -> Result<(), PasswordResetConfirmError> {
         let user_id = state
             .password_reset_tokens
@@ -139,7 +140,7 @@ mod service {
             .await
             .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
 
-        match state.users.set_password(user_id, PasswordHash::Argon2(password_hash)).await {
+        match state.users.set_password(user_id, PasswordHash::Argon2(password_hash.into())).await {
             SetPasswordOutcome::Ok => {}
             // The token was valid a moment ago but the account is gone now --
             // vanishingly unlikely (nothing in this codebase deletes users),
@@ -233,7 +234,7 @@ mod tests {
         let mut state = state();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("old-hash".to_string())),
+            password: Some(PasswordHash::Argon2("old-hash".into())),
             ..User::default()
         };
         let user_id = user.id;
@@ -248,7 +249,7 @@ mod tests {
         assert_eq!(result, Ok(StatusCode::OK));
 
         let updated = state.users.get_user_by_id(user_id).await.unwrap();
-        assert_ne!(updated.password, Some(PasswordHash::Argon2("old-hash".to_string())));
+        assert_ne!(updated.password.unwrap().expose(), ("argon2", "old-hash"));
 
         // Single-use: the same token can't be redeemed twice.
         let replay = PasswordResetConfirmRequest {
@@ -268,7 +269,7 @@ mod tests {
         let mut state = state();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("old-hash".to_string())),
+            password: Some(PasswordHash::Argon2("old-hash".into())),
             ..User::default()
         };
         let user_id = user.id;

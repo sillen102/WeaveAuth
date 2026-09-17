@@ -1,6 +1,7 @@
 use crate::config::OidcProviderConfig;
 use openidconnect::core::{CoreClient, CoreProviderMetadata};
 use openidconnect::{ClientId, ClientSecret, EndpointNotSet, EndpointSet, IssuerUrl, RedirectUrl};
+use secrecy::ExposeSecret;
 use std::collections::HashMap;
 
 /// A `CoreClient` built with only the auth and token endpoints set -- the
@@ -38,7 +39,7 @@ pub(crate) async fn build_providers(
             issuer,
             metadata.jwks().clone(),
         )
-        .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        .set_client_secret(ClientSecret::new(config.client_secret.expose_secret().to_string()))
         .set_auth_uri(metadata.authorization_endpoint().clone())
         .set_token_uri(token_endpoint)
         .set_redirect_uri(RedirectUrl::new(config.redirect_uri.clone())?);

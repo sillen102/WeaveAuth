@@ -4,6 +4,7 @@ use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::{PasswordHash, User};
 use email_address::EmailAddress;
+use secrecy::SecretString;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -49,7 +50,7 @@ impl VerifiedEmail {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum OidcLinkOutcome {
     /// Either a brand-new user, an already-linked identity, or a link into an
     /// account whose email was *already* verified -- no further proof needed.
@@ -218,11 +219,11 @@ pub(crate) trait RefreshTokenStorage {
 /// What `/oauth/oidc/{provider}/login` stashed for a single in-flight
 /// redirect, so `/oauth/oidc/{provider}/callback` can complete the exchange
 /// once the user comes back from the provider.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct OidcLoginState {
     pub(crate) provider: String,
-    pub(crate) pkce_verifier: String,
-    pub(crate) nonce: String,
+    pub(crate) pkce_verifier: SecretString,
+    pub(crate) nonce: SecretString,
 }
 
 /// A short-lived, single-use record of an in-flight `/oauth/oidc/{provider}/login`

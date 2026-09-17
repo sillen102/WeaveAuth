@@ -60,7 +60,8 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<OidcConfirmLinkRequest>,
     ) -> Result<Json<OidcConfirmLinkResponse>, OidcError> {
-        let login_session = service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password).await?;
+        let login_session =
+            service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into()).await?;
         Ok(Json(OidcConfirmLinkResponse { login_session }))
     }
 
@@ -110,6 +111,7 @@ mod service {
         TokenResponse,
     };
     use schemars::JsonSchema;
+    use secrecy::{ExposeSecret, SecretString};
     use serde::Serialize;
     use thiserror::Error;
     use common_macros::ErrorResponses;
@@ -224,7 +226,7 @@ mod service {
 
         let token_response = client
             .exchange_code(AuthorizationCode::new(code))
-            .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier))
+            .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.expose_secret().to_string()))
             .request_async(&*state.oidc_http_client)
             .await
             .map_err(|_| OidcError::ExchangeFailed)?;
@@ -232,7 +234,7 @@ mod service {
         let id_token = token_response.id_token().ok_or(OidcError::ExchangeFailed)?;
         let verifier = client.id_token_verifier();
         let claims = id_token
-            .claims(&verifier, &Nonce::new(login_state.nonce))
+            .claims(&verifier, &Nonce::new(login_state.nonce.expose_secret().to_string()))
             .map_err(|_| OidcError::ExchangeFailed)?;
 
         // Accounts are linked across providers by matching this email against
@@ -272,7 +274,7 @@ mod service {
     pub(crate) async fn oidc_confirm_link(
         state: &mut AppState,
         pending_link_token: &str,
-        password: String,
+        password: SecretString,
     ) -> Result<String, OidcError> {
         let pending_link = state
             .pending_oidc_links
@@ -447,7 +449,7 @@ mod tests {
             .to_string();
         let user = User {
             email: "squatter@example.com".to_string(),
-            password: Some(PasswordHash::Argon2(hash)),
+            password: Some(PasswordHash::Argon2(hash.into())),
             email_verified: false,
             ..User::default()
         };
@@ -482,7 +484,7 @@ mod tests {
             .to_string();
         let user = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2(hash)),
+            password: Some(PasswordHash::Argon2(hash.into())),
             email_verified: false,
             ..User::default()
         };

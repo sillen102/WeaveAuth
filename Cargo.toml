@@ -42,3 +42,4 @@ rand = "0.10"
 strum = { version = "0.28", features = ["derive"] }
 email_address = "0.2"
 tera = { version = "2", features = ["glob_fs"] }
+secrecy = { version = "0.10", features = ["serde"] }

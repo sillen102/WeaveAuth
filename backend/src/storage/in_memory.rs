@@ -297,7 +297,7 @@ impl OidcStateStorage for InMemoryOidcStateStorage {
         if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
             return None;
         }
-        Some(OidcLoginState { provider, pkce_verifier, nonce })
+        Some(OidcLoginState { provider, pkce_verifier: pkce_verifier.into(), nonce: nonce.into() })
     }
 }
 
@@ -507,6 +507,7 @@ impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
+    use secrecy::ExposeSecret;
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::{PasswordHash, User};
     use crate::storage::in_memory::{
@@ -514,7 +515,7 @@ mod tests {
         InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
     };
     use crate::storage::{
-        CreateUserOutcome, LoginSessionStorage, OidcLinkOutcome, OidcLoginState, OidcStateStorage,
+        CreateUserOutcome, LoginSessionStorage, OidcLinkOutcome, OidcStateStorage,
         PasswordResetTokenStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
         SetPasswordOutcome, UserStorage, VerifiedEmail,
     };
@@ -572,7 +573,7 @@ mod tests {
             unreachable!("expected Resolved, got {outcome:?}");
         };
         assert_eq!(user.email, "alice@example.com");
-        assert_eq!(user.password, None);
+        assert!(user.password.is_none());
         assert!(user.email_verified);
     }
 
@@ -598,7 +599,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let local_user = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("hash".to_string())),
+            password: Some(PasswordHash::Argon2("hash".into())),
             email_verified: true,
             ..User::default()
         };
@@ -611,7 +612,7 @@ mod tests {
         };
         assert_eq!(oidc_user.id, local_user.id);
         // The password is untouched -- the user can still log in with it too.
-        assert_eq!(oidc_user.password, Some(PasswordHash::Argon2("hash".to_string())));
+        assert_eq!(oidc_user.password.unwrap().expose(), ("argon2", "hash"));
     }
 
     #[tokio::test]
@@ -649,7 +650,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let squatter = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("squatter-hash".to_string())),
+            password: Some(PasswordHash::Argon2("squatter-hash".into())),
             email_verified: false,
             ..User::default()
         };
@@ -657,10 +658,10 @@ mod tests {
 
         let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
 
-        assert_eq!(
+        assert!(matches!(
             outcome,
-            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id: squatter.id }
-        );
+            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } if existing_user_id == squatter.id
+        ));
         // Nothing was mutated -- still unverified, no identity linked yet.
         let still_unverified = storage.get_user_by_email("alice@example.com").await.unwrap();
         assert!(!still_unverified.email_verified);
@@ -671,7 +672,7 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let squatter = User {
             email: "alice@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("squatter-hash".to_string())),
+            password: Some(PasswordHash::Argon2("squatter-hash".into())),
             email_verified: false,
             ..User::default()
         };
@@ -708,18 +709,18 @@ mod tests {
         let mut storage = InMemoryUserStorage::new();
         let mut user = User::default();
         user.email = "carol".to_string();
-        user.password = Some(PasswordHash::Argon2("old-hash".to_string()));
+        user.password = Some(PasswordHash::Argon2("old-hash".into()));
         let user_id = user.id;
         let original_updated_at = user.updated_at;
         let _ = storage.create_user(user).await;
 
         assert_eq!(
-            storage.set_password(user_id, PasswordHash::Argon2("new-hash".to_string())).await,
+            storage.set_password(user_id, PasswordHash::Argon2("new-hash".into())).await,
             SetPasswordOutcome::Ok
         );
 
         let updated = storage.get_user_by_id(user_id).await.unwrap();
-        assert_eq!(updated.password, Some(PasswordHash::Argon2("new-hash".to_string())));
+        assert_eq!(updated.password.unwrap().expose(), ("argon2", "new-hash"));
         assert!(updated.updated_at >= original_updated_at);
     }
 
@@ -727,7 +728,7 @@ mod tests {
     async fn set_password_returns_user_not_found_for_an_unknown_user() {
         let mut storage = InMemoryUserStorage::new();
         assert_eq!(
-            storage.set_password(Uuid::new_v4(), PasswordHash::Argon2("new-hash".to_string())).await,
+            storage.set_password(Uuid::new_v4(), PasswordHash::Argon2("new-hash".into())).await,
             SetPasswordOutcome::UserNotFound
         );
     }
@@ -792,14 +793,10 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            storage.take_state("csrf-token").await,
-            Some(OidcLoginState {
-                provider: "google".to_string(),
-                pkce_verifier: "verifier".to_string(),
-                nonce: "nonce".to_string(),
-            })
-        );
+        let state = storage.take_state("csrf-token").await.expect("state was saved");
+        assert_eq!(state.provider, "google");
+        assert_eq!(state.pkce_verifier.expose_secret(), "verifier");
+        assert_eq!(state.nonce.expose_secret(), "nonce");
     }
 
     #[tokio::test]
@@ -815,7 +812,7 @@ mod tests {
             .await;
         storage.take_state("csrf-token").await;
 
-        assert_eq!(storage.take_state("csrf-token").await, None);
+        assert!(storage.take_state("csrf-token").await.is_none());
     }
 
     #[tokio::test]
@@ -830,7 +827,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(storage.take_state("csrf-token").await, None);
+        assert!(storage.take_state("csrf-token").await.is_none());
     }
 
     #[tokio::test]

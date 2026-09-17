@@ -1,5 +1,6 @@
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Yaml};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -41,6 +42,13 @@ pub struct Config {
     /// route path (e.g. "google" for `/oauth/oidc/google/login`). Empty by
     /// default -- third-party login is a no-op unless a provider is
     /// configured here.
+    ///
+    /// `skip_serializing` because `OidcProviderConfig` doesn't derive
+    /// `Serialize` (it holds a `SecretString`, and serializing it would
+    /// expose the client secret) -- `default` fills it back in from
+    /// `Config::default()` on the deserialize side, since `Config::load`'s
+    /// defaults layer never sees it.
+    #[serde(default, skip_serializing)]
     pub oidc_providers: HashMap<String, OidcProviderConfig>,
     /// Highest bcrypt cost factor accepted when verifying an imported
     /// legacy-user hash (see `crypto::verify_password`) -- caps how long a
@@ -51,10 +59,10 @@ pub struct Config {
 /// Config for a single third-party OIDC login provider. Discovered at
 /// startup via `{issuer}/.well-known/openid-configuration`, so only the
 /// issuer and this app's own client registration need to be given here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OidcProviderConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     pub issuer: String,
     /// This provider's callback redirect URL, as registered with it --
     /// backend isn't meant to be internet-exposed, so this must be bff's
@@ -123,7 +131,7 @@ impl Config {
                 provider.client_id = client_id;
             }
             if let Ok(client_secret) = env::var(format!("WA_OIDC_{key}_CLIENT_SECRET")) {
-                provider.client_secret = client_secret;
+                provider.client_secret = client_secret.into();
             }
         }
 
@@ -151,6 +159,7 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn defaults_when_no_env_and_no_file() {
@@ -276,7 +285,7 @@ mod tests {
             let config = Config::load().unwrap();
             let google = config.oidc_providers.get("google").expect("google provider loaded");
             assert_eq!(google.client_id, "my-client-id");
-            assert_eq!(google.client_secret, "my-client-secret");
+            assert_eq!(google.client_secret.expose_secret(), "my-client-secret");
             assert_eq!(google.issuer, "https://accounts.google.com");
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
             Ok(())
@@ -302,7 +311,7 @@ mod tests {
             let config = Config::load().unwrap();
             let google = config.oidc_providers.get("google").expect("google provider loaded");
             assert_eq!(google.client_id, "env-client-id");
-            assert_eq!(google.client_secret, "env-client-secret");
+            assert_eq!(google.client_secret.expose_secret(), "env-client-secret");
             // Non-secret fields still come from the file, untouched.
             assert_eq!(google.issuer, "https://accounts.google.com");
             Ok(())

@@ -1,16 +1,33 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use secrecy::SecretString;
+#[cfg(test)]
+use secrecy::ExposeSecret;
 use uuid::Uuid;
 
 /// A stored password hash, tagged by scheme. Only `Argon2` is ever written; `Bcrypt` exists so an imported legacy user can unlock and get upgraded.
-/// Only in-memory storage exists today, so this isn't exercised, but a future durable `UserStorage` must account for this type's serde shape when reading pre-existing rows.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// Wrapped in `SecretString` so `#[derive(Debug)]` here (and on `User`, which
+/// embeds it) prints `[REDACTED]` instead of the real hash.
+#[derive(Debug, Clone)]
 pub(crate) enum PasswordHash {
-    Argon2(String),
-    Bcrypt(String),
+    Argon2(SecretString),
+    #[allow(dead_code)]
+    Bcrypt(SecretString),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg(test)]
+impl PasswordHash {
+    /// `secrecy` deliberately doesn't derive `PartialEq` (discourages easy
+    /// secret comparisons); tests use this to check the underlying value.
+    pub(crate) fn expose(&self) -> (&'static str, &str) {
+        match self {
+            Self::Argon2(s) => ("argon2", s.expose_secret()),
+            Self::Bcrypt(s) => ("bcrypt", s.expose_secret()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct User {
     pub id: Uuid,
     pub email: String,
@@ -24,6 +41,7 @@ pub(crate) struct User {
     /// `false` for a plain password registration (this app has no
     /// verification-email flow of its own).
     pub email_verified: bool,
+    #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,7 +68,7 @@ mod tests {
     fn default_has_empty_email_and_no_password() {
         let user = User::default();
         assert_eq!(user.email, "");
-        assert_eq!(user.password, None);
+        assert!(user.password.is_none());
     }
 
     #[test]

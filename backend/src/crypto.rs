@@ -8,6 +8,7 @@ use jsonwebtoken::EncodingKey;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
 use crate::model::user::PasswordHash;
@@ -19,10 +20,12 @@ pub(crate) static ARGON2: LazyLock<Argon2<'static>> = LazyLock::new(Argon2::defa
 
 /// Hashes `password` with argon2, off the tokio worker thread (argon2 is
 /// deliberately CPU-heavy, synchronous work).
-pub(crate) async fn hash_password(password: String) -> anyhow::Result<String> {
-    let result = tokio::task::spawn_blocking(move || ARGON2.hash_password(password.as_bytes()).map(|h| h.to_string()))
-        .await?
-        .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"));
+pub(crate) async fn hash_password(password: SecretString) -> anyhow::Result<String> {
+    let result = tokio::task::spawn_blocking(move || {
+        ARGON2.hash_password(password.expose_secret().as_bytes()).map(|h| h.to_string())
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"));
 
     if let Err(e) = &result {
         tracing::warn!(error = %e, "argon2 hashing failed");
@@ -57,19 +60,19 @@ pub(crate) enum PasswordVerifyError {
 /// use for unknown emails -- the cap bounds that leak but doesn't close it.
 pub(crate) async fn verify_password(
     hash: PasswordHash,
-    password: String,
+    password: SecretString,
     max_bcrypt_cost: u32,
 ) -> Result<PasswordVerifyOutcome, PasswordVerifyError> {
     let result = tokio::task::spawn_blocking(move || match hash {
-        PasswordHash::Argon2(s) => match Argon2PasswordHash::new(&s) {
-            Ok(parsed) if ARGON2.verify_password(password.as_bytes(), &parsed).is_ok() => {
+        PasswordHash::Argon2(s) => match Argon2PasswordHash::new(s.expose_secret()) {
+            Ok(parsed) if ARGON2.verify_password(password.expose_secret().as_bytes(), &parsed).is_ok() => {
                 Ok(PasswordVerifyOutcome::Verified)
             }
             Ok(_) => Ok(PasswordVerifyOutcome::NotVerified),
             Err(e) => Err(anyhow::anyhow!("stored argon2 hash didn't parse: {e}").into()),
         },
-        PasswordHash::Bcrypt(s) => match bcrypt_cost(&s) {
-            Some(cost) if cost <= max_bcrypt_cost => match bcrypt::verify(&password, &s) {
+        PasswordHash::Bcrypt(s) => match bcrypt_cost(s.expose_secret()) {
+            Some(cost) if cost <= max_bcrypt_cost => match bcrypt::verify(password.expose_secret(), s.expose_secret()) {
                 Ok(true) => Ok(PasswordVerifyOutcome::Verified),
                 Ok(false) => Ok(PasswordVerifyOutcome::NotVerified),
                 Err(e) => Err(anyhow::anyhow!("bcrypt verification failed: {e}").into()),
@@ -189,7 +192,7 @@ mod tests {
         let max_cost = 12;
         let inflated = format!("$2b${}$abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx", max_cost + 1);
 
-        let result = verify_password(PasswordHash::Bcrypt(inflated), "whatever".to_string(), max_cost).await;
+        let result = verify_password(PasswordHash::Bcrypt(inflated.into()), "whatever".into(), max_cost).await;
 
         assert!(result.is_err());
     }

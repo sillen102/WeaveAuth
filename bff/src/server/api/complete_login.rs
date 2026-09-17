@@ -147,8 +147,8 @@ mod service {
             .save_session(
                 session_id.clone(),
                 SessionData {
-                    access_token: token.access_token,
-                    refresh_token: token.refresh_token,
+                    access_token: token.access_token.into(),
+                    refresh_token: token.refresh_token.into(),
                     expires_at: token.expires_at,
                     refresh_expires_at: token.refresh_expires_at,
                     user_id: token.user_id,

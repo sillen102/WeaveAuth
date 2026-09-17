@@ -24,7 +24,7 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<RegisterRequest>,
     ) -> Result<StatusCode, RegisterError> {
-        service::register(&mut state, req.email, req.password).await?;
+        service::register(&mut state, req.email, req.password.into()).await?;
         Ok(StatusCode::CREATED)
     }
 
@@ -48,6 +48,8 @@ mod service {
     use uuid::Uuid;
     use common_macros::ErrorResponses;
 
+    use secrecy::SecretString;
+
     use crate::crypto;
     use crate::model::email::normalize_email;
     use crate::model::user::{PasswordHash, User};
@@ -67,7 +69,11 @@ mod service {
         UnexpectedError,
     }
 
-    pub(crate) async fn register(state: &mut AppState, email: String, password: String) -> Result<(), RegisterError> {
+    pub(crate) async fn register(
+        state: &mut AppState,
+        email: String,
+        password: SecretString,
+    ) -> Result<(), RegisterError> {
         let email = normalize_email(&email);
         if !EmailAddress::is_valid(&email) {
             return Err(RegisterError::InvalidEmail);
@@ -81,7 +87,7 @@ mod service {
             .create_user(User {
                 id: Uuid::new_v4(),
                 email,
-                password: Some(PasswordHash::Argon2(password_hash)),
+                password: Some(PasswordHash::Argon2(password_hash.into())),
                 // This app has no verification-email flow of its own -- only
                 // an OIDC provider confirming the address (see
                 // `UserStorage::link_or_create_oidc_user`) flips this to true.

@@ -29,7 +29,7 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
-        let login_session = service::login(&mut state, &req.email, req.password).await?;
+        let login_session = service::login(&mut state, &req.email, req.password.into()).await?;
         Ok(Json(LoginResponse { login_session }))
     }
 
@@ -49,6 +49,7 @@ mod controller {
 
 mod service {
     use axum::http::StatusCode;
+    use secrecy::SecretString;
     use thiserror::Error;
     use common_macros::ErrorResponses;
 
@@ -82,14 +83,18 @@ mod service {
         UnexpectedError,
     }
 
-    pub(crate) async fn login(state: &mut AppState, email: &str, password: String) -> Result<String, LoginError> {
+    pub(crate) async fn login(
+        state: &mut AppState,
+        email: &str,
+        password: SecretString,
+    ) -> Result<String, LoginError> {
         let user = state.users.get_user_by_email(&normalize_email(email)).await;
 
         // Hash even for an unknown email (DUMMY_PASSWORD_HASH) so timing can't enumerate registered emails.
         let hash = user
             .as_ref()
             .and_then(|u| u.password.clone())
-            .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.to_string()));
+            .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.into()));
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
             Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginError::InvalidCredentials),
@@ -155,7 +160,7 @@ mod tests {
             .hash_password(password.as_bytes())
             .expect("hashing a test password never fails")
             .to_string();
-        state_with_user_password(email, PasswordHash::Argon2(hash)).await
+        state_with_user_password(email, PasswordHash::Argon2(hash.into())).await
     }
 
     #[tokio::test]
@@ -224,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn logging_in_with_an_imported_bcrypt_hash_unlocks_the_account_and_upgrades_it_to_argon2() {
         let bcrypt_hash = bcrypt::hash("hunter2", 4).expect("hashing a test password never fails");
-        let state = state_with_user_password("alice@example.com", PasswordHash::Bcrypt(bcrypt_hash)).await;
+        let state = state_with_user_password("alice@example.com", PasswordHash::Bcrypt(bcrypt_hash.into())).await;
         let req = LoginRequest {
             email: "alice@example.com".to_string(),
             password: "hunter2".to_string(),

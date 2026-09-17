@@ -46,11 +46,12 @@ impl ExpiryMaintenance for InMemorySessionStorage {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use secrecy::ExposeSecret;
 
     fn sample_session(token: &str) -> SessionData {
         SessionData {
-            access_token: token.to_string(),
-            refresh_token: format!("{token}-refresh"),
+            access_token: token.into(),
+            refresh_token: format!("{token}-refresh").into(),
             expires_at: Utc::now(),
             refresh_expires_at: Utc::now(),
             user_id: uuid::Uuid::new_v4(),
@@ -71,8 +72,8 @@ mod tests {
             .await;
 
         let data = storage.get_session("session-1").await.unwrap();
-        assert_eq!(data.access_token, "token-1");
-        assert_eq!(data.refresh_token, "token-1-refresh");
+        assert_eq!(data.access_token.expose_secret(), "token-1");
+        assert_eq!(data.refresh_token.expose_secret(), "token-1-refresh");
     }
 
     #[tokio::test]
@@ -97,6 +98,6 @@ mod tests {
             .await;
 
         let data = storage.get_session("session-1").await.unwrap();
-        assert_eq!(data.access_token, "token-2");
+        assert_eq!(data.access_token.expose_secret(), "token-2");
     }
 }

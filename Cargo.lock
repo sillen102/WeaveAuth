@@ -2855,6 +2855,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3935,6 +3945,7 @@ dependencies = [
  "rand 0.10.2",
  "rsa",
  "schemars 1.2.2",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3964,6 +3975,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.2",
  "reqwest 0.13.5",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.0",

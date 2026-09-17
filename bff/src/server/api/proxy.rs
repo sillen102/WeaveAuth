@@ -10,6 +10,7 @@ mod controller {
     use axum::response::Response;
     use axum_reverse_proxy::ReverseProxy;
     use common::model::token::TokenType;
+    use secrecy::ExposeSecret;
 
     use super::service;
     pub(crate) use super::service::ProxyError;
@@ -43,7 +44,7 @@ mod controller {
             .ok_or(ProxyError::Unauthenticated)?;
         let access_token = service::resolve_bearer_token(&mut state, &session_id).await?;
 
-        let auth_value = format!("{} {}", TokenType::Bearer, access_token)
+        let auth_value = format!("{} {}", TokenType::Bearer, access_token.expose_secret())
             .parse()
             .map_err(|_| ProxyError::Unauthenticated)?;
         req.headers_mut().remove(header::COOKIE);
@@ -60,6 +61,7 @@ mod service {
     use axum::http::StatusCode;
     use chrono::{DateTime, Utc};
     use common_macros::ErrorResponses;
+    use secrecy::{ExposeSecret, SecretString};
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use uuid::Uuid;
@@ -97,7 +99,10 @@ mod service {
     /// Resolves the given session cookie value into an access token to
     /// forward upstream, transparently refreshing it first if it has expired
     /// (or is about to) but the session's refresh token hasn't.
-    pub(crate) async fn resolve_bearer_token(state: &mut AppState, session_id: &str) -> Result<String, ProxyError> {
+    pub(crate) async fn resolve_bearer_token(
+        state: &mut AppState,
+        session_id: &str,
+    ) -> Result<SecretString, ProxyError> {
         let session = state
             .sessions
             .get_session(session_id)
@@ -107,7 +112,7 @@ mod service {
         let session = if session.expires_at > Utc::now() + ACCESS_TOKEN_REFRESH_LEEWAY {
             session
         } else if session.refresh_expires_at > Utc::now() {
-            refresh_session(state, session_id, &session.refresh_token)
+            refresh_session(state, session_id, session.refresh_token.expose_secret())
                 .await
                 .ok_or(ProxyError::Unauthenticated)?
         } else {
@@ -150,8 +155,8 @@ mod service {
         let token: TokenResponse = resp.json().await.ok()?;
 
         let data = SessionData {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
+            access_token: token.access_token.into(),
+            refresh_token: token.refresh_token.into(),
             expires_at: token.expires_at,
             refresh_expires_at: token.refresh_expires_at,
             user_id: token.user_id,
