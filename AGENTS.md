@@ -42,6 +42,35 @@ login page (`login/`, binary `weaveauth-login`, port 8081, just redirects into b
 - Write tests first before implementing new behavior. Make sure tests fail before implementing the change.
 - Prefer fast unit tests first; add integration coverage when behavior crosses IO boundaries.
 
+### Mutation testing
+
+A test that passes proves nothing until it has been shown it can fail. After writing or
+changing a test, break the code it covers on purpose, confirm that exact test fails, then
+restore the code. This catches the common failure where a test passes whether or not the
+feature works at all.
+
+- Mutate the smallest thing that should matter: invert a condition (`==` → `!=`), delete a
+  guard clause, short-circuit a branch (`if cond` → `if false && cond`), drop a call, or
+  return early.
+- Exactly one test should fail, and it should be the one written for that behavior. None
+  failing means the test is vacuous. Many failing means they all lean on the same
+  assumption and none of them pins this behavior down.
+- Cover both directions. A test asserting something does NOT happen (a handler isn't
+  called, a route isn't served) needs a companion asserting it DOES on the happy path —
+  otherwise deleting the feature outright leaves the suite green.
+- Restore the code and re-run the full suite before finishing. Never commit a mutation.
+- For security-relevant behavior, record the mutation and the test that caught it in the
+  commit body, so a reviewer can see the test was verified rather than assumed.
+
+Example: `backend/src/server/api/register.rs` forwards extra registration fields to the
+configured handler only for an email that isn't already taken. Removing the
+`get_user_by_email` pre-check must fail `does_not_invoke_the_handler_for_an_already_taken_email`
+and nothing else; disabling the dispatch entirely must fail
+`invokes_the_handler_once_for_a_new_email` and nothing else.
+
+This is a manual discipline, not a tool. `cargo-mutants` automates the same idea if a
+crate ever needs a systematic sweep, but it is not part of the standard workflow here.
+
 ## Documentation
 - When a change alters a flow documented under `docs/flows/`, update that doc in the same change — it must describe the current behavior, not what it used to be.
 

@@ -54,6 +54,58 @@ pub struct Config {
     /// legacy-user hash (see `crypto::verify_password`) -- caps how long a
     /// single login can tie up a blocking-pool thread.
     pub max_bcrypt_cost: u32,
+    /// How extra fields on a register request (anything beyond
+    /// `email`/`password`) are handled. `None` means extra fields aren't
+    /// supported -- a register request carrying any is rejected.
+    #[serde(default)]
+    pub extra_data_handler: Option<ExtraDataHandlerConfig>,
+}
+
+/// Where extra registration fields are forwarded. An error from either kind
+/// fails the whole registration; nothing is ever persisted by WeaveAuth
+/// itself -- see `extra_data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtraDataHandlerConfig {
+    /// POSTs the extra fields as JSON to this URL. Must be `https://` unless
+    /// the host is loopback (`localhost`/127.0.0.1/::1) -- registration
+    /// fields include the user's email and whatever the deployer's form
+    /// collects, so a plaintext `http://` hop to a non-local host would ship
+    /// that over the wire in the clear.
+    Webhook {
+        url: String,
+        /// How long to wait for the webhook before failing the
+        /// registration -- a hung endpoint must not hold the request open
+        /// indefinitely.
+        #[serde(default = "default_webhook_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// Runs the exported `handle_registration` function of the WASM module
+    /// at this path.
+    Wasm {
+        path: String,
+        /// How long a single plugin call may run before wasmtime interrupts
+        /// it and the registration fails.
+        #[serde(default = "default_wasm_timeout_secs")]
+        timeout_secs: u64,
+        /// Cap on the plugin's linear memory, in MB -- stops a runaway
+        /// plugin from growing memory without bound. Rounded down to whole
+        /// 64KiB wasm pages.
+        #[serde(default = "default_wasm_memory_max_mb")]
+        memory_max_mb: u32,
+    },
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    10
+}
+
+fn default_wasm_timeout_secs() -> u64 {
+    5
+}
+
+fn default_wasm_memory_max_mb() -> u32 {
+    8
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -87,6 +139,7 @@ impl Default for Config {
             expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
             max_bcrypt_cost: bcrypt::DEFAULT_COST,
+            extra_data_handler: None,
         }
     }
 }
@@ -314,6 +367,78 @@ mod tests {
             assert_eq!(google.client_secret.expose_secret(), "env-client-secret");
             // Non-secret fields still come from the file, untouched.
             assert_eq!(google.issuer, "https://accounts.google.com");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn defaults_to_no_extra_data_handler() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+
+            let config = Config::load().unwrap();
+            assert!(config.extra_data_handler.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_webhook_extra_data_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "extra_data_handler:\n  kind: webhook\n  url: https://internal.test/hook\n  timeout_secs: 3\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.extra_data_handler.expect("handler configured") {
+                ExtraDataHandlerConfig::Webhook { url, timeout_secs } => {
+                    assert_eq!(url, "https://internal.test/hook");
+                    assert_eq!(timeout_secs, 3);
+                }
+                other => unreachable!("only a webhook handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn webhook_timeout_secs_defaults_when_omitted() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "extra_data_handler:\n  kind: webhook\n  url: https://internal.test/hook\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.extra_data_handler.expect("handler configured") {
+                ExtraDataHandlerConfig::Webhook { timeout_secs, .. } => assert_eq!(timeout_secs, 10),
+                other => unreachable!("only a webhook handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_wasm_extra_data_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "extra_data_handler:\n  kind: wasm\n  path: /opt/plugins/register.wasm\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.extra_data_handler.expect("handler configured") {
+                ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb } => {
+                    assert_eq!(path, "/opt/plugins/register.wasm");
+                    assert_eq!(timeout_secs, 5);
+                    assert_eq!(memory_max_mb, 8);
+                }
+                other => unreachable!("only a wasm handler was configured, got {other:?}"),
+            }
             Ok(())
         });
     }

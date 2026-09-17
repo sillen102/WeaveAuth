@@ -99,8 +99,9 @@ written by this app.
 
 ## Known gaps
 
-- **No password policy** on registration or login -- inherited from `/register`,
-  documented in the [password reset flow](password-reset.md#known-gaps).
+- **No password policy** on registration or login -- inherited from
+  [`/register`](register.md), documented in the
+  [password reset flow](password-reset.md#known-gaps).
 - **No rate limiting on `/oauth/login`** itself (bff's `/login` has
   `WA_RATE_LIMIT_*`-configured per-IP limiting; backend's own endpoint, reachable
   directly by anything on the internal network, does not).

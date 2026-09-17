@@ -36,6 +36,11 @@ pub struct Config {
     /// How often the background task sweeps expired sessions out of the
     /// session store. Bounds how long a dead session's leftovers linger.
     pub expiry_sweep_interval_secs: u64,
+    /// Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`).
+    /// Off by default: bff is the internet-facing service, and these are
+    /// unauthenticated endpoints describing the auth surface, so a
+    /// deployment has to opt in rather than opt out.
+    pub docs_enabled: bool,
 }
 
 impl Default for Config {
@@ -50,6 +55,7 @@ impl Default for Config {
             rate_limit_max_attempts: 10,
             rate_limit_window_secs: 60,
             expiry_sweep_interval_secs: 60,
+            docs_enabled: false,
         }
     }
 }
@@ -95,6 +101,7 @@ impl Config {
                         "WA_RATE_LIMIT_MAX_ATTEMPTS" => "rate_limit_max_attempts".into(),
                         "WA_RATE_LIMIT_WINDOW_SECS" => "rate_limit_window_secs".into(),
                         "WA_EXPIRY_SWEEP_INTERVAL_SECS" => "expiry_sweep_interval_secs".into(),
+                        "WA_DOCS_ENABLED" => "docs_enabled".into(),
                         _ => "_ignored".into(),
                     })
                     .ignore(&["_ignored"]),
@@ -135,6 +142,7 @@ mod tests {
             assert_eq!(config.trusted_origins, vec!["http://localhost:8081".to_string()]);
             assert_eq!(config.rate_limit_max_attempts, 10);
             assert_eq!(config.rate_limit_window_secs, 60);
+            assert!(!config.docs_enabled, "docs must stay off unless explicitly enabled");
             Ok(())
         });
     }

@@ -25,6 +25,7 @@ fn test_config() -> Config {
         expiry_sweep_interval_secs: 60,
         oidc_providers: HashMap::new(),
         max_bcrypt_cost: 12,
+        extra_data_handler: None,
     }
 }
 
@@ -196,4 +197,25 @@ async fn token_exchange_rejects_expired_code() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn register_rejects_extra_fields_over_http_when_no_handler_is_configured() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(
+            Request::post("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"email": "extra@example.com", "password": "hunter2", "company": "Acme"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["reason"], "ExtraDataNotSupported");
 }
