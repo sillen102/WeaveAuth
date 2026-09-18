@@ -62,14 +62,25 @@ feature works at all.
 - For security-relevant behavior, record the mutation and the test that caught it in the
   commit body, so a reviewer can see the test was verified rather than assumed.
 
-Example: `backend/src/server/api/register.rs` forwards extra registration fields to the
-configured handler only for an email that isn't already taken. Removing the
-`get_user_by_email` pre-check must fail `does_not_invoke_the_handler_for_an_already_taken_email`
-and nothing else; disabling the dispatch entirely must fail
-`invokes_the_handler_once_for_a_new_email` and nothing else.
+`cargo-mutants` is the standard tool for this (already installed) — use it instead of
+manual mutation for new/changed tests:
 
-This is a manual discipline, not a tool. `cargo-mutants` automates the same idea if a
-crate ever needs a systematic sweep, but it is not part of the standard workflow here.
+- Run via `mise run mutants -- -p weaveauth` (backend's package name; or `-p
+  weaveauth-bff`/`-p weaveauth-login`) from the repo root. Everything after `--` is
+  forwarded straight to `cargo mutants`, so scope to one file with `--file
+  backend/src/crypto.rs`, or a function/line with `--file ... --function name` /
+  `--line N`, to keep a run fast. The task sets `CARGO_INCREMENTAL=1`, overriding the
+  workspace's `profile.dev.incremental = false` (root `Cargo.toml`, kept off for normal
+  builds) — each mutant is a one-file diff, so incremental compilation avoids a full
+  rebuild per mutant.
+- It builds each mutant, runs the test suite, and reports mutants that survived (no
+  test failed) vs. caught. A surviving mutant means a real gap in coverage.
+- Run it after adding/changing tests for a behavior change, scoped to the touched
+  file(s); fix surviving mutants by strengthening the test, not the implementation.
+- Slow on a full crate (rebuild + test run per mutant); prefer `--file` scoping over a
+  workspace-wide run.
+- For security-relevant behavior, record the surviving-then-fixed mutant and the test
+  that now catches it in the commit body.
 
 ## Documentation
 - When a change alters a flow documented under `docs/flows/`, update that doc in the same change — it must describe the current behavior, not what it used to be.

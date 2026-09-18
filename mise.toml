@@ -1,5 +1,9 @@
 monorepo_root = true
 
+[tools]
+rust = "1.98"
+"cargo:cargo-mutants" = "latest"
+
 [monorepo]
 config_roots = [
     "backend",
@@ -10,9 +14,6 @@ config_roots = [
     "testing/downstream-service",
     "testing/user-service",
 ]
-
-[tools]
-rust = "1.98"
 
 [tasks.build]
 depends = [
@@ -60,3 +61,8 @@ depends = [
     { task = "services" },
     { task = "test-apps" },
 ]
+
+[tasks.mutants]
+description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth)"
+run = "cargo mutants"
+env = { CARGO_INCREMENTAL = "1" }
