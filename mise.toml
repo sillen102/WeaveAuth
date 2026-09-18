@@ -65,4 +65,3 @@ depends = [
 [tasks.mutants]
 description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth)"
 run = "cargo mutants"
-env = { CARGO_INCREMENTAL = "1" }

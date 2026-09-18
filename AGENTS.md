@@ -69,16 +69,28 @@ manual mutation for new/changed tests:
   weaveauth-bff`/`-p weaveauth-login`) from the repo root. Everything after `--` is
   forwarded straight to `cargo mutants`, so scope to one file with `--file
   backend/src/crypto.rs`, or a function/line with `--file ... --function name` /
-  `--line N`, to keep a run fast. The task sets `CARGO_INCREMENTAL=1`, overriding the
-  workspace's `profile.dev.incremental = false` (root `Cargo.toml`, kept off for normal
-  builds) — each mutant is a one-file diff, so incremental compilation avoids a full
-  rebuild per mutant.
+  `--line N`, to keep a run fast. Don't try `CARGO_INCREMENTAL=1`: `~/.cargo/config.toml`
+  sets `sccache` as the `rustc-wrapper`, which refuses to run incremental at all (also
+  why root `Cargo.toml` has `profile.dev.incremental = false`); forcing it off via
+  `RUSTC_WRAPPER=""` to allow incremental was tried and measured *slower* overall
+  (loses sccache's cross-crate cache reuse, which mattered more than incremental's
+  per-mutant savings) — not worth the complexity.
 - It builds each mutant, runs the test suite, and reports mutants that survived (no
   test failed) vs. caught. A surviving mutant means a real gap in coverage.
 - Run it after adding/changing tests for a behavior change, scoped to the touched
   file(s); fix surviving mutants by strengthening the test, not the implementation.
 - Slow on a full crate (rebuild + test run per mutant); prefer `--file` scoping over a
   workspace-wide run.
+- `.cargo/mutants.toml` excludes each crate's `main.rs` (pure startup wiring, no branches
+  worth mutating) via `exclude_globs` — cargo-mutants only reads config from
+  `.cargo/mutants.toml` by default, not a workspace-root `mutants.toml`.
+- A surviving mutant that only changes whether a log line fires (not any return value,
+  stored state, or response) is treated as accepted noise, not chased with log-capture
+  test infrastructure — e.g. `Config::load`'s `>` vs `>=` at the bcrypt cost clamp
+  boundary is a no-op either way (the clamped and unclamped value are identical at the
+  boundary); `upgrade_bcrypt_to_argon2`'s `!=`/`==` on the `set_password` outcome only
+  gates a `tracing::warn!`. Record the reasoning in the commit body when leaving one
+  unaddressed.
 - For security-relevant behavior, record the surviving-then-fixed mutant and the test
   that now catches it in the commit body.
 
@@ -163,3 +175,10 @@ manual mutation for new/changed tests:
 - Backend must never be deployed with a public-facing listener/ingress — only bff and
   login are meant to be internet-exposed; a trusted internal service may reach backend
   directly, but backend itself is never safe to expose.
+- Toggling `RUSTC_WRAPPER`/`CARGO_INCREMENTAL` between builds (e.g. experimenting with
+  disabling sccache) can leave `sccache` serving a stale/corrupted cached object for a
+  later build with the *same* env — surfaces as unrelated tests failing or passing
+  inexplicably, and disappears if you rebuild with `RUSTC_WRAPPER=""`. Fix by clearing
+  the cache directory (`sccache --show-stats` prints its `Cache location`, e.g.
+  `~/Library/Caches/Mozilla.sccache` on macOS) rather than debugging the "failure" as a
+  code issue.

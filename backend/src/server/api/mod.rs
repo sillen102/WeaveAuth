@@ -32,3 +32,27 @@ pub(crate) async fn upgrade_bcrypt_to_argon2(users: &mut impl UserStorage, user_
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::user::User;
+    use crate::storage::in_memory::InMemoryUserStorage;
+
+    #[tokio::test]
+    async fn upgrade_bcrypt_to_argon2_replaces_the_stored_hash() {
+        let mut users = InMemoryUserStorage::new();
+        let mut user = User {
+            password: Some(PasswordHash::Bcrypt("old-bcrypt-hash".into())),
+            ..User::default()
+        };
+        user.email = "alice@example.com".to_string();
+        let user_id = user.id;
+        let _ = users.create_user(user).await;
+
+        upgrade_bcrypt_to_argon2(&mut users, user_id, "hunter2".into()).await;
+
+        let updated = users.get_user_by_id(user_id).await.expect("user still exists");
+        assert!(matches!(updated.password, Some(PasswordHash::Argon2(_))));
+    }
+}

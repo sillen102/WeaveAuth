@@ -48,3 +48,54 @@ pub(crate) async fn build_providers(
     }
     Ok(providers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OidcProviderConfig;
+    use secrecy::SecretString;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn build_providers_discovers_and_returns_a_client_for_each_configured_provider() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })))
+            .mount(&server)
+            .await;
+
+        let mut configs = HashMap::new();
+        configs.insert(
+            "test-provider".to_string(),
+            OidcProviderConfig {
+                issuer: issuer.clone(),
+                client_id: "client-id".to_string(),
+                client_secret: SecretString::from("client-secret".to_string()),
+                redirect_uri: "http://localhost/callback".to_string(),
+            },
+        );
+
+        let http_client = openidconnect::reqwest::Client::new();
+        let providers = build_providers(&configs, &http_client).await.expect("discovery succeeds");
+
+        assert!(providers.contains_key("test-provider"));
+    }
+}

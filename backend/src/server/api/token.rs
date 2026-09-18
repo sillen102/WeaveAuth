@@ -437,6 +437,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issued_tokens_expire_in_the_future_not_the_past() {
+        let (mut state, user_id) = state_with_user().await;
+        let verifier = "correct-verifier";
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let before = chrono::Utc::now();
+
+        let Json(body) = issue_token(State(state), Form(code_req("code1", verifier, "http://redirect.test")))
+            .await
+            .unwrap();
+
+        // Access-token expiry is a JWT claim, not a response field -- decode
+        // the JWT's own payload (no signature check needed) to pin down that
+        // `expires_at = issued_at + ttl`, not `- ttl`.
+        let payload = body.access_token.split('.').nth(1).expect("JWT has a payload segment");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64")).expect("valid JSON");
+        let exp = claims["exp"].as_i64().expect("exp claim");
+        let iat = claims["iat"].as_i64().expect("iat claim");
+        assert!(exp > iat, "access token must expire after it was issued");
+
+        assert!(
+            body.refresh_expires_at > before,
+            "refresh token must expire in the future, not {} seconds in the past",
+            (before - body.refresh_expires_at).num_seconds()
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_grant_rejects_missing_refresh_token() {
         let req = TokenRequest {
             grant_type: GrantType::RefreshToken,

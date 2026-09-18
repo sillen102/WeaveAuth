@@ -425,6 +425,154 @@ mod tests {
         assert_eq!(result.err(), Some(OidcError::InvalidState));
     }
 
+    /// Builds a real `OidcClient` (via discovery against a mocked issuer)
+    /// plus a matching signed id_token, so `oidc_callback` can run its full
+    /// exchange instead of stopping at the state/provider lookup like the
+    /// other tests here.
+    async fn provider_and_id_token(
+        email: &str,
+        email_verified: bool,
+        nonce: &str,
+    ) -> (String, std::sync::Arc<HashMap<String, crate::oidc::OidcClient>>, String) {
+        use serde::Serialize;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+
+        let signing_key = crate::crypto::JwtKeys::generate().expect("RSA keygen for tests never fails");
+
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(signing_key.jwk_set()))
+            .mount(&server)
+            .await;
+
+        #[derive(Serialize)]
+        struct IdTokenClaims<'a> {
+            iss: &'a str,
+            sub: &'a str,
+            aud: &'a str,
+            exp: i64,
+            iat: i64,
+            nonce: &'a str,
+            email: &'a str,
+            email_verified: bool,
+        }
+
+        let now = chrono::Utc::now();
+        let claims = IdTokenClaims {
+            iss: &issuer,
+            sub: "provider-subject",
+            aud: "client-id",
+            exp: (now + chrono::Duration::hours(1)).timestamp(),
+            iat: now.timestamp(),
+            nonce,
+            email,
+            email_verified,
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(signing_key.kid.clone());
+        let id_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key).expect("signing");
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "opaque-access-token",
+                "token_type": "Bearer",
+                "id_token": id_token,
+            })))
+            .mount(&server)
+            .await;
+
+        let mut configs = HashMap::new();
+        configs.insert(
+            "test-provider".to_string(),
+            crate::config::OidcProviderConfig {
+                issuer: issuer.clone(),
+                client_id: "client-id".to_string(),
+                client_secret: secrecy::SecretString::from("client-secret".to_string()),
+                redirect_uri: "http://localhost/callback".to_string(),
+            },
+        );
+        let http_client = openidconnect::reqwest::Client::new();
+        let providers = crate::oidc::build_providers(&configs, &http_client)
+            .await
+            .expect("discovery succeeds");
+
+        // The mock server must outlive the request that hits it -- returning
+        // it (leaked, effectively) alongside the providers keeps it alive
+        // for the caller's `oidc_callback` call.
+        std::mem::forget(server);
+        (issuer, std::sync::Arc::new(providers), id_token)
+    }
+
+    #[tokio::test]
+    async fn callback_resolves_to_authenticated_when_the_provider_confirms_the_email() {
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state
+            .oidc_state
+            .save_state(
+                "csrf-token".to_string(),
+                "test-provider".to_string(),
+                "verifier".to_string(),
+                "test-nonce".to_string(),
+            )
+            .await;
+        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: "csrf-token".to_string() };
+
+        let result = oidc_callback(State(state), Path("test-provider".to_string()), Query(query)).await;
+
+        let Json(super::service::OidcCallbackResponse::Authenticated { .. }) = result.expect("callback succeeds")
+        else {
+            unreachable!("expected Authenticated");
+        };
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_an_id_token_whose_email_is_not_verified() {
+        // The only reason this must fail is the provider's email_verified
+        // claim being false -- everything else about the exchange (issuer,
+        // audience, signature, nonce) is valid. Without this check, anyone
+        // able to put an arbitrary "email" in an id_token could attach
+        // themselves to any victim's account (see the comment at the call
+        // site in `service::oidc_callback`).
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", false, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state
+            .oidc_state
+            .save_state(
+                "csrf-token".to_string(),
+                "test-provider".to_string(),
+                "verifier".to_string(),
+                "test-nonce".to_string(),
+            )
+            .await;
+        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: "csrf-token".to_string() };
+
+        let result = oidc_callback(State(state), Path("test-provider".to_string()), Query(query)).await;
+
+        assert_eq!(result.err(), Some(OidcError::EmailNotVerified));
+    }
+
     #[tokio::test]
     async fn confirm_link_rejects_missing_or_expired_token() {
         let state = state_with_no_providers().await;

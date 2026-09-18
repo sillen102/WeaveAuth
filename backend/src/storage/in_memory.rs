@@ -226,6 +226,41 @@ impl InMemoryPasswordResetTokenStorage {
     }
 }
 
+#[cfg(test)]
+impl InMemoryPendingOidcLinkStorage {
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+impl InMemoryOidcStateStorage {
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+impl InMemoryPkceStorage {
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.code_challenges.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+impl InMemoryLoginSessionStorage {
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+impl InMemoryRefreshTokenStorage {
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.tokens.lock().await.len()
+    }
+}
+
 fn hash_reset_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
@@ -512,11 +547,11 @@ mod tests {
     use crate::model::user::{PasswordHash, User};
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
-        InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
+        InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
     };
     use crate::storage::{
-        CreateUserOutcome, LoginSessionStorage, OidcLinkOutcome, OidcStateStorage,
-        PasswordResetTokenStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
+        CreateUserOutcome, ExpiryMaintenance, LoginSessionStorage, OidcLinkOutcome, OidcStateStorage,
+        PasswordResetTokenStorage, PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
         SetPasswordOutcome, UserStorage, VerifiedEmail,
     };
 
@@ -734,6 +769,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_oidc_link_round_trips() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(60);
+        let existing_user_id = Uuid::new_v4();
+        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), existing_user_id).await;
+
+        let link = storage.take_pending_link(&token).await.expect("link was saved");
+        assert_eq!(link.provider, "google");
+        assert_eq!(link.subject, "sub-123");
+        assert_eq!(link.existing_user_id, existing_user_id);
+    }
+
+    #[tokio::test]
+    async fn pending_oidc_link_is_single_use() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(60);
+        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        storage.take_pending_link(&token).await;
+
+        assert!(storage.take_pending_link(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_oidc_link_rejects_expired_entries() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(-1);
+        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+
+        assert!(storage.take_pending_link(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_oidc_link_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(0);
+        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+
+        assert!(storage.take_pending_link(&token).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_oidc_link_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(-1);
+        storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_oidc_link_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryPendingOidcLinkStorage::new(0);
+        storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 1);
+    }
+
+    #[tokio::test]
     async fn password_reset_token_round_trips_to_the_user_it_was_issued_for() {
         let mut storage = InMemoryPasswordResetTokenStorage::new(60);
         let user_id = Uuid::new_v4();
@@ -763,6 +855,37 @@ mod tests {
         let token = storage.save_reset_token(Uuid::new_v4()).await;
 
         assert_eq!(storage.take_reset_token(&token).await, None);
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        // ttl_secs=0, taken immediately: age is 0, which must NOT count as
+        // expired (the check is "age > ttl", not "age >= ttl").
+        let mut storage = InMemoryPasswordResetTokenStorage::new(0);
+        let user_id = Uuid::new_v4();
+        let token = storage.save_reset_token(user_id).await;
+
+        assert_eq!(storage.take_reset_token(&token).await, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn password_reset_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(-1);
+        storage.save_reset_token(Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.token_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn password_reset_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryPasswordResetTokenStorage::new(0);
+        storage.save_reset_token(Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.token_count().await, 1);
     }
 
     #[tokio::test]
@@ -813,6 +936,45 @@ mod tests {
         storage.take_state("csrf-token").await;
 
         assert!(storage.take_state("csrf-token").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oidc_state_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        let mut storage = InMemoryOidcStateStorage::new(0);
+        storage
+            .save_state(
+                "csrf-token".to_string(),
+                "google".to_string(),
+                "verifier".to_string(),
+                "nonce".to_string(),
+            )
+            .await;
+
+        assert!(storage.take_state("csrf-token").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn oidc_state_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryOidcStateStorage::new(-1);
+        storage
+            .save_state("csrf-token".to_string(), "google".to_string(), "verifier".to_string(), "nonce".to_string())
+            .await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn oidc_state_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryOidcStateStorage::new(0);
+        storage
+            .save_state("csrf-token".to_string(), "google".to_string(), "verifier".to_string(), "nonce".to_string())
+            .await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 1);
     }
 
     #[tokio::test]
@@ -880,6 +1042,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_take_code_challenge_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        let mut storage = InMemoryPkceStorage::new(0);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        assert!(storage.take_code_challenge("test_code").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pkce_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryPkceStorage::new(-1);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pkce_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryPkceStorage::new(0);
+        storage
+            .save_code_challenge(
+                "test_code".to_string(),
+                "test_challenge".to_string(),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 1);
+    }
+
+    #[tokio::test]
     async fn test_take_code_challenge_rejects_expired_entries() {
         // A negative TTL means "expired the instant it's issued" -- avoids
         // sleeping in the test to exercise the expiry branch.
@@ -919,6 +1133,35 @@ mod tests {
     async fn login_session_rejects_unknown_token() {
         let mut storage = InMemoryLoginSessionStorage::new(60);
         assert_eq!(storage.take_session("no-such-token").await, None);
+    }
+
+    #[tokio::test]
+    async fn login_session_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        let mut storage = InMemoryLoginSessionStorage::new(0);
+        let user_id = Uuid::new_v4();
+        let token = storage.create_session(user_id).await;
+
+        assert_eq!(storage.take_session(&token).await, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn login_session_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryLoginSessionStorage::new(-1);
+        storage.create_session(Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn login_session_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryLoginSessionStorage::new(0);
+        storage.create_session(Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 1);
     }
 
     #[tokio::test]
@@ -987,6 +1230,39 @@ mod tests {
             storage.take_refresh_token("token2").await,
             RefreshTokenOutcome::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_is_not_yet_expired_exactly_at_the_ttl_boundary() {
+        let mut storage = InMemoryRefreshTokenStorage::new(0);
+        let user_id = Uuid::new_v4();
+        let family_id = Uuid::new_v4();
+        storage.save_refresh_token("token1".to_string(), user_id, family_id).await;
+
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::Valid { user_id, family_id }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_sweep_expired_removes_expired_entries() {
+        let mut storage = InMemoryRefreshTokenStorage::new(-1);
+        storage.save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_token_sweep_expired_keeps_entries_at_the_ttl_boundary() {
+        let mut storage = InMemoryRefreshTokenStorage::new(0);
+        storage.save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4()).await;
+
+        storage.sweep_expired().await;
+
+        assert_eq!(storage.entry_count().await, 1);
     }
 
     #[tokio::test]
