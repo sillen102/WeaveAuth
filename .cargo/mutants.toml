@@ -1,0 +1,8 @@
+# cargo-mutants config (https://mutants.rs/config.html).
+#
+# main.rs in each binary crate is pure startup wiring (load config, wire up
+# tracing, call into the library) with no branches worth mutating -- testing
+# it would mean spinning up the real binary end-to-end for no real coverage
+# gain over the unit/integration tests already exercising the library code
+# main.rs calls into.
+exclude_globs = ["backend/src/main.rs", "bff/src/main.rs", "login/src/main.rs"]

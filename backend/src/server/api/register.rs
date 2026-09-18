@@ -372,6 +372,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allows_exactly_the_max_number_of_extra_fields() {
+        let mut state = state();
+        state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
+        let mut req = req("alice@example.com", "hunter2");
+        for i in 0..50 {
+            req.extra.insert(format!("field{i}"), "value".to_string());
+        }
+
+        let result = register(State(state), Json(req)).await;
+
+        assert_eq!(result, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
+    async fn allows_extra_field_key_and_value_at_the_max_length() {
+        let mut state = state();
+        state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
+        let mut req = req("alice@example.com", "hunter2");
+        req.extra.insert("k".repeat(4096), "v".repeat(4096));
+
+        let result = register(State(state), Json(req)).await;
+
+        assert_eq!(result, Ok(StatusCode::CREATED));
+    }
+
+    #[tokio::test]
     async fn rejects_too_many_extra_fields() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));

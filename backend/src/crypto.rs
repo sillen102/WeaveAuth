@@ -196,4 +196,26 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn verify_password_rejects_a_valid_bcrypt_hash_whose_cost_exceeds_the_cap() {
+        // Unlike the malformed-hash case above, this hash is genuine and the
+        // password matches it -- the only reason to reject it is the cost
+        // check itself, which is what distinguishes this from a mutant that
+        // always lets the cost check pass.
+        let password = "correct horse battery staple";
+        let hash = bcrypt::hash(password, 5).expect("bcrypt hash");
+
+        let result = verify_password(PasswordHash::Bcrypt(hash.into()), password.into(), 4).await;
+
+        assert!(result.is_err(), "cost 5 must be rejected when the cap is 4");
+    }
+
+    #[test]
+    fn bcrypt_cost_parses_the_two_digit_cost_field() {
+        assert_eq!(
+            bcrypt_cost("$2b$12$abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx"),
+            Some(12)
+        );
+    }
 }
