@@ -10,12 +10,13 @@ mod controller {
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
 
-    use super::service::{self, RegisterOutcome};
-    pub(crate) use super::service::RegisterError;
+    use super::service::{self, RegisterOutcome, RegisterServiceError};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
@@ -32,6 +33,36 @@ mod controller {
         /// whether these are accepted at all.
         #[serde(flatten)]
         pub(super) extra: HashMap<String, String>,
+    }
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum RegisterError {
+        #[error("request did not come from a trusted origin")]
+        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        UntrustedOrigin,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
+    impl From<RegisterServiceError> for RegisterError {
+        fn from(err: RegisterServiceError) -> Self {
+            match err {
+                RegisterServiceError::BackendUnavailable => RegisterError::BackendUnavailable,
+            }
+        }
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn start_register_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("register")
+            .summary("Register a new user and log them in")
+            .description(
+                "Forwards to backend's /register, then auto-logs the new user in. Any fields \
+                 beyond email/password/redirect_uri/next are forwarded to backend as-is, which \
+                 in turn forwards them to its own configured extra-data handler.",
+            )
     }
 
     /// Forwards registration to backend's `/register`, then -- since the
@@ -72,29 +103,21 @@ mod controller {
             }
         }
     }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn start_register_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("register")
-            .summary("Register a new user and log them in")
-            .description(
-                "Forwards to backend's /register, then auto-logs the new user in. Any fields \
-                 beyond email/password/redirect_uri/next are forwarded to backend as-is, which \
-                 in turn forwards them to its own configured extra-data handler.",
-            )
-    }
 }
 
 mod service {
-    use axum::http::StatusCode;
-    use common_macros::ErrorResponses;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use thiserror::Error;
 
     use crate::server::api::complete_login::complete_login;
     use crate::server::AppState;
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum RegisterServiceError {
+        #[error("backend returned an unexpected response")]
+        BackendUnavailable,
+    }
 
     #[derive(Serialize)]
     struct BackendCredentials<'a> {
@@ -107,16 +130,6 @@ mod service {
     #[derive(Deserialize)]
     struct LoginSessionResponse {
         login_session: String,
-    }
-
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum RegisterError {
-        #[error("request did not come from a trusted origin")]
-        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
-        UntrustedOrigin,
-        #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
-        BackendUnavailable,
     }
 
     pub(crate) enum RegisterOutcome {
@@ -135,20 +148,20 @@ mod service {
         email: &str,
         password: &str,
         extra: HashMap<String, String>,
-    ) -> Result<RegisterOutcome, RegisterError> {
+    ) -> Result<RegisterOutcome, RegisterServiceError> {
         let resp = state
             .http_client
             .post(format!("{}/register", state.config.backend_url))
             .json(&BackendCredentials { email, password, extra })
             .send()
             .await
-            .map_err(|_| RegisterError::BackendUnavailable)?;
+            .map_err(|_| RegisterServiceError::BackendUnavailable)?;
 
         if resp.status().is_client_error() {
             return Ok(RegisterOutcome::Rejected);
         }
         if !resp.status().is_success() {
-            return Err(RegisterError::BackendUnavailable);
+            return Err(RegisterServiceError::BackendUnavailable);
         }
 
         Ok(RegisterOutcome::Created)

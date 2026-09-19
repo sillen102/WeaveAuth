@@ -8,15 +8,17 @@ pub(crate) use controller::oidc_login_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
     use axum::response::Redirect;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
     use super::service;
-    pub(crate) use super::service::OidcError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct OidcCallbackQuery {
@@ -36,33 +38,56 @@ mod controller {
         pub(super) login_session: String,
     }
 
-    pub(crate) async fn oidc_login(
-        State(mut state): State<AppState>,
-        Path(provider): Path<String>,
-    ) -> Result<Redirect, OidcError> {
-        let auth_url = service::oidc_login(&mut state, provider).await?;
-        Ok(Redirect::to(&auth_url))
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum OidcError {
+        #[error("unknown oidc provider")]
+        #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
+        UnknownProvider,
+        #[error("invalid or expired oidc state")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired oidc state")]
+        InvalidState,
+        #[error("oidc token exchange or id token verification failed")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "oidc token exchange or id token verification failed"
+        )]
+        ExchangeFailed,
+        #[error("oidc provider did not return a verified email")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "oidc provider did not return a verified email"
+        )]
+        EmailNotVerified,
     }
 
-    pub(crate) async fn oidc_callback(
-        State(mut state): State<AppState>,
-        Path(provider): Path<String>,
-        Query(query): Query<OidcCallbackQuery>,
-    ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
-        let response = service::oidc_callback(&mut state, provider, query.code, query.state).await?;
-        Ok(Json(response))
+    impl From<service::OidcServiceError> for OidcError {
+        fn from(err: service::OidcServiceError) -> Self {
+            match err {
+                service::OidcServiceError::UnknownProvider => OidcError::UnknownProvider,
+                service::OidcServiceError::InvalidState => OidcError::InvalidState,
+                service::OidcServiceError::ExchangeFailed => OidcError::ExchangeFailed,
+                service::OidcServiceError::EmailNotVerified => OidcError::EmailNotVerified,
+            }
+        }
     }
 
-    /// Finishes linking an OIDC identity that `oidc_callback` flagged as
-    /// `PasswordConfirmationRequired`, once the caller has supplied the
-    /// existing account's password.
-    pub(crate) async fn oidc_confirm_link(
-        State(mut state): State<AppState>,
-        Json(req): Json<OidcConfirmLinkRequest>,
-    ) -> Result<Json<OidcConfirmLinkResponse>, OidcError> {
-        let login_session =
-            service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into()).await?;
-        Ok(Json(OidcConfirmLinkResponse { login_session }))
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum ConfirmLinkError {
+        #[error("invalid or expired pending oidc link")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired pending oidc link")]
+        InvalidPendingLink,
+        #[error("incorrect password")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "incorrect password")]
+        PasswordConfirmationFailed,
+    }
+
+    impl From<service::ConfirmLinkServiceError> for ConfirmLinkError {
+        fn from(err: service::ConfirmLinkServiceError) -> Self {
+            match err {
+                service::ConfirmLinkServiceError::InvalidPendingLink => ConfirmLinkError::InvalidPendingLink,
+                service::ConfirmLinkServiceError::PasswordConfirmationFailed => ConfirmLinkError::PasswordConfirmationFailed,
+            }
+        }
     }
 
     pub(crate) fn oidc_login_doc(op: TransformOperation) -> TransformOperation {
@@ -101,10 +126,38 @@ mod controller {
                  the email had already been verified at callback time.",
             )
     }
+
+    pub(crate) async fn oidc_login(
+        State(mut state): State<AppState>,
+        Path(provider): Path<String>,
+    ) -> Result<Redirect, OidcError> {
+        let auth_url = service::oidc_login(&mut state, provider).await?;
+        Ok(Redirect::to(&auth_url))
+    }
+
+    pub(crate) async fn oidc_callback(
+        State(mut state): State<AppState>,
+        Path(provider): Path<String>,
+        Query(query): Query<OidcCallbackQuery>,
+    ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
+        let response = service::oidc_callback(&mut state, provider, query.code, query.state).await?;
+        Ok(Json(response))
+    }
+
+    /// Finishes linking an OIDC identity that `oidc_callback` flagged as
+    /// `PasswordConfirmationRequired`, once the caller has supplied the
+    /// existing account's password.
+    pub(crate) async fn oidc_confirm_link(
+        State(mut state): State<AppState>,
+        Json(req): Json<OidcConfirmLinkRequest>,
+    ) -> Result<Json<OidcConfirmLinkResponse>, ConfirmLinkError> {
+        let login_session =
+            service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into()).await?;
+        Ok(Json(OidcConfirmLinkResponse { login_session }))
+    }
 }
 
 mod service {
-    use axum::http::StatusCode;
     use openidconnect::core::CoreAuthenticationFlow;
     use openidconnect::{
         AuthorizationCode, CsrfToken, Nonce, PkceCodeChallenge, PkceCodeVerifier, Scope,
@@ -114,7 +167,6 @@ mod service {
     use secrecy::{ExposeSecret, SecretString};
     use serde::Serialize;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::crypto;
     use crate::model::user::PasswordHash;
@@ -122,6 +174,33 @@ mod service {
     use crate::storage::{
         LoginSessionStorage, OidcLinkOutcome, OidcStateStorage, PendingOidcLinkStorage, UserStorage, VerifiedEmail,
     };
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum OidcServiceError {
+        #[error("unknown oidc provider")]
+        UnknownProvider,
+        #[error("invalid or expired oidc state")]
+        InvalidState,
+        #[error("oidc token exchange or id token verification failed")]
+        ExchangeFailed,
+        /// Accounts are linked across providers by email (see
+        /// `UserStorage::resolve_oidc_login`), so an id_token whose email
+        /// isn't provider-confirmed can't be trusted for that -- rather than
+        /// silently falling back to an unmerged identity, this fails loudly
+        /// since it means either the provider doesn't verify emails
+        /// (shouldn't happen for a provider deliberately configured here) or
+        /// something is misconfigured (e.g. missing the `email` scope).
+        #[error("oidc provider did not return a verified email")]
+        EmailNotVerified,
+    }
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum ConfirmLinkServiceError {
+        #[error("invalid or expired pending oidc link")]
+        InvalidPendingLink,
+        #[error("incorrect password")]
+        PasswordConfirmationFailed,
+    }
 
     #[derive(Serialize, JsonSchema)]
     #[serde(tag = "status", rename_all = "snake_case")]
@@ -137,48 +216,13 @@ mod service {
         PasswordConfirmationRequired { pending_link_token: String, email: String },
     }
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum OidcError {
-        #[error("unknown oidc provider")]
-        #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
-        UnknownProvider,
-        #[error("invalid or expired oidc state")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired oidc state")]
-        InvalidState,
-        #[error("oidc token exchange or id token verification failed")]
-        #[error_response(
-            StatusCode::BAD_GATEWAY,
-            details = "oidc token exchange or id token verification failed"
-        )]
-        ExchangeFailed,
-        /// Accounts are linked across providers by email (see
-        /// `UserStorage::resolve_oidc_login`), so an id_token whose email
-        /// isn't provider-confirmed can't be trusted for that -- rather than
-        /// silently falling back to an unmerged identity, this fails loudly
-        /// since it means either the provider doesn't verify emails
-        /// (shouldn't happen for a provider deliberately configured here) or
-        /// something is misconfigured (e.g. missing the `email` scope).
-        #[error("oidc provider did not return a verified email")]
-        #[error_response(
-            StatusCode::BAD_REQUEST,
-            details = "oidc provider did not return a verified email"
-        )]
-        EmailNotVerified,
-        #[error("invalid or expired pending oidc link")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired pending oidc link")]
-        InvalidPendingLink,
-        #[error("incorrect password")]
-        #[error_response(StatusCode::UNAUTHORIZED, details = "incorrect password")]
-        PasswordConfirmationFailed,
-    }
-
     /// Starts a third-party OIDC login for `provider`, returning the
     /// provider's consent-screen URL to redirect the caller to.
-    pub(crate) async fn oidc_login(state: &mut AppState, provider: String) -> Result<String, OidcError> {
+    pub(crate) async fn oidc_login(state: &mut AppState, provider: String) -> Result<String, OidcServiceError> {
         let client = state
             .oidc_providers
             .get(&provider)
-            .ok_or(OidcError::UnknownProvider)?;
+            .ok_or(OidcServiceError::UnknownProvider)?;
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
         let (auth_url, csrf_token, nonce) = client
@@ -210,32 +254,32 @@ mod service {
         provider: String,
         code: String,
         query_state: String,
-    ) -> Result<OidcCallbackResponse, OidcError> {
+    ) -> Result<OidcCallbackResponse, OidcServiceError> {
         let login_state = state
             .oidc_state
             .take_state(&query_state)
             .await
             .filter(|s| s.provider == provider)
-            .ok_or(OidcError::InvalidState)?;
+            .ok_or(OidcServiceError::InvalidState)?;
         let stored_provider = login_state.provider;
 
         let client = state
             .oidc_providers
             .get(&stored_provider)
-            .ok_or(OidcError::UnknownProvider)?;
+            .ok_or(OidcServiceError::UnknownProvider)?;
 
         let token_response = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.expose_secret().to_string()))
             .request_async(&*state.oidc_http_client)
             .await
-            .map_err(|_| OidcError::ExchangeFailed)?;
+            .map_err(|_| OidcServiceError::ExchangeFailed)?;
 
-        let id_token = token_response.id_token().ok_or(OidcError::ExchangeFailed)?;
+        let id_token = token_response.id_token().ok_or(OidcServiceError::ExchangeFailed)?;
         let verifier = client.id_token_verifier();
         let claims = id_token
             .claims(&verifier, &Nonce::new(login_state.nonce.expose_secret().to_string()))
-            .map_err(|_| OidcError::ExchangeFailed)?;
+            .map_err(|_| OidcServiceError::ExchangeFailed)?;
 
         // Accounts are linked across providers by matching this email against
         // existing users (see `resolve_oidc_login`), so it must be one the
@@ -246,9 +290,9 @@ mod service {
         // `resolve_oidc_login` require a `VerifiedEmail` in its signature --
         // this is the only place in the codebase allowed to construct one
         // from an OIDC claim.
-        let email = claims.email().ok_or(OidcError::EmailNotVerified)?.as_str().to_string();
+        let email = claims.email().ok_or(OidcServiceError::EmailNotVerified)?.as_str().to_string();
         let verified_email =
-            VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true)).ok_or(OidcError::EmailNotVerified)?;
+            VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true)).ok_or(OidcServiceError::EmailNotVerified)?;
         let subject = claims.subject().as_str();
 
         let response = match state.users.resolve_oidc_login(&stored_provider, subject, &verified_email).await {
@@ -275,26 +319,26 @@ mod service {
         state: &mut AppState,
         pending_link_token: &str,
         password: SecretString,
-    ) -> Result<String, OidcError> {
+    ) -> Result<String, ConfirmLinkServiceError> {
         let pending_link = state
             .pending_oidc_links
             .take_pending_link(pending_link_token)
             .await
-            .ok_or(OidcError::InvalidPendingLink)?;
+            .ok_or(ConfirmLinkServiceError::InvalidPendingLink)?;
 
         let user = state
             .users
             .get_user_by_id(pending_link.existing_user_id)
             .await
-            .ok_or(OidcError::InvalidPendingLink)?;
-        let hash = user.password.ok_or(OidcError::PasswordConfirmationFailed)?;
+            .ok_or(ConfirmLinkServiceError::InvalidPendingLink)?;
+        let hash = user.password.ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
         let is_legacy_bcrypt = matches!(hash, PasswordHash::Bcrypt(_));
 
         // No dummy-hash timing guard needed: pending_link_token already reveals the account exists.
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
             Ok(crypto::PasswordVerifyOutcome::NotVerified) | Err(_) => {
-                return Err(OidcError::PasswordConfirmationFailed);
+                return Err(ConfirmLinkServiceError::PasswordConfirmationFailed);
             }
         }
 
@@ -306,7 +350,7 @@ mod service {
             .users
             .link_verified_oidc_identity(pending_link.existing_user_id, &pending_link.provider, &pending_link.subject)
             .await
-            .ok_or(OidcError::PasswordConfirmationFailed)?;
+            .ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
         let login_session = state.login_sessions.create_session(user.id).await;
 
         Ok(login_session)
@@ -583,7 +627,7 @@ mod tests {
 
         let result = oidc_confirm_link(State(state), Json(req)).await;
 
-        assert_eq!(result.err(), Some(OidcError::InvalidPendingLink));
+        assert_eq!(result.err(), Some(ConfirmLinkError::InvalidPendingLink));
     }
 
     #[tokio::test]
@@ -615,7 +659,7 @@ mod tests {
         };
         let result = oidc_confirm_link(State(state.clone()), Json(req)).await;
 
-        assert_eq!(result.err(), Some(OidcError::PasswordConfirmationFailed));
+        assert_eq!(result.err(), Some(ConfirmLinkError::PasswordConfirmationFailed));
         // Untouched: still unverified, no identity linked.
         let still_unverified = state.users.get_user_by_email("squatter@example.com").await.unwrap();
         assert!(!still_unverified.email_verified);
@@ -660,6 +704,6 @@ mod tests {
             password: "correct-password".to_string(),
         };
         let result = oidc_confirm_link(State(state), Json(replay)).await;
-        assert_eq!(result.err(), Some(OidcError::InvalidPendingLink));
+        assert_eq!(result.err(), Some(ConfirmLinkError::InvalidPendingLink));
     }
 }

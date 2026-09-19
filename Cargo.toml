@@ -1,10 +1,10 @@
 [workspace]
-members = ["backend", "bff", "common", "common/macros", "login"]
+members = ["backend", "bff", "common", "common/macros", "login", "system-tests"]
 resolver = "2"
 
 [profile.dev]
 debug = 0
-incremental = false
+incremental = true
 
 [profile.dev.package."*"]
 debug = 0
@@ -17,18 +17,17 @@ schemars = "1.2"
 argon2 = "0.6"
 bcrypt = "0.19"
 jsonwebtoken = "11.1"
-openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "native-tls"] }
-rsa = { version = "0.9", features = ["pem"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+openidconnect = { version = "4.0", default-features = false }
+rsa = "0.9"
+tokio = "1"
 tower-http = "0.7"
-tower = { version = "0.5", features = ["util"] }
-serde = { version = "1", features = ["derive"] }
+serde = "1"
 serde_json = "1"
-figment = { version = "0.10", features = ["yaml", "env", "test"] }
+figment = "0.10"
 dotenvy = "0.15"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = "0.13"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 anyhow = "1"
 thiserror = "2"
 uuid = "1"
@@ -39,7 +38,11 @@ http = "1.5"
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
-strum = { version = "0.28", features = ["derive"] }
+strum = "0.28"
 email_address = "0.2"
-tera = { version = "2", features = ["glob_fs"] }
-secrecy = { version = "0.10", features = ["serde"] }
+tera = "2"
+secrecy = "0.10"
+
+# Test utilities
+tower = "0.5"
+wiremock = "0.6"

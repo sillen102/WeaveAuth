@@ -1,12 +1,43 @@
-pub(crate) use service::complete_login;
-pub(crate) use service::CompleteLoginError;
+pub(crate) use service::{complete_login, CompleteLoginServiceError};
+pub(crate) use controller::CompleteLoginError;
+
+mod controller {
+    use axum::http::StatusCode;
+    use common_macros::ErrorResponses;
+    use thiserror::Error;
+
+    use super::service::CompleteLoginServiceError;
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum CompleteLoginError {
+        #[error("redirect_uri is not allowed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
+        InvalidRedirectUri,
+        #[error("token exchange failed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
+        TokenExchangeFailed,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
+    impl From<CompleteLoginServiceError> for CompleteLoginError {
+        fn from(err: CompleteLoginServiceError) -> Self {
+            match err {
+                CompleteLoginServiceError::InvalidRedirectUri => CompleteLoginError::InvalidRedirectUri,
+                CompleteLoginServiceError::TokenExchangeFailed => CompleteLoginError::TokenExchangeFailed,
+                CompleteLoginServiceError::BackendUnavailable => CompleteLoginError::BackendUnavailable,
+            }
+        }
+    }
+}
 
 mod service {
     use axum::http::{header, StatusCode};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use chrono::{DateTime, Utc};
-    use common_macros::ErrorResponses;
     use rand::RngExt;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -18,8 +49,14 @@ mod service {
     use crate::server::AppState;
     use crate::storage::SessionStorage;
 
-    fn b64url(bytes: &[u8]) -> String {
-        URL_SAFE_NO_PAD.encode(bytes)
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum CompleteLoginServiceError {
+        #[error("redirect_uri is not allowed")]
+        InvalidRedirectUri,
+        #[error("token exchange failed")]
+        TokenExchangeFailed,
+        #[error("backend returned an unexpected response")]
+        BackendUnavailable,
     }
 
     #[derive(Serialize)]
@@ -43,20 +80,6 @@ mod service {
         user_id: Uuid,
     }
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
-    pub(crate) enum CompleteLoginError {
-        #[error("redirect_uri is not allowed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
-        InvalidRedirectUri,
-        #[error("token exchange failed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
-        TokenExchangeFailed,
-        #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
-        BackendUnavailable,
-    }
-
     /// Drives the PKCE authorization-code exchange against backend
     /// server-to-server given an already-minted `login_session` -- backend
     /// mints one of these the same way whether it came from a password
@@ -78,7 +101,7 @@ mod service {
         state: &mut AppState,
         login_session: &str,
         redirect_uri: &str,
-    ) -> Result<String, CompleteLoginError> {
+    ) -> Result<String, CompleteLoginServiceError> {
         let mut verifier_bytes = [0u8; 32];
         rand::rng().fill(&mut verifier_bytes);
         let code_verifier = b64url(&verifier_bytes);
@@ -97,25 +120,25 @@ mod service {
             .get(format!("{}/oauth/authorize?{}", state.config.backend_url, qs))
             .send()
             .await
-            .map_err(|_| CompleteLoginError::BackendUnavailable)?;
+            .map_err(|_| CompleteLoginServiceError::BackendUnavailable)?;
 
         if authorize_resp.status() == StatusCode::BAD_REQUEST {
             // backend rejected redirect_uri (not allowlisted) -- a client error, not a
             // backend-connectivity problem.
-            return Err(CompleteLoginError::InvalidRedirectUri);
+            return Err(CompleteLoginServiceError::InvalidRedirectUri);
         }
         if !authorize_resp.status().is_redirection() {
-            return Err(CompleteLoginError::BackendUnavailable);
+            return Err(CompleteLoginServiceError::BackendUnavailable);
         }
         let location = authorize_resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or(CompleteLoginError::BackendUnavailable)?;
+            .ok_or(CompleteLoginServiceError::BackendUnavailable)?;
         let code = url::Url::parse(location)
             .ok()
             .and_then(|u| u.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.into_owned()))
-            .ok_or(CompleteLoginError::BackendUnavailable)?;
+            .ok_or(CompleteLoginServiceError::BackendUnavailable)?;
 
         let token_req = TokenExchangeRequest {
             grant_type: "authorization_code",
@@ -131,15 +154,15 @@ mod service {
             .form(&token_req)
             .send()
             .await
-            .map_err(|_| CompleteLoginError::BackendUnavailable)?;
+            .map_err(|_| CompleteLoginServiceError::BackendUnavailable)?;
 
         if !token_resp.status().is_success() {
-            return Err(CompleteLoginError::TokenExchangeFailed);
+            return Err(CompleteLoginServiceError::TokenExchangeFailed);
         }
         let token: TokenResponse = token_resp
             .json()
             .await
-            .map_err(|_| CompleteLoginError::BackendUnavailable)?;
+            .map_err(|_| CompleteLoginServiceError::BackendUnavailable)?;
 
         let session_id = Uuid::new_v4().to_string();
         state
@@ -164,5 +187,9 @@ mod service {
             max_age,
             state.config.secure_cookies(),
         ))
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
     }
 }

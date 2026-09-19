@@ -11,15 +11,15 @@ mod controller {
 
     use super::service;
 
-    pub(crate) async fn jwks(State(state): State<AppState>) -> Json<Value> {
-        Json(service::jwk_set(&state).await)
-    }
-
     pub(crate) fn jwks_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("jwks")
             .summary("JSON Web Key Set")
             .description("Public keys used to verify access token signatures (RFC 7517).")
+    }
+
+    pub(crate) async fn jwks(State(state): State<AppState>) -> Json<Value> {
+        Json(service::jwk_set(&state).await)
     }
 }
 

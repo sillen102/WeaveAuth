@@ -7,12 +7,13 @@ mod controller {
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use serde::Deserialize;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
 
-    use super::service::{self, LoginOutcome};
-    pub(crate) use super::service::LoginError;
+    use super::service::{self, LoginOutcome, LoginServiceError};
 
     #[derive(Deserialize)]
     pub(crate) struct LoginRequest {
@@ -22,6 +23,33 @@ mod controller {
         /// Where to bounce the browser back to on wrong credentials -- the login
         /// page's own URL, supplied by its form, not user-typed input.
         pub(super) next: String,
+    }
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum LoginError {
+        #[error("request did not come from a trusted origin")]
+        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        UntrustedOrigin,
+        #[error("redirect_uri is not allowed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
+        InvalidRedirectUri,
+        #[error("token exchange failed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
+        TokenExchangeFailed,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
+    impl From<LoginServiceError> for LoginError {
+        fn from(err: LoginServiceError) -> Self {
+            match err {
+                LoginServiceError::InvalidRedirectUri => LoginError::InvalidRedirectUri,
+                LoginServiceError::TokenExchangeFailed => LoginError::TokenExchangeFailed,
+                LoginServiceError::BackendUnavailable => LoginError::BackendUnavailable,
+            }
+        }
     }
 
     /// A plain form POST, not a fetch -- so a friendly bounce back to the
@@ -59,12 +87,31 @@ mod controller {
 
 mod service {
     use axum::http::StatusCode;
-    use common_macros::ErrorResponses;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
-    use crate::server::api::complete_login::{complete_login, CompleteLoginError};
+    use crate::server::api::complete_login::{complete_login, CompleteLoginServiceError};
     use crate::server::AppState;
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum LoginServiceError {
+        #[error("redirect_uri is not allowed")]
+        InvalidRedirectUri,
+        #[error("token exchange failed")]
+        TokenExchangeFailed,
+        #[error("backend returned an unexpected response")]
+        BackendUnavailable,
+    }
+
+    impl From<CompleteLoginServiceError> for LoginServiceError {
+        fn from(err: CompleteLoginServiceError) -> Self {
+            match err {
+                CompleteLoginServiceError::InvalidRedirectUri => LoginServiceError::InvalidRedirectUri,
+                CompleteLoginServiceError::TokenExchangeFailed => LoginServiceError::TokenExchangeFailed,
+                CompleteLoginServiceError::BackendUnavailable => LoginServiceError::BackendUnavailable,
+            }
+        }
+    }
 
     #[derive(Serialize)]
     struct VerifyLoginRequest<'a> {
@@ -75,33 +122,6 @@ mod service {
     #[derive(Deserialize)]
     struct LoginSessionResponse {
         login_session: String,
-    }
-
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
-    pub(crate) enum LoginError {
-        #[error("request did not come from a trusted origin")]
-        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
-        UntrustedOrigin,
-        #[error("redirect_uri is not allowed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
-        InvalidRedirectUri,
-        #[error("token exchange failed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
-        TokenExchangeFailed,
-        #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
-        BackendUnavailable,
-    }
-
-    impl From<CompleteLoginError> for LoginError {
-        fn from(err: CompleteLoginError) -> Self {
-            match err {
-                CompleteLoginError::InvalidRedirectUri => LoginError::InvalidRedirectUri,
-                CompleteLoginError::TokenExchangeFailed => LoginError::TokenExchangeFailed,
-                CompleteLoginError::BackendUnavailable => LoginError::BackendUnavailable,
-            }
-        }
     }
 
     pub(crate) enum LoginOutcome {
@@ -130,24 +150,24 @@ mod service {
         email: &str,
         password: &str,
         redirect_uri: &str,
-    ) -> Result<LoginOutcome, LoginError> {
+    ) -> Result<LoginOutcome, LoginServiceError> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
             .json(&VerifyLoginRequest { email, password })
             .send()
             .await
-            .map_err(|_| LoginError::BackendUnavailable)?;
+            .map_err(|_| LoginServiceError::BackendUnavailable)?;
         if verify_resp.status() == StatusCode::UNAUTHORIZED {
             return Ok(LoginOutcome::Rejected);
         }
         if !verify_resp.status().is_success() {
-            return Err(LoginError::BackendUnavailable);
+            return Err(LoginServiceError::BackendUnavailable);
         }
         let login_session = verify_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|_| LoginError::BackendUnavailable)?
+            .map_err(|_| LoginServiceError::BackendUnavailable)?
             .login_session;
 
         let cookie = complete_login(state, &login_session, redirect_uri).await?;

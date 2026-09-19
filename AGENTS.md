@@ -31,6 +31,13 @@ login page (`login/`, binary `weaveauth-login`, port 8081, just redirects into b
 - Formatting: use `rustfmt` with default settings.
 - Lint: code must pass `cargo clippy` with default lints.
 - Error handling: use `thiserror` to define error types; prefer `Result<T, MyError>` over panics.
+  - **Layer separation**: Service/business-logic errors must NOT contain HTTP knowledge. Do NOT use `#[error_response(...)]` or import `StatusCode` in service modules. HTTP error mapping belongs in the controller/handler layer only.
+  - **Pattern**: Define two error types per endpoint: (1) `XyzServiceError` in `service` module with only `#[derive(Debug, Error, ...)]`, (2) `XyzError` in `controller` module with `ErrorResponses` and `#[error_response(...)]` attributes. Implement `From<XyzServiceError> for XyzError` in controller to enable automatic conversion via `?` operator.
+  - **Item order within a module**: top-down, public-first, types-before-consumers.
+    - `controller`: imports, request struct(s), response struct, error enum, `_doc()` fn,
+      then the handler fn last (it's the assembly of everything declared above it).
+    - `service`: error enum first, then the public entry fn, then private helpers below
+      it in call order.
 - Avoid functions that return `bool` for a success/failure outcome; return `Result<T, MyError>` with an error enum instead, so callers can match on and log the actual failure reason.
 - Async: use `async/await` with `tokio` runtime for IO-bound operations.
 - Logging: use `tracing` for structured logging; avoid logging sensitive information.
@@ -164,6 +171,12 @@ manual mutation for new/changed tests:
   `FileConfig` + a row in `README.md`. Structured config with no sane env shape (bff's
   `routes`) is YAML-only.
 - Custom environment variables are prefixed with `WA_`.
+- Root `Cargo.toml`'s `[workspace.dependencies]` declares bare version numbers only, no
+  features (e.g. `axum = "0.8"`, not `axum = { version = "0.8" }`). Each member crate
+  declares the features it needs on its own `{ workspace = true, features = [...] }`
+  line. Exception: `default-features = false` is part of the dependency's identity
+  shared by every consumer, so it belongs on the root declaration (see `openidconnect`),
+  not repeated per member.
 - In-memory storage (backend's PKCE store, bff's session store) follows the same idiom
   throughout: `Arc<Mutex<HashMap<...>>>`, "take"/remove-on-read for single-use records.
 

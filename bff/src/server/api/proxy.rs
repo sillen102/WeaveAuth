@@ -1,8 +1,7 @@
 pub(crate) use controller::proxy_router;
 
 mod controller {
-    use crate::server::cookie::extract_cookie;
-    use crate::server::AppState;
+    use axum::http::StatusCode;
     use axum::Router;
     use axum::extract::{Request, State};
     use axum::http::header;
@@ -11,9 +10,29 @@ mod controller {
     use axum_reverse_proxy::ReverseProxy;
     use common::model::token::TokenType;
     use secrecy::ExposeSecret;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
-    use super::service;
-    pub(crate) use super::service::ProxyError;
+    use crate::server::cookie::extract_cookie;
+    use crate::server::AppState;
+
+    use super::service::{self, ProxyServiceError};
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum ProxyError {
+        #[error("missing or invalid session")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
+        Unauthenticated,
+    }
+
+    impl From<ProxyServiceError> for ProxyError {
+        fn from(err: ProxyServiceError) -> Self {
+            match err {
+                ProxyServiceError::Unauthenticated => ProxyError::Unauthenticated,
+            }
+        }
+    }
 
     /// One `axum-reverse-proxy` service per configured route, merged, gated by
     /// session auth. The proxy crate handles path stripping, header/body
@@ -41,12 +60,12 @@ mod controller {
         next: Next,
     ) -> Result<Response, ProxyError> {
         let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
-            .ok_or(ProxyError::Unauthenticated)?;
+            .ok_or(ProxyServiceError::Unauthenticated)?;
         let access_token = service::resolve_bearer_token(&mut state, &session_id).await?;
 
         let auth_value = format!("{} {}", TokenType::Bearer, access_token.expose_secret())
             .parse()
-            .map_err(|_| ProxyError::Unauthenticated)?;
+            .map_err(|_| ProxyServiceError::Unauthenticated)?;
         req.headers_mut().remove(header::COOKIE);
         req.headers_mut().insert(header::AUTHORIZATION, auth_value);
 
@@ -58,9 +77,7 @@ mod service {
     use crate::model::session::SessionData;
     use crate::server::AppState;
     use crate::storage::SessionStorage;
-    use axum::http::StatusCode;
     use chrono::{DateTime, Utc};
-    use common_macros::ErrorResponses;
     use secrecy::{ExposeSecret, SecretString};
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -73,11 +90,9 @@ mod service {
     /// spurious auth failure there instead of here.
     const ACCESS_TOKEN_REFRESH_LEEWAY: chrono::Duration = chrono::Duration::seconds(5);
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
-    pub(crate) enum ProxyError {
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum ProxyServiceError {
         #[error("missing or invalid session")]
-        #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
         Unauthenticated,
     }
 
@@ -102,21 +117,21 @@ mod service {
     pub(crate) async fn resolve_bearer_token(
         state: &mut AppState,
         session_id: &str,
-    ) -> Result<SecretString, ProxyError> {
+    ) -> Result<SecretString, ProxyServiceError> {
         let session = state
             .sessions
             .get_session(session_id)
             .await
-            .ok_or(ProxyError::Unauthenticated)?;
+            .ok_or(ProxyServiceError::Unauthenticated)?;
 
         let session = if session.expires_at > Utc::now() + ACCESS_TOKEN_REFRESH_LEEWAY {
             session
         } else if session.refresh_expires_at > Utc::now() {
             refresh_session(state, session_id, session.refresh_token.expose_secret())
                 .await
-                .ok_or(ProxyError::Unauthenticated)?
+                .ok_or(ProxyServiceError::Unauthenticated)?
         } else {
-            return Err(ProxyError::Unauthenticated);
+            return Err(ProxyServiceError::Unauthenticated);
         };
 
         Ok(session.access_token)

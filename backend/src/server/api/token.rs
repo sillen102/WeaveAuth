@@ -5,14 +5,17 @@ mod controller {
     use aide::transform::TransformOperation;
     use axum::Json;
     use axum::extract::{Form, State};
+    use axum::http::StatusCode;
     use common::model::token::GrantType;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
-    use super::service::{self, AuthorizationCodeGrant};
-    pub(crate) use super::service::{TokenError, TokenResponse};
+    use super::service::{self, AuthorizationCodeGrant, TokenServiceError};
+    pub(crate) use super::service::TokenResponse;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct TokenRequest {
@@ -21,6 +24,61 @@ mod controller {
         pub(super) code_verifier: Option<String>,
         pub(super) redirect_uri: Option<String>,
         pub(super) refresh_token: Option<String>,
+    }
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum TokenError {
+        #[error("invalid or expired code")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired code")]
+        InvalidCode,
+        #[error("redirect uri does not match the one the code was issued for")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "redirect uri does not match the one the code was issued for"
+        )]
+        RedirectUriMismatch,
+        #[error("code verifier does not match the code challenge")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "code verifier does not match the code challenge"
+        )]
+        InvalidCodeVerifier,
+        #[error("required parameters for this grant_type are missing")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "required parameters for this grant_type are missing"
+        )]
+        MissingParameters,
+        #[error("invalid or expired refresh token")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired refresh token")]
+        InvalidRefreshToken,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
+    }
+
+    impl From<TokenServiceError> for TokenError {
+        fn from(err: TokenServiceError) -> Self {
+            match err {
+                TokenServiceError::InvalidCode => TokenError::InvalidCode,
+                TokenServiceError::RedirectUriMismatch => TokenError::RedirectUriMismatch,
+                TokenServiceError::InvalidCodeVerifier => TokenError::InvalidCodeVerifier,
+                TokenServiceError::MissingParameters => TokenError::MissingParameters,
+                TokenServiceError::InvalidRefreshToken => TokenError::InvalidRefreshToken,
+                TokenServiceError::UnexpectedError => TokenError::UnexpectedError,
+            }
+        }
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn issue_token_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("token")
+            .summary("Exchange an authorization code for tokens")
+            .description(
+                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
+                 and that redirect_uri matches the one the code was issued for",
+            )
     }
 
     pub(crate) async fn issue_token(
@@ -43,26 +101,13 @@ mod controller {
         };
         Ok(Json(response))
     }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn issue_token_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("token")
-            .summary("Exchange an authorization code for tokens")
-            .description(
-                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
-                 and that redirect_uri matches the one the code was issued for",
-            )
-    }
 }
 
 mod service {
-    use axum::http::StatusCode;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Duration, Utc};
     use common::model::token::TokenType;
-    use common_macros::ErrorResponses;
     use jsonwebtoken::{Algorithm, Header};
     use rand::RngExt;
     use schemars::JsonSchema;
@@ -73,6 +118,22 @@ mod service {
 
     use crate::server::AppState;
     use crate::storage::{JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage};
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum TokenServiceError {
+        #[error("invalid or expired code")]
+        InvalidCode,
+        #[error("redirect uri does not match the one the code was issued for")]
+        RedirectUriMismatch,
+        #[error("code verifier does not match the code challenge")]
+        InvalidCodeVerifier,
+        #[error("required parameters for this grant_type are missing")]
+        MissingParameters,
+        #[error("invalid or expired refresh token")]
+        InvalidRefreshToken,
+        #[error("internal error")]
+        UnexpectedError,
+    }
 
     /// Access token claims (RFC 7519).
     #[derive(Serialize)]
@@ -107,60 +168,29 @@ mod service {
         pub(crate) user_id: Uuid,
     }
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum TokenError {
-        #[error("invalid or expired code")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired code")]
-        InvalidCode,
-        #[error("redirect uri does not match the one the code was issued for")]
-        #[error_response(
-            StatusCode::BAD_REQUEST,
-            details = "redirect uri does not match the one the code was issued for"
-        )]
-        RedirectUriMismatch,
-        #[error("code verifier does not match the code challenge")]
-        #[error_response(
-            StatusCode::BAD_REQUEST,
-            details = "code verifier does not match the code challenge"
-        )]
-        InvalidCodeVerifier,
-        #[error("required parameters for this grant_type are missing")]
-        #[error_response(
-            StatusCode::BAD_REQUEST,
-            details = "required parameters for this grant_type are missing"
-        )]
-        MissingParameters,
-        #[error("invalid or expired refresh token")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired refresh token")]
-        InvalidRefreshToken,
-        #[error("internal error")]
-        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
-        UnexpectedError,
-    }
-
     pub(crate) async fn issue_token_for_authorization_code(
         state: &mut AppState,
         grant: Option<AuthorizationCodeGrant>,
-    ) -> Result<TokenResponse, TokenError> {
+    ) -> Result<TokenResponse, TokenServiceError> {
         let AuthorizationCodeGrant { code, code_verifier, redirect_uri } =
-            grant.ok_or(TokenError::MissingParameters)?;
+            grant.ok_or(TokenServiceError::MissingParameters)?;
 
         let (challenge, _method, issued_redirect_uri, user_id) = state
             .pkce
             .take_code_challenge(&code)
             .await
-            .ok_or(TokenError::InvalidCode)?;
+            .ok_or(TokenServiceError::InvalidCode)?;
 
         // Binds the code to the redirect_uri it was issued for (RFC 6749
         // 4.1.3) -- without this, a code obtained for one redirect_uri
         // could be redeemed while claiming a different one.
         if redirect_uri != issued_redirect_uri {
-            return Err(TokenError::RedirectUriMismatch);
+            return Err(TokenServiceError::RedirectUriMismatch);
         }
 
         let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
         if computed != challenge {
-            return Err(TokenError::InvalidCodeVerifier);
+            return Err(TokenServiceError::InvalidCodeVerifier);
         }
 
         issue_tokens(state, user_id, Uuid::new_v4()).await
@@ -169,8 +199,8 @@ mod service {
     pub(crate) async fn issue_token_for_refresh_token(
         state: &mut AppState,
         refresh_token: Option<String>,
-    ) -> Result<TokenResponse, TokenError> {
-        let refresh_token = refresh_token.ok_or(TokenError::MissingParameters)?;
+    ) -> Result<TokenResponse, TokenServiceError> {
+        let refresh_token = refresh_token.ok_or(TokenServiceError::MissingParameters)?;
 
         match state.refresh_tokens.take_refresh_token(&refresh_token).await {
             RefreshTokenOutcome::Valid { user_id, family_id } => issue_tokens(state, user_id, family_id).await,
@@ -178,7 +208,7 @@ mod service {
             // whole family as a side effect. Wrong/unknown token: same
             // client-facing error either way, so the response doesn't
             // leak which case it was.
-            RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => Err(TokenError::InvalidRefreshToken),
+            RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => Err(TokenServiceError::InvalidRefreshToken),
         }
     }
 
@@ -189,8 +219,8 @@ mod service {
         state: &mut AppState,
         user_id: Uuid,
         family_id: Uuid,
-    ) -> Result<TokenResponse, TokenError> {
-        let user = state.users.get_user_by_id(user_id).await.ok_or(TokenError::UnexpectedError)?;
+    ) -> Result<TokenResponse, TokenServiceError> {
+        let user = state.users.get_user_by_id(user_id).await.ok_or(TokenServiceError::UnexpectedError)?;
 
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
@@ -206,7 +236,7 @@ mod service {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(signing_key.kid.clone());
         let access_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key)
-            .map_err(|_| TokenError::UnexpectedError)?;
+            .map_err(|_| TokenServiceError::UnexpectedError)?;
 
         let mut token_bytes = [0u8; 32];
         rand::rng().fill(&mut token_bytes);
