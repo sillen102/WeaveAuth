@@ -9,11 +9,13 @@ mod controller {
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
     use super::service;
-    pub(crate) use super::service::RegisterError;
+    use super::service::RegisterServiceError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
@@ -26,45 +28,6 @@ mod controller {
         #[serde(flatten)]
         pub(super) extra: HashMap<String, String>,
     }
-
-    pub(crate) async fn register(
-        State(mut state): State<AppState>,
-        Json(req): Json<RegisterRequest>,
-    ) -> Result<StatusCode, RegisterError> {
-        service::register(&mut state, req.email, req.password.into(), req.extra).await?;
-        Ok(StatusCode::CREATED)
-    }
-
-    // OpenAPI documentation for this route.
-    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
-        op.tag("Auth")
-            .id("register")
-            .summary("Register a new user")
-            .description(
-                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
-                 valid address, 409 if it's already taken. Any fields beyond email/password are \
-                 forwarded to the deployer's configured extra-data handler -- 400 if none is \
-                 configured, 502 if the handler rejects the registration.",
-            )
-    }
-}
-
-mod service {
-    use axum::http::StatusCode;
-    use chrono::Utc;
-    use email_address::EmailAddress;
-    use std::collections::HashMap;
-    use thiserror::Error;
-    use uuid::Uuid;
-    use common_macros::ErrorResponses;
-
-    use secrecy::SecretString;
-
-    use crate::crypto;
-    use crate::model::email::normalize_email;
-    use crate::model::user::{PasswordHash, User};
-    use crate::server::AppState;
-    use crate::storage::{CreateUserOutcome, UserStorage};
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum RegisterError {
@@ -88,6 +51,72 @@ mod service {
         UnexpectedError,
     }
 
+    impl From<RegisterServiceError> for RegisterError {
+        fn from(err: RegisterServiceError) -> Self {
+            match err {
+                RegisterServiceError::InvalidEmail => RegisterError::InvalidEmail,
+                RegisterServiceError::EmailTaken => RegisterError::EmailTaken,
+                RegisterServiceError::ExtraDataNotSupported => RegisterError::ExtraDataNotSupported,
+                RegisterServiceError::ExtraDataTooLarge => RegisterError::ExtraDataTooLarge,
+                RegisterServiceError::DownstreamServiceFailed => RegisterError::DownstreamServiceFailed,
+                RegisterServiceError::UnexpectedError => RegisterError::UnexpectedError,
+            }
+        }
+    }
+
+    // OpenAPI documentation for this route.
+    pub(crate) fn register_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("register")
+            .summary("Register a new user")
+            .description(
+                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
+                 valid address, 409 if it's already taken. Any fields beyond email/password are \
+                 forwarded to the deployer's configured extra-data handler -- 400 if none is \
+                 configured, 502 if the handler rejects the registration.",
+            )
+    }
+
+    pub(crate) async fn register(
+        State(mut state): State<AppState>,
+        Json(req): Json<RegisterRequest>,
+    ) -> Result<StatusCode, RegisterError> {
+        service::register(&mut state, req.email, req.password.into(), req.extra).await?;
+        Ok(StatusCode::CREATED)
+    }
+}
+
+mod service {
+    use chrono::Utc;
+    use email_address::EmailAddress;
+    use std::collections::HashMap;
+    use thiserror::Error;
+    use uuid::Uuid;
+
+    use secrecy::SecretString;
+
+    use crate::crypto;
+    use crate::model::email::normalize_email;
+    use crate::model::user::{PasswordHash, User};
+    use crate::server::AppState;
+    use crate::storage::{CreateUserOutcome, UserStorage};
+
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum RegisterServiceError {
+        #[error("invalid email address")]
+        InvalidEmail,
+        #[error("email already taken")]
+        EmailTaken,
+        #[error("extra registration fields are not supported by this deployment")]
+        ExtraDataNotSupported,
+        #[error("too many extra registration fields, or a field is too large")]
+        ExtraDataTooLarge,
+        #[error("downstream extra-data handler rejected the registration")]
+        DownstreamServiceFailed,
+        #[error("internal error")]
+        UnexpectedError,
+    }
+
     /// Bounds on extra registration fields, checked before anything else
     /// touches them (handler dispatch, storage) -- otherwise a single
     /// request could hand an unbounded number/size of fields to a webhook or
@@ -100,19 +129,19 @@ mod service {
         email: String,
         password: SecretString,
         extra: HashMap<String, String>,
-    ) -> Result<(), RegisterError> {
+    ) -> Result<(), RegisterServiceError> {
         if extra.len() > MAX_EXTRA_FIELDS
             || extra.iter().any(|(key, value)| key.len() > MAX_EXTRA_FIELD_LEN || value.len() > MAX_EXTRA_FIELD_LEN)
         {
-            return Err(RegisterError::ExtraDataTooLarge);
+            return Err(RegisterServiceError::ExtraDataTooLarge);
         }
 
         let email = normalize_email(&email);
         if !EmailAddress::is_valid(&email) {
-            return Err(RegisterError::InvalidEmail);
+            return Err(RegisterServiceError::InvalidEmail);
         }
 
-        let password_hash = crypto::hash_password(password).await.map_err(|_| RegisterError::UnexpectedError)?;
+        let password_hash = crypto::hash_password(password).await.map_err(|_| RegisterServiceError::UnexpectedError)?;
 
         // Generated up front (rather than left to storage) so it can be
         // handed to the extra-data handler before the user is created --
@@ -131,14 +160,14 @@ mod service {
             // the user; `create_user`'s atomic check-and-insert still
             // guarantees only one of them ends up with an account.
             if state.users.get_user_by_email(&email).await.is_some() {
-                return Err(RegisterError::EmailTaken);
+                return Err(RegisterServiceError::EmailTaken);
             }
 
-            let handler = state.extra_data_handler.as_ref().ok_or(RegisterError::ExtraDataNotSupported)?;
+            let handler = state.extra_data_handler.as_ref().ok_or(RegisterServiceError::ExtraDataNotSupported)?;
             handler
                 .handle(user_id, &email, &extra)
                 .await
-                .map_err(|_| RegisterError::DownstreamServiceFailed)?;
+                .map_err(|_| RegisterServiceError::DownstreamServiceFailed)?;
         }
 
         let now = Utc::now();
@@ -159,7 +188,7 @@ mod service {
 
         match outcome {
             CreateUserOutcome::Created => Ok(()),
-            CreateUserOutcome::EmailTaken => Err(RegisterError::EmailTaken),
+            CreateUserOutcome::EmailTaken => Err(RegisterServiceError::EmailTaken),
         }
     }
 }

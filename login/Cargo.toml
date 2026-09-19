@@ -5,13 +5,13 @@ edition = "2021"
 
 [dependencies]
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower-http = { workspace = true, features = ["fs"] }
-serde = { workspace = true }
-figment = { workspace = true }
-tera = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+figment = { workspace = true, features = ["yaml", "env", "test"] }
+tera = { workspace = true, features = ["glob_fs"] }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 
 [dev-dependencies]
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }

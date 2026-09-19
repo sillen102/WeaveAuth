@@ -10,11 +10,13 @@ mod controller {
     use axum::Json;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
     use super::service;
-    pub(crate) use super::service::PasswordResetConfirmError;
+    use super::service::PasswordResetConfirmServiceError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct PasswordResetRequestRequest {
@@ -27,20 +29,23 @@ mod controller {
         pub(super) new_password: String,
     }
 
-    pub(crate) async fn request_password_reset(
-        State(mut state): State<AppState>,
-        Json(req): Json<PasswordResetRequestRequest>,
-    ) -> StatusCode {
-        service::request_password_reset(&mut state, &req.email).await;
-        StatusCode::ACCEPTED
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum PasswordResetConfirmError {
+        #[error("invalid or expired password reset token")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired password reset token")]
+        InvalidOrExpiredToken,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
     }
 
-    pub(crate) async fn confirm_password_reset(
-        State(mut state): State<AppState>,
-        Json(req): Json<PasswordResetConfirmRequest>,
-    ) -> Result<StatusCode, PasswordResetConfirmError> {
-        service::confirm_password_reset(&mut state, &req.token, req.new_password.into()).await?;
-        Ok(StatusCode::OK)
+    impl From<PasswordResetConfirmServiceError> for PasswordResetConfirmError {
+        fn from(err: PasswordResetConfirmServiceError) -> Self {
+            match err {
+                PasswordResetConfirmServiceError::InvalidOrExpiredToken => PasswordResetConfirmError::InvalidOrExpiredToken,
+                PasswordResetConfirmServiceError::UnexpectedError => PasswordResetConfirmError::UnexpectedError,
+            }
+        }
     }
 
     pub(crate) fn request_password_reset_doc(op: TransformOperation) -> TransformOperation {
@@ -65,13 +70,27 @@ mod controller {
                  token is unknown, expired, or already used.",
             )
     }
+
+    pub(crate) async fn request_password_reset(
+        State(mut state): State<AppState>,
+        Json(req): Json<PasswordResetRequestRequest>,
+    ) -> StatusCode {
+        service::request_password_reset(&mut state, &req.email).await;
+        StatusCode::ACCEPTED
+    }
+
+    pub(crate) async fn confirm_password_reset(
+        State(mut state): State<AppState>,
+        Json(req): Json<PasswordResetConfirmRequest>,
+    ) -> Result<StatusCode, PasswordResetConfirmError> {
+        service::confirm_password_reset(&mut state, &req.token, req.new_password.into()).await?;
+        Ok(StatusCode::OK)
+    }
 }
 
 mod service {
-    use axum::http::StatusCode;
     use secrecy::SecretString;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::crypto;
     use crate::model::email::normalize_email;
@@ -82,13 +101,11 @@ mod service {
         SetPasswordOutcome, UserStorage,
     };
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum PasswordResetConfirmError {
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum PasswordResetConfirmServiceError {
         #[error("invalid or expired password reset token")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired password reset token")]
         InvalidOrExpiredToken,
         #[error("internal error")]
-        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
         UnexpectedError,
     }
 
@@ -116,12 +133,12 @@ mod service {
         state: &mut AppState,
         token: &str,
         new_password: SecretString,
-    ) -> Result<(), PasswordResetConfirmError> {
+    ) -> Result<(), PasswordResetConfirmServiceError> {
         let user_id = state
             .password_reset_tokens
             .take_reset_token(token)
             .await
-            .ok_or(PasswordResetConfirmError::InvalidOrExpiredToken)?;
+            .ok_or(PasswordResetConfirmServiceError::InvalidOrExpiredToken)?;
 
         // A password reset is the standard remediation for "my account may
         // be compromised" -- that only actually remediates anything if it
@@ -138,7 +155,7 @@ mod service {
 
         let password_hash = crypto::hash_password(new_password)
             .await
-            .map_err(|_| PasswordResetConfirmError::UnexpectedError)?;
+            .map_err(|_| PasswordResetConfirmServiceError::UnexpectedError)?;
 
         match state.users.set_password(user_id, PasswordHash::Argon2(password_hash.into())).await {
             SetPasswordOutcome::Ok => {}
@@ -147,7 +164,7 @@ mod service {
             // but report it as the same not-found-shaped error rather than a
             // 500, since from the caller's perspective the token just doesn't
             // resolve to anything anymore.
-            SetPasswordOutcome::UserNotFound => return Err(PasswordResetConfirmError::InvalidOrExpiredToken),
+            SetPasswordOutcome::UserNotFound => return Err(PasswordResetConfirmServiceError::InvalidOrExpiredToken),
         }
 
         revoke_everything_for(state, user_id).await?;
@@ -155,12 +172,12 @@ mod service {
         Ok(())
     }
 
-    async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmError> {
+    async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmServiceError> {
         if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmError::UnexpectedError);
+            return Err(PasswordResetConfirmServiceError::UnexpectedError);
         }
         if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmError::UnexpectedError);
+            return Err(PasswordResetConfirmServiceError::UnexpectedError);
         }
         Ok(())
     }

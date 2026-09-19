@@ -3,6 +3,7 @@ monorepo_root = true
 [tools]
 rust = "1.98"
 "cargo:cargo-mutants" = "latest"
+"cargo:cargo-crap" = "latest"
 
 [monorepo]
 config_roots = [

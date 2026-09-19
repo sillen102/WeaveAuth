@@ -4,14 +4,16 @@ pub(crate) use controller::login_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use axum::extract::State;
+    use axum::http::StatusCode;
     use axum::Json;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
     use super::service;
-    pub(crate) use super::service::LoginError;
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
@@ -25,12 +27,23 @@ mod controller {
         pub(super) login_session: String,
     }
 
-    pub(crate) async fn login(
-        State(mut state): State<AppState>,
-        Json(req): Json<LoginRequest>,
-    ) -> Result<Json<LoginResponse>, LoginError> {
-        let login_session = service::login(&mut state, &req.email, req.password.into()).await?;
-        Ok(Json(LoginResponse { login_session }))
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    pub(crate) enum LoginError {
+        #[error("invalid credentials")]
+        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid credentials")]
+        InvalidCredentials,
+        #[error("internal error")]
+        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
+        UnexpectedError,
+    }
+
+    impl From<service::LoginServiceError> for LoginError {
+        fn from(err: service::LoginServiceError) -> Self {
+            match err {
+                service::LoginServiceError::InvalidCredentials => LoginError::InvalidCredentials,
+                service::LoginServiceError::UnexpectedError => LoginError::UnexpectedError,
+            }
+        }
     }
 
     // OpenAPI documentation for this route.
@@ -45,13 +58,19 @@ mod controller {
                  regardless of what order a caller invokes the two endpoints in",
             )
     }
+
+    pub(crate) async fn login(
+        State(mut state): State<AppState>,
+        Json(req): Json<LoginRequest>,
+    ) -> Result<Json<LoginResponse>, LoginError> {
+        let login_session = service::login(&mut state, &req.email, req.password.into()).await?;
+        Ok(Json(LoginResponse { login_session }))
+    }
 }
 
 mod service {
-    use axum::http::StatusCode;
     use secrecy::SecretString;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::crypto;
     use crate::model::email::normalize_email;
@@ -73,13 +92,11 @@ mod service {
     /// at build time or once at first request.
     const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$+asaoNd4judQBozzpttaCQ$WFrspw+VJ+HAPOXqRwravZFYap0GT3yyfgRf5ZVv6qc";
 
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    pub(crate) enum LoginError {
+    #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum LoginServiceError {
         #[error("invalid credentials")]
-        #[error_response(StatusCode::UNAUTHORIZED, details = "invalid credentials")]
         InvalidCredentials,
         #[error("internal error")]
-        #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
         UnexpectedError,
     }
 
@@ -87,7 +104,7 @@ mod service {
         state: &mut AppState,
         email: &str,
         password: SecretString,
-    ) -> Result<String, LoginError> {
+    ) -> Result<String, LoginServiceError> {
         let user = state.users.get_user_by_email(&normalize_email(email)).await;
 
         // Hash even for an unknown email (DUMMY_PASSWORD_HASH) so timing can't enumerate registered emails.
@@ -97,11 +114,11 @@ mod service {
             .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.into()));
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
-            Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginError::InvalidCredentials),
-            Err(_) => return Err(LoginError::UnexpectedError),
+            Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginServiceError::InvalidCredentials),
+            Err(_) => return Err(LoginServiceError::UnexpectedError),
         }
 
-        let user = user.ok_or(LoginError::InvalidCredentials)?;
+        let user = user.ok_or(LoginServiceError::InvalidCredentials)?;
 
         if matches!(user.password, Some(PasswordHash::Bcrypt(_))) {
             crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
