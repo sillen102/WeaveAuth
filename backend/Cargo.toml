@@ -32,12 +32,13 @@ jsonwebtoken = { workspace = true , features = ["rust_crypto"] }
 openidconnect = { workspace = true, features = ["reqwest", "native-tls"] }
 rsa = { workspace = true, features = ["pem"] }
 email_address = { workspace = true }
+native-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-extism = { version = "1", default-features = false, features = ["wasmtime-default-features"] }
-async-trait = "0.1"
+extism = { workspace = true, features = ["wasmtime-default-features"] }
+async-trait = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
-wiremock = "0.6"
-wat = "1"
+wiremock = { workspace = true }
+wat = { workspace = true }

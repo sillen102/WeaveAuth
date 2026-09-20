@@ -14,8 +14,10 @@ opt-level = 0
 axum = "0.8"
 aide = "0.16.0-alpha.4"
 schemars = "1.2"
+async-trait = "0.1"
 argon2 = "0.6"
 bcrypt = "0.19"
+extism = { version = "1", default-features = false }
 jsonwebtoken = "11.1"
 openidconnect = { version = "4.0", default-features = false }
 rsa = "0.9"
@@ -40,9 +42,11 @@ base64 = "0.23"
 rand = "0.10"
 strum = "0.28"
 email_address = "0.2"
+native-tls = "0.2"
 tera = "2"
 secrecy = "0.10"
 
 # Test utilities
 tower = "0.5"
 wiremock = "0.6"
+wat = "1"

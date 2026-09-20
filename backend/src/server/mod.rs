@@ -1,5 +1,6 @@
-use crate::config::{Config, ExtraDataHandlerConfig};
+use crate::config::{Config, ExtraDataHandlerConfig, PluginSocketsConfig};
 use crate::extra_data::{ExtraDataHandler, WasmHandler, WebhookHandler};
+use crate::plugin::{PluginLimits, SocketHost, WasmPlugin, parse_endpoint};
 use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
@@ -85,16 +86,33 @@ fn build_extra_data_handler(
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
             Arc::new(WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
-        Some(ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb }) => {
-            let wasm_bytes = std::fs::read(path)?;
-            Arc::new(WasmHandler::load(
-                wasm_bytes,
-                std::time::Duration::from_secs(*timeout_secs),
-                *memory_max_mb,
-            )?)
+        Some(ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb, allowed_hosts, sockets }) => {
+            let limits = PluginLimits {
+                timeout: Duration::from_secs(*timeout_secs),
+                memory_max_mb: *memory_max_mb,
+                allowed_hosts: allowed_hosts.clone(),
+            };
+            let plugin = WasmPlugin::load(std::fs::read(path)?, &limits, build_socket_host(sockets.as_ref())?)?;
+            Arc::new(WasmHandler::new(Arc::new(plugin)))
         }
     };
     Ok(Some(handler))
+}
+
+fn build_socket_host(config: Option<&PluginSocketsConfig>) -> anyhow::Result<Option<Arc<SocketHost>>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if config.allowed.is_empty() {
+        anyhow::bail!("plugin socket capability is configured with an empty allowlist; remove `sockets` to disable it");
+    }
+    let allowed = config.allowed.iter().map(|raw| parse_endpoint(raw)).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Some(Arc::new(SocketHost::new(
+        allowed,
+        config.max_idle_per_endpoint,
+        Duration::from_millis(config.idle_timeout_ms),
+        Duration::from_millis(config.io_timeout_ms),
+    ))))
 }
 
 pub async fn app_start(config: &Config) -> anyhow::Result<()> {
@@ -122,4 +140,41 @@ fn spawn_expiry_sweep(mut state: AppState, interval: Duration) {
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.
 pub async fn app(config: &Config) -> anyhow::Result<axum::Router> {
     Ok(router(AppState::new(config).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sockets(allowed: Vec<&str>) -> PluginSocketsConfig {
+        PluginSocketsConfig {
+            allowed: allowed.into_iter().map(str::to_string).collect(),
+            max_idle_per_endpoint: 8,
+            idle_timeout_ms: 30_000,
+            io_timeout_ms: 2_000,
+        }
+    }
+
+    // An empty allowlist would otherwise grant the socket imports with
+    // nothing reachable through them -- a deployer who meant "allow
+    // everything" must not get a silently working plugin either way.
+    #[test]
+    fn refuses_a_socket_capability_with_an_empty_allowlist() {
+        assert!(build_socket_host(Some(&sockets(vec![]))).is_err());
+    }
+
+    #[test]
+    fn refuses_a_socket_capability_with_a_malformed_endpoint() {
+        assert!(build_socket_host(Some(&sockets(vec!["db:5432", "rabbit"]))).is_err());
+    }
+
+    #[test]
+    fn builds_a_socket_host_from_valid_endpoints() {
+        assert!(build_socket_host(Some(&sockets(vec!["db:5432"]))).expect("builds").is_some());
+    }
+
+    #[test]
+    fn grants_no_socket_host_when_the_capability_is_not_configured() {
+        assert!(build_socket_host(None).expect("builds").is_none());
+    }
 }

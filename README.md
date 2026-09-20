@@ -259,6 +259,20 @@ redirect_uri_allowlist:
   - http://localhost:8081/
 ```
 
+backend's `extra_data_handler` is YAML-only too. It decides what happens to fields a
+register request carries beyond `email`/`password`: `kind: webhook` POSTs them to a URL,
+`kind: wasm` calls a WASM module the deployer mounts. The plugin runtime is generic —
+sandboxed, no network unless the deployer grants an HTTP or raw-TCP allowlist, and
+reusable from other flows. See **[docs/plugins.md](docs/plugins.md)**.
+
+```yaml
+extra_data_handler:
+  kind: wasm
+  path: /plugins/register.wasm
+  sockets:
+    allowed: ["db:5432"]
+```
+
 ### Test doubles (`testing/`)
 
 Two standalone Rust binaries (own `Cargo.toml` with an empty `[workspace]` table each,
