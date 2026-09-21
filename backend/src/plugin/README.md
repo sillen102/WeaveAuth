@@ -139,7 +139,38 @@ Invariants worth not breaking:
    `CallScope`, and bound every allocation the plugin can influence.
 5. Document the ABI in `docs/plugins.md`.
 
-Run `mise run mutants -- -p weaveauth --file backend/src/plugin/<file>.rs`
-afterwards. Note it shares `~/.cargo-target-shared` with everything else, so a
+## Tests
+
+| where | covers | needs |
+| --- | --- | --- |
+| `sockets.rs` unit tests | `CallScope` and the pool, driven directly | — |
+| `system-tests/tests/plugin_socket_flow.rs` | a real WASM plugin through backend's real `POST /register`, against a stand-in server | the `wasm32-unknown-unknown` target |
+| `system-tests/tests/plugin_postgres_flow.rs` | the same plugin against a real Postgres | Docker, `--features docker` |
+
+The plugin is
+[`system-tests/tests/fixtures/plugins/pg-probe`](../../../system-tests/tests/fixtures/plugins/), built from
+source by the test. It takes its socket wrappers as a path dependency on
+[`plugin-sdk/rust`](../../../plugin-sdk/) (crate `weaveauth-plugin-sdk`), so
+the SDK is covered too — which is otherwise the one part of this feature
+nothing would exercise.
+
+```bash
+cargo test                  # unit + the stand-in system tests
+mise run test-docker        # adds the real Postgres layer
+```
+
+A change to the socket ABI should show up in all three. The stand-in server
+only implements what `pg-probe` sends, so teaching the plugin a new message
+means teaching the stand-in to answer it.
+
+## Mutation testing
+
+Not part of the per-change loop — see the repo `AGENTS.md`. When a deeper
+pass is warranted here (the sandbox limits and the allowlist are the parts
+worth it):
+
+```bash
+mise run mutants -- -p weaveauth --file backend/src/plugin/sockets.rs
+``` Note it shares `~/.cargo-target-shared` with everything else, so a
 concurrent `cargo test` will link against mutated artifacts and fail
 spuriously — use `CARGO_TARGET_DIR=/tmp/…` while it runs.

@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Tests that need a Docker daemon: they run a real Postgres via
+# testcontainers. Off by default so `cargo test` stays runnable without it.
+docker = ["dep:testcontainers", "dep:tokio-postgres"]
+
+[dependencies]
+testcontainers = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+
 [dev-dependencies]
 weaveauth = { path = "../backend" }
 weaveauth-bff = { path = "../bff" }

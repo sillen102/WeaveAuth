@@ -1,9 +1,8 @@
 //! Socket capability wrappers for a WeaveAuth plugin written in Rust.
 //!
-//! Copy this file into your plugin crate. It turns the four JSON/base64
-//! imports into ordinary functions, so your plugin only writes protocol.
-//!
-//! Requires `extism-pdk`, `serde`, `serde_json` and `base64`.
+//! Depend on this crate (`weaveauth-plugin-sdk`, path or git dependency --
+//! it isn't published). It turns the four JSON/base64 imports into ordinary
+//! functions, so your plugin only writes protocol.
 
 use base64::Engine;
 use extism_pdk::*;

@@ -1,7 +1,8 @@
 // Package weaveauth wraps the socket capability a WeaveAuth plugin is granted.
 //
-// Copy this file into your plugin module. It turns the four JSON/base64
-// imports into ordinary functions, so your plugin only writes protocol.
+// Import it as github.com/sillen102/WeaveAuth/plugin-sdk/go. It turns the
+// four JSON/base64 imports into ordinary functions, so your plugin only
+// writes protocol.
 //
 // Requires github.com/extism/go-pdk, and TinyGo to build.
 package weaveauth

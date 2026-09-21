@@ -162,6 +162,12 @@ impl SocketHost {
         idle.retain(|_, slots| !slots.is_empty());
     }
 
+    /// How many connections are currently pooled, across every endpoint.
+    #[cfg(test)]
+    pub(crate) fn pooled_count(&self) -> usize {
+        self.idle.lock().expect("pool is not poisoned").values().map(Vec::len).sum()
+    }
+
     fn checkout(&self, host: &str, port: u16, tls: bool, budget: Duration) -> Result<(Conn, bool), SocketError> {
         if !self.allowed.iter().any(|(allowed, allowed_port)| allowed == host && *allowed_port == port) {
             return Err(SocketError::new(
@@ -551,10 +557,6 @@ mod tests {
         ("127.0.0.1".to_string(), port)
     }
 
-    fn pooled(host: &SocketHost) -> usize {
-        host.idle.lock().expect("pool is not poisoned").values().map(Vec::len).sum()
-    }
-
     fn host(allowed: Vec<(String, u16)>, idle_timeout: Duration) -> Arc<SocketHost> {
         Arc::new(SocketHost::new(allowed, limits(idle_timeout)))
     }
@@ -847,7 +849,7 @@ mod tests {
             scope.release(handle, true).expect("releases");
         });
 
-        assert_eq!(pooled(&host), 0, "a connection an operation failed on was handed back to the pool");
+        assert_eq!(host.pooled_count(), 0, "a connection an operation failed on was handed back to the pool");
     }
 
     // Positive control for the test above: a connection nothing failed on
@@ -863,7 +865,7 @@ mod tests {
             scope.release(handle, true).expect("releases");
         });
 
-        assert_eq!(pooled(&host), 1);
+        assert_eq!(host.pooled_count(), 1);
     }
 
     #[test]
@@ -897,7 +899,7 @@ mod tests {
         });
         host.sweep_idle();
 
-        assert_eq!(pooled(&host), 1);
+        assert_eq!(host.pooled_count(), 1);
     }
 
     #[test]

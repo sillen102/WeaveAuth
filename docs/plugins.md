@@ -87,7 +87,7 @@ dead peer is the plugin's to handle. `code` is the stable part
 (`not_allowed`, `timeout`, `unknown_handle`, `too_many_connections`,
 `bad_request`, `unavailable`, `io`); branch on it, not on the message.
 
-Copy-in wrappers for Rust and Go live in [`plugin-sdk/`](../plugin-sdk/).
+Rust and Go wrappers live in [`plugin-sdk/`](../plugin-sdk/), as a crate and a module you depend on rather than files you copy.
 
 | import | request | response on success |
 | --- | --- | --- |
@@ -133,6 +133,13 @@ if fresh {
 - A single `sock_read` returns at most 1MB regardless of the `max` requested.
 - Idle connections are swept on the same interval as the TTL'd stores, so an
   endpoint that stops being used doesn't hold its sockets open.
+
+## A worked example
+
+[`system-tests/tests/fixtures/plugins/pg-probe`](../system-tests/tests/fixtures/plugins/) is a complete plugin that
+talks to a real Postgres through the socket capability. The system tests build and run
+it, against a stand-in server by default and against a real Postgres under
+`mise run test-docker`, so it stays in step with the ABI above.
 
 ## Security
 

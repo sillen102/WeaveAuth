@@ -69,8 +69,15 @@ feature works at all.
 - For security-relevant behavior, record the mutation and the test that caught it in the
   commit body, so a reviewer can see the test was verified rather than assumed.
 
-`cargo-mutants` is the standard tool for this (already installed) — use it instead of
-manual mutation for new/changed tests:
+`cargo-mutants` (already installed) does the same thing exhaustively. **It is not part
+of the per-change loop** — a scoped run is minutes and a crate-wide one is far worse, so
+it is run deliberately, not by default. The manual check above is what every behavior
+change gets; reach for `cargo-mutants` when the extra minutes are worth it:
+
+- before shipping security-relevant behavior (auth, tokens, allowlists, sandbox limits),
+- when a piece of logic is dense enough that picking one mutation by hand won't cover it,
+- when a reviewer or the author doubts a test is doing anything,
+- on request.
 
 - Run via `mise run mutants -- -p weaveauth` (backend's package name; or `-p
   weaveauth-bff`/`-p weaveauth-login`) from the repo root. Everything after `--` is
@@ -84,10 +91,14 @@ manual mutation for new/changed tests:
   per-mutant savings) — not worth the complexity.
 - It builds each mutant, runs the test suite, and reports mutants that survived (no
   test failed) vs. caught. A surviving mutant means a real gap in coverage.
-- Run it after adding/changing tests for a behavior change, scoped to the touched
-  file(s); fix surviving mutants by strengthening the test, not the implementation.
-- Slow on a full crate (rebuild + test run per mutant); prefer `--file` scoping over a
-  workspace-wide run.
+- Always scope it to the touched file(s); fix surviving mutants by strengthening the
+  test, not the implementation.
+- Slow on a full crate (rebuild + test run per mutant) — a workspace-wide run is not
+  worth starting without a reason.
+- It writes into the same build directory as everything else (`~/.cargo/config.toml`
+  sets one shared `target-dir`), so a `cargo test` running alongside it can link against
+  a *mutated* artifact and fail for no reason. Don't run the two at once; if you must,
+  give the other one `CARGO_TARGET_DIR=/tmp/…`.
 - `.cargo/mutants.toml` excludes each crate's `main.rs` (pure startup wiring, no branches
   worth mutating) via `exclude_globs` — cargo-mutants only reads config from
   `.cargo/mutants.toml` by default, not a workspace-root `mutants.toml`.
@@ -98,8 +109,8 @@ manual mutation for new/changed tests:
   boundary); `upgrade_bcrypt_to_argon2`'s `!=`/`==` on the `set_password` outcome only
   gates a `tracing::warn!`. Record the reasoning in the commit body when leaving one
   unaddressed.
-- For security-relevant behavior, record the surviving-then-fixed mutant and the test
-  that now catches it in the commit body.
+- When a run does happen for security-relevant behavior, record the surviving-then-fixed
+  mutant and the test that now catches it in the commit body.
 
 ## Documentation
 - When a change alters a flow documented under `docs/flows/`, update that doc in the same change — it must describe the current behavior, not what it used to be.

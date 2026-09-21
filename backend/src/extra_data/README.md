@@ -164,7 +164,7 @@ Raw TCP (TLS is done host-side, so you don't carry a crypto stack into wasm).
 The protocol is yours. Four imports; see
 [`../plugin/README.md`](../plugin/README.md#socket-abi) for the full ABI, and
 [`plugin-sdk/`](../../../plugin-sdk/) for ready-made Rust and Go wrappers you
-can copy instead of writing the marshalling below by hand.
+can depend on instead of writing the marshalling below by hand.
 
 **Connections are pooled host-side and outlive your instance** — your instance
 is created per call and can't hold one. `sock_open` tells you whether you got a
@@ -244,6 +244,14 @@ Rules that bite if ignored:
   together. `io_timeout_ms` (default 2s) caps a single operation within it.
   A `timeout` code means the call is over — retrying cannot succeed.
 - A call may open at most `max_open_per_call` connections (default 8).
+
+## A worked example
+
+[`system-tests/tests/fixtures/plugins/pg-probe`](../../../system-tests/tests/fixtures/plugins/) is a complete,
+compiling plugin that does all of this against a real Postgres: it speaks the
+wire protocol over the socket capability, skips the handshake on a pooled
+connection, and releases cleanly. It's built and run by the system tests,
+so it can't rot.
 
 ## Before you ship
 

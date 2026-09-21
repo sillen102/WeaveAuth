@@ -1,16 +1,17 @@
 # plugin-sdk
 
-Copy-in wrappers for the socket capability a WeaveAuth plugin is granted.
-Drop one file into your plugin and write protocol instead of base64 and JSON.
+Wrappers for the socket capability a WeaveAuth plugin is granted. Depend on
+one and write protocol instead of base64 and JSON.
 
-| file | for |
+| module | for |
 | --- | --- |
-| `rust/sockets.rs` | a Rust plugin (`extism-pdk`, `serde`, `serde_json`, `base64`) |
-| `go/sockets.go` | a TinyGo plugin (`github.com/extism/go-pdk`) |
+| `rust/` (crate `weaveauth-plugin-sdk`) | a Rust plugin (`extism-pdk`, `serde`, `serde_json`, `base64`) |
+| `go/` (module `github.com/sillen102/WeaveAuth/plugin-sdk/go`, package `weaveauth`) | a TinyGo plugin (`github.com/extism/go-pdk`) |
 
-These are files to copy, not a published crate or module — a plugin is the
-deployer's own build, and a copied file has no version to keep in step.
-The ABI they wrap is in
+Neither is published — take a path dependency if your plugin lives in this
+repo (see `system-tests/tests/fixtures/plugins/pg-probe` for the Rust
+example), or a git dependency/`replace` directive otherwise. The ABI they
+wrap is in
 [`backend/src/plugin/README.md`](../backend/src/plugin/README.md#socket-abi);
 writing a registration plugin is in
 [`backend/src/extra_data/README.md`](../backend/src/extra_data/README.md).
