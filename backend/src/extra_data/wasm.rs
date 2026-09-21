@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{ExtraDataError, ExtraDataHandler, ExtraDataPayload};
-use crate::plugin::WasmPlugin;
+use crate::plugin::{Hook, WasmPlugin};
 
 /// The export a registration plugin has to provide. Other flows call other
 /// exports on the same module -- the runtime itself is flow-agnostic, see
@@ -16,12 +16,12 @@ const REGISTER_EXPORT: &str = "handle_registration";
 /// only needs the contract in `ExtraDataPayload` on the way in and a
 /// returning (rather than trapping) call on the way out.
 pub(crate) struct WasmHandler {
-    plugin: Arc<WasmPlugin>,
+    hook: Hook,
 }
 
 impl WasmHandler {
     pub(crate) fn new(plugin: Arc<WasmPlugin>) -> Self {
-        Self { plugin }
+        Self { hook: Hook::new(plugin, REGISTER_EXPORT) }
     }
 }
 
@@ -29,10 +29,9 @@ impl WasmHandler {
 impl ExtraDataHandler for WasmHandler {
     async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
         let payload = ExtraDataPayload { user_id, email, fields };
-        self.plugin.call(REGISTER_EXPORT, &payload).await.map(|_| ()).map_err(|error| {
-            tracing::warn!(%error, "extra-data wasm plugin call failed");
-            ExtraDataError
-        })
+        // `Hook::invoke` already logged why; registration only needs to know
+        // the handler rejected it.
+        self.hook.invoke(&payload).await.map_err(|_| ExtraDataError)
     }
 }
 

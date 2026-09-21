@@ -121,6 +121,11 @@ pub struct PluginSocketsConfig {
     /// hold one itself.
     #[serde(default = "default_socket_max_idle_per_endpoint")]
     pub max_idle_per_endpoint: usize,
+    /// How many connections one plugin call may open. Bounds the dials a
+    /// runaway plugin can aim at a downstream system inside its deadline;
+    /// `max_idle_per_endpoint` only bounds what is kept afterwards.
+    #[serde(default = "default_socket_max_open_per_call")]
+    pub max_open_per_call: usize,
     /// How long a pooled connection may sit idle before it's dropped rather
     /// than handed back -- past this the peer has likely closed it.
     #[serde(default = "default_socket_idle_timeout_ms")]
@@ -146,6 +151,10 @@ fn default_wasm_memory_max_mb() -> u32 {
 }
 
 fn default_socket_max_idle_per_endpoint() -> usize {
+    8
+}
+
+fn default_socket_max_open_per_call() -> usize {
     8
 }
 
@@ -511,6 +520,7 @@ mod tests {
                     assert_eq!(sockets.allowed, vec!["db:5432".to_string(), "rabbit:5672".to_string()]);
                     assert_eq!(sockets.io_timeout_ms, 500);
                     assert_eq!(sockets.max_idle_per_endpoint, 8);
+                    assert_eq!(sockets.max_open_per_call, 8);
                     assert_eq!(sockets.idle_timeout_ms, 30_000);
                 }
                 other => unreachable!("only a wasm handler was configured, got {other:?}"),

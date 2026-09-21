@@ -9,13 +9,14 @@
 
 pub(crate) mod sockets;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use thiserror::Error;
 
-pub(crate) use sockets::{SocketHost, parse_endpoint};
+pub(crate) use sockets::{SocketHost, SocketLimits, parse_endpoint};
 
 /// Wasm linear memory is addressed in 64KiB pages, but a deployer thinks in
 /// megabytes -- so the config takes MB and this converts.
@@ -71,6 +72,7 @@ pub(crate) struct PluginLimits {
 pub(crate) struct WasmPlugin {
     compiled: extism::CompiledPlugin,
     sockets: Option<Arc<SocketHost>>,
+    timeout: Duration,
 }
 
 impl WasmPlugin {
@@ -94,7 +96,7 @@ impl WasmPlugin {
         if sockets.is_some() {
             builder = builder.with_functions(sockets::host_functions());
         }
-        Ok(Self { compiled: builder.compile()?, sockets })
+        Ok(Self { compiled: builder.compile()?, sockets, timeout: limits.timeout })
     }
 
     /// Calls `export` with `input` serialized as JSON and returns the
@@ -112,14 +114,63 @@ impl WasmPlugin {
                 .map_err(|error| PluginError::Instantiate(error.to_string()))?;
 
             // Host functions run on this same thread, so the socket scope is
-            // installed thread-locally for the duration of the call. Dropping
-            // the guard closes whatever the plugin left open.
-            let _scope = self.sockets.as_ref().map(sockets::CallScope::enter);
+            // installed thread-locally for the duration of the call. It
+            // carries the same deadline, so host IO shares one budget with
+            // wasm execution rather than extending it. Dropping the guard
+            // closes whatever the plugin left open.
+            let _scope = self
+                .sockets
+                .as_ref()
+                .map(|sockets| sockets::CallScope::enter(sockets, self.timeout));
 
             plugin
                 .call::<&[u8], &[u8]>(export, &input)
                 .map(<[u8]>::to_vec)
                 .map_err(|error| PluginError::Call { export: export.to_string(), message: error.to_string() })
+        })
+    }
+}
+
+/// How a flow decodes what its plugin returned.
+///
+/// Only `()` -- ignore the output -- is implemented, because registration is
+/// the only caller and that is all it needs. A flow that wants data back adds
+/// its own impl here; the crate denies `dead_code`, so an unused decoder
+/// can't sit around waiting for one.
+pub(crate) trait HookOutput: Sized {
+    fn from_output(output: Vec<u8>) -> Result<Self, PluginError>;
+}
+
+impl HookOutput for () {
+    fn from_output(_: Vec<u8>) -> Result<Self, PluginError> {
+        Ok(())
+    }
+}
+
+/// One flow's plugin entry point: an export name bound to the output type
+/// that flow expects. A flow declares its hook once and calls
+/// [`Hook::invoke`], instead of repeating the call/decode/log sequence in
+/// every adapter.
+pub(crate) struct Hook<O = ()> {
+    plugin: Arc<WasmPlugin>,
+    export: &'static str,
+    _output: PhantomData<fn() -> O>,
+}
+
+impl<O: HookOutput> Hook<O> {
+    pub(crate) fn new(plugin: Arc<WasmPlugin>, export: &'static str) -> Self {
+        Self { plugin, export, _output: PhantomData }
+    }
+
+    /// Calls the plugin and decodes its output. Logs the failure here so
+    /// each flow doesn't have to, and hands back the error for the flow to
+    /// map onto its own type.
+    pub(crate) async fn invoke<I: Serialize>(&self, input: &I) -> Result<O, PluginError> {
+        let output = self.plugin.call(self.export, input).await.inspect_err(|error| {
+            tracing::warn!(%error, export = self.export, "plugin hook failed");
+        })?;
+        O::from_output(output).inspect_err(|error| {
+            tracing::warn!(%error, export = self.export, "plugin hook returned output this flow can't read");
         })
     }
 }
@@ -299,7 +350,15 @@ mod tests {
     // leave the suite green.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_plugin_importing_a_socket_runs_with_the_capability() {
-        let sockets = Arc::new(SocketHost::new(vec![], 8, Duration::from_secs(30), Duration::from_secs(2)));
+        let sockets = Arc::new(SocketHost::new(
+            vec![],
+            SocketLimits {
+                max_idle_per_endpoint: 8,
+                max_open_per_call: 8,
+                idle_timeout: Duration::from_secs(30),
+                io_timeout: Duration::from_secs(2),
+            },
+        ));
         let plugin = WasmPlugin::load(
             wat::parse_str(IMPORTS_A_SOCKET).expect("valid wat"),
             &limits(Duration::from_secs(5), 8),

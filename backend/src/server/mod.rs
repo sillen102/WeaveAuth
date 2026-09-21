@@ -1,6 +1,6 @@
 use crate::config::{Config, ExtraDataHandlerConfig, PluginSocketsConfig};
 use crate::extra_data::{ExtraDataHandler, WasmHandler, WebhookHandler};
-use crate::plugin::{PluginLimits, SocketHost, WasmPlugin, parse_endpoint};
+use crate::plugin::{PluginLimits, SocketHost, SocketLimits, WasmPlugin, parse_endpoint};
 use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
@@ -33,6 +33,9 @@ pub(crate) struct AppState {
     pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
     pub(crate) max_bcrypt_cost: u32,
     pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
+    /// Kept only so the idle connection pool gets swept; the plugin reaches
+    /// it through its host functions, not through here.
+    pub(crate) plugin_sockets: Option<Arc<SocketHost>>,
 }
 
 impl AppState {
@@ -45,6 +48,9 @@ impl AppState {
         self.oidc_state.sweep_expired().await;
         self.pending_oidc_links.sweep_expired().await;
         self.password_reset_tokens.sweep_expired().await;
+        if let Some(sockets) = &self.plugin_sockets {
+            sockets.sweep_idle();
+        }
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
@@ -56,7 +62,9 @@ impl AppState {
                 .build()?,
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
-        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref())?;
+        let mut plugin_sockets = None;
+        let extra_data_handler =
+            build_extra_data_handler(config.extra_data_handler.as_ref(), &mut plugin_sockets)?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -74,12 +82,17 @@ impl AppState {
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
             max_bcrypt_cost: config.max_bcrypt_cost,
             extra_data_handler,
+            plugin_sockets,
         })
     }
 }
 
+/// `plugin_sockets` is filled in with the socket host the handler was given,
+/// if any, so `AppState` can sweep its idle pool on the same interval as the
+/// TTL'd stores.
 fn build_extra_data_handler(
     config: Option<&ExtraDataHandlerConfig>,
+    plugin_sockets: &mut Option<Arc<SocketHost>>,
 ) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
@@ -92,7 +105,9 @@ fn build_extra_data_handler(
                 memory_max_mb: *memory_max_mb,
                 allowed_hosts: allowed_hosts.clone(),
             };
-            let plugin = WasmPlugin::load(std::fs::read(path)?, &limits, build_socket_host(sockets.as_ref())?)?;
+            let sockets = build_socket_host(sockets.as_ref())?;
+            *plugin_sockets = sockets.clone();
+            let plugin = WasmPlugin::load(std::fs::read(path)?, &limits, sockets)?;
             Arc::new(WasmHandler::new(Arc::new(plugin)))
         }
     };
@@ -109,9 +124,12 @@ fn build_socket_host(config: Option<&PluginSocketsConfig>) -> anyhow::Result<Opt
     let allowed = config.allowed.iter().map(|raw| parse_endpoint(raw)).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Some(Arc::new(SocketHost::new(
         allowed,
-        config.max_idle_per_endpoint,
-        Duration::from_millis(config.idle_timeout_ms),
-        Duration::from_millis(config.io_timeout_ms),
+        SocketLimits {
+            max_idle_per_endpoint: config.max_idle_per_endpoint,
+            max_open_per_call: config.max_open_per_call,
+            idle_timeout: Duration::from_millis(config.idle_timeout_ms),
+            io_timeout: Duration::from_millis(config.io_timeout_ms),
+        },
     ))))
 }
 
@@ -150,6 +168,7 @@ mod tests {
         PluginSocketsConfig {
             allowed: allowed.into_iter().map(str::to_string).collect(),
             max_idle_per_endpoint: 8,
+            max_open_per_call: 8,
             idle_timeout_ms: 30_000,
             io_timeout_ms: 2_000,
         }

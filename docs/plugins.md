@@ -68,6 +68,7 @@ is where that problem belongs.
   sockets:
     allowed: ["db:5432", "rabbit:5672"]
     max_idle_per_endpoint: 8      # default 8
+    max_open_per_call: 8          # default 8
     idle_timeout_ms: 30000        # default 30s
     io_timeout_ms: 2000           # default 2s
 ```
@@ -81,8 +82,12 @@ network.
 Four imports, in Extism's `extism:host/user` namespace. Every one takes a JSON
 request and returns a JSON response; byte payloads are base64 so the ABI is the
 same in every guest language. Failures come back as `{"status": "error",
-"message": ...}` data rather than a trap -- a refused endpoint or a dead peer is
-the plugin's to handle.
+"code": ..., "message": ...}` data rather than a trap -- a refused endpoint or a
+dead peer is the plugin's to handle. `code` is the stable part
+(`not_allowed`, `timeout`, `unknown_handle`, `too_many_connections`,
+`bad_request`, `unavailable`, `io`); branch on it, not on the message.
+
+Copy-in wrappers for Rust and Go live in [`plugin-sdk/`](../plugin-sdk/).
 
 | import | request | response on success |
 | --- | --- | --- |
@@ -115,10 +120,19 @@ if fresh {
 - A pooled connection idle past `idle_timeout_ms` is dropped rather than handed
   back -- past that the peer has likely closed it, and a plugin told
   `fresh: false` would replay its session onto a dead socket.
-- `io_timeout_ms` bounds each connect, read and write. This is load-bearing:
-  `timeout_secs` is wasmtime epoch interruption, which interrupts *wasm*
-  execution and cannot interrupt a host call blocked on a socket.
+- A connection an operation already failed on is **never pooled**, whatever
+  `reuse` says: a failed read or write can leave unread bytes or a half-written
+  frame behind.
+- **`timeout_secs` is one wall-clock budget for the whole call**, wasm
+  execution and socket IO together; `io_timeout_ms` caps a single operation
+  within it. Both are load-bearing: epoch interruption interrupts *wasm* and
+  cannot interrupt a host call blocked on a socket, so without the shared
+  budget a plugin could chain operations past its timeout indefinitely.
+- A call may open at most `max_open_per_call` connections. Pooled connections
+  count.
 - A single `sock_read` returns at most 1MB regardless of the `max` requested.
+- Idle connections are swept on the same interval as the TTL'd stores, so an
+  endpoint that stops being used doesn't hold its sockets open.
 
 ## Security
 
@@ -138,10 +152,10 @@ granting a capability.
   whatever that DSN's role has. Point it at a separate database, or at minimum
   a role restricted to its own schema with no access to WeaveAuth's user and
   credential tables.
-- **A plugin can open connections in a loop.** `max_idle_per_endpoint` bounds
-  what is *pooled*, not what is dialled; `timeout_secs` and `io_timeout_ms`
-  bound how long it can keep trying. Size the downstream system's own
-  connection limit accordingly.
+- **Bound what a plugin can dial.** `max_open_per_call` caps connections per
+  call and `max_idle_per_endpoint` caps what is kept afterwards; `timeout_secs`
+  bounds the whole call. Size the downstream system's own connection limit
+  accordingly.
 - **Extra registration fields are bounded before the plugin sees them** -- at
   most 50 fields, each key and value at most 4096 bytes. See the
   [registration flow](flows/register.md).

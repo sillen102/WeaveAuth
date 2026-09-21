@@ -14,18 +14,26 @@ This file is for working on WeaveAuth itself.
 
 ## Calling a plugin from a flow
 
+A flow declares a `Hook` once and invokes it:
+
 ```rust
-let output = plugin.call("handle_registration", &payload).await?;
+let hook = Hook::new(plugin, "handle_registration");   // Hook<()> by default
+hook.invoke(&payload).await?;
 ```
 
 `payload` is anything `Serialize`; it arrives as JSON in the plugin's Extism
-input. `output` is the plugin's raw output bytes — the flow decides what, if
-anything, they mean. Registration ignores them.
+input. The output type is whatever implements `HookOutput` — only `()` today,
+since registration ignores what the plugin returns. A flow that wants data back
+adds its own impl; the crate denies `dead_code`, so a decoder can't sit unused
+waiting for a caller.
+
+`Hook::invoke` logs the failure and hands the error back for the flow to map
+onto its own type. `WasmPlugin::call` is the layer underneath if a flow needs
+raw output bytes.
 
 That is the whole integration surface. **Wiring a plugin into a second flow is
-a new export name, not a new runtime.** Give the flow a thin adapter next to
-its own code (see `extra_data/wasm.rs`, ~35 lines) holding an
-`Arc<WasmPlugin>` and a `const EXPORT: &str`.
+a new export name, not a new runtime** — see `extra_data/wasm.rs` for how thin
+the adapter ends up.
 
 Errors: `PluginError::Instantiate` (module wouldn't start), `::Call` (trap,
 timeout, or missing export), `::Input` (payload wouldn't serialize). A flow
@@ -49,7 +57,9 @@ has to guess. Anything that genuinely must outlive a call — a connection to a
 database or a broker — lives host-side in `SocketHost`.
 
 `call` is `async` but the wasm runs synchronously inside `block_in_place`;
-wasmtime has no async execution model here.
+wasmtime has no async execution model here. The plugin's `timeout` is also the
+socket scope's wall-clock budget, so host IO shares one deadline with wasm
+execution rather than extending it.
 
 ## Capabilities
 
@@ -73,9 +83,13 @@ identical from every guest language.
 | `sock_read` | `{"handle", "max"}` | `{"status":"ok", "data": base64, "eof"}` |
 | `sock_release` | `{"handle", "reuse"}` | `{"status":"ok"}` |
 
-Failures return `{"status":"error","message":...}` rather than trapping — a
-refused endpoint or a dead peer is the plugin's to handle, not a reason to kill
-the flow outright.
+Failures return `{"status":"error","code":…,"message":…}` rather than trapping
+— a refused endpoint or a dead peer is the plugin's to handle, not a reason to
+kill the flow outright. `code` is the stable part (`not_allowed`, `timeout`,
+`unknown_handle`, `too_many_connections`, `bad_request`, `unavailable`, `io`)
+so a plugin can branch on the reason; the message is for a log.
+
+Ready-made guest wrappers live in [`plugin-sdk/`](../../../plugin-sdk/).
 
 ### How pooling works
 
@@ -98,10 +112,21 @@ Invariants worth not breaking:
 - A pooled connection idle past `idle_timeout` is dropped, not handed back:
   the peer has likely closed it, and a plugin told `fresh: false` would replay
   its session onto a dead socket.
-- `io_timeout` is load-bearing. The plugin timeout is wasmtime epoch
-  interruption, which interrupts *wasm* execution and **cannot** interrupt a
-  host call blocked on a socket.
+- **One budget for the whole call.** `CallScope` carries the plugin's own
+  timeout as a deadline; each operation gets `min(io_timeout, remaining)` and
+  is refused outright once it's spent. Without this a plugin could chain an
+  unbounded number of `io_timeout`-long operations and outlive its timeout
+  however many times over it liked — epoch interruption interrupts *wasm*
+  execution and cannot interrupt a host call blocked on a socket.
+- **A failed operation poisons its connection.** `Open::dirty` is set on any
+  IO error, and a dirty connection is never pooled whatever `reuse` says: a
+  failed read or write can leave unread bytes or a half-written frame behind.
+- A call may open at most `max_open_per_call` connections.
 - A single read allocates at most `MAX_READ_BYTES`, whatever `max` asks for.
+- `SocketHost::sweep_idle` runs on the same interval as the TTL'd stores.
+  `take_idle` only expires connections for the endpoint being *asked for*, so
+  without the sweep an endpoint that stopped being used would hold its sockets
+  until the process exits.
 
 ## Adding a capability
 

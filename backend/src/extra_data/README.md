@@ -157,11 +157,14 @@ where that problem belongs.
 ```yaml
   sockets:
     allowed: ["db:5432"]
+    max_open_per_call: 8    # default 8
 ```
 
 Raw TCP (TLS is done host-side, so you don't carry a crypto stack into wasm).
 The protocol is yours. Four imports; see
-[`../plugin/README.md`](../plugin/README.md#socket-abi) for the full ABI.
+[`../plugin/README.md`](../plugin/README.md#socket-abi) for the full ABI, and
+[`plugin-sdk/`](../../../plugin-sdk/) for ready-made Rust and Go wrappers you
+can copy instead of writing the marshalling below by hand.
 
 **Connections are pooled host-side and outlive your instance** — your instance
 is created per call and can't hold one. `sock_open` tells you whether you got a
@@ -231,12 +234,16 @@ func handleRegistration() int32 {
 Rules that bite if ignored:
 
 - `sock_release` with `reuse: true` only if the connection is back in a clean,
-  reusable state. Mid-protocol, pass `false`.
+  reusable state. Mid-protocol, pass `false`. A connection an operation already
+  failed on is never pooled whatever you pass.
 - A connection you leave open is closed at call end, never pooled.
 - A handle does not survive into the next call.
-- A socket op returns `{"status":"error"}` as data, not a trap — check it.
-- `io_timeout_ms` (default 2s) bounds each connect/read/write. The plugin
-  timeout can't interrupt a blocked socket, so this is the real deadline.
+- A socket op returns `{"status":"error","code":…}` as data, not a trap —
+  check it, and branch on `code`, not on the message.
+- **`timeout_secs` is one budget for the whole call**, wasm and socket IO
+  together. `io_timeout_ms` (default 2s) caps a single operation within it.
+  A `timeout` code means the call is over — retrying cannot succeed.
+- A call may open at most `max_open_per_call` connections (default 8).
 
 ## Before you ship
 
