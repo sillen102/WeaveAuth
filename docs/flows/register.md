@@ -15,7 +15,8 @@ Relevant code:
 - `backend/src/server/api/register.rs` -- validation, hashing, user creation
 - `backend/src/extra_data/mod.rs` -- `ExtraDataHandler` trait and payload contract
 - `backend/src/extra_data/webhook.rs` -- HTTP handler
-- `backend/src/extra_data/wasm.rs` -- WASM plugin handler
+- `backend/src/extra_data/wasm.rs` -- adapter onto the generic plugin runtime
+- `backend/src/plugin/` -- the plugin runtime and its capabilities ([docs](../plugins.md))
 - `backend/src/crypto.rs` -- argon2 hashing primitives
 
 ## Steps
@@ -108,10 +109,17 @@ An error from either kind fails the whole registration.
   would serialize every registration behind whichever call is in flight. Per-call
   instances also mean each registration sees zeroed memory, so one user's fields aren't
   still sitting there for the next call's plugin to read.
+- The plugin returning accepts the registration; trapping, timing out, or failing to
+  instantiate fails it. Its output bytes are ignored here.
 - `timeout_secs` (default 5) is enforced by wasmtime epoch interruption, so it stops a
   plugin that loops forever, not just one that blocks.
 - `memory_max_mb` (default 8) caps linear memory; it's converted to 64KiB wasm pages.
-- The plugin runs without WASI. It can be written in any language with an Extism PDK.
+- The plugin runs without WASI and reaches nothing outside the sandbox unless the
+  deployer grants it `allowed_hosts` (HTTP) or `sockets` (raw TCP, pooled host-side).
+  Both are allowlists with no wildcard, and they are the whole network boundary -- see
+  **[WASM plugins](../plugins.md)** for the capability ABI and the security notes.
+- The runtime under this handler is flow-agnostic: other flows call other exports on the
+  same kind of module. Registration is just its first caller.
 
 ## Known gaps
 

@@ -93,7 +93,49 @@ pub enum ExtraDataHandlerConfig {
         /// 64KiB wasm pages.
         #[serde(default = "default_wasm_memory_max_mb")]
         memory_max_mb: u32,
+        /// Hosts the plugin may reach with extism's built-in HTTP client.
+        /// Empty (the default) means no HTTP at all.
+        #[serde(default)]
+        allowed_hosts: Vec<String>,
+        /// Raw TCP, for downstream systems that aren't reachable over HTTP.
+        /// Absent (the default) means the plugin gets no socket imports at
+        /// all and a module asking for them fails to load.
+        #[serde(default)]
+        sockets: Option<PluginSocketsConfig>,
     },
+}
+
+/// The socket capability granted to a WASM plugin. Everything above the byte
+/// stream -- Postgres wire, AMQP, SMTP, a SOAP envelope -- lives in the
+/// plugin, which is what lets a deployer target a new kind of system without
+/// a change to WeaveAuth.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSocketsConfig {
+    /// `host:port` endpoints the plugin may reach. There is no wildcard:
+    /// this list is the only thing standing between a mounted `.wasm` and
+    /// both request forgery into the internal network and exfiltration of
+    /// every registering user's email, so it is required and exact.
+    pub allowed: Vec<String>,
+    /// How many idle connections to keep per endpoint. Connections are
+    /// pooled host-side because a plugin instance is per-call and cannot
+    /// hold one itself.
+    #[serde(default = "default_socket_max_idle_per_endpoint")]
+    pub max_idle_per_endpoint: usize,
+    /// How many connections one plugin call may open. Bounds the dials a
+    /// runaway plugin can aim at a downstream system inside its deadline;
+    /// `max_idle_per_endpoint` only bounds what is kept afterwards.
+    #[serde(default = "default_socket_max_open_per_call")]
+    pub max_open_per_call: usize,
+    /// How long a pooled connection may sit idle before it's dropped rather
+    /// than handed back -- past this the peer has likely closed it.
+    #[serde(default = "default_socket_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Deadline on a single connect/read/write. The plugin timeout is
+    /// wasmtime epoch interruption, which cannot interrupt a host call
+    /// blocked on a socket, so this is what stops a plugin waiting on a dead
+    /// peer from outliving it.
+    #[serde(default = "default_socket_io_timeout_ms")]
+    pub io_timeout_ms: u64,
 }
 
 fn default_webhook_timeout_secs() -> u64 {
@@ -106,6 +148,22 @@ fn default_wasm_timeout_secs() -> u64 {
 
 fn default_wasm_memory_max_mb() -> u32 {
     8
+}
+
+fn default_socket_max_idle_per_endpoint() -> usize {
+    8
+}
+
+fn default_socket_max_open_per_call() -> usize {
+    8
+}
+
+fn default_socket_idle_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_socket_io_timeout_ms() -> u64 {
+    2_000
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -432,10 +490,38 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb } => {
+                ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb, allowed_hosts, sockets } => {
                     assert_eq!(path, "/opt/plugins/register.wasm");
                     assert_eq!(timeout_secs, 5);
                     assert_eq!(memory_max_mb, 8);
+                    assert!(allowed_hosts.is_empty(), "a plugin gets no HTTP unless the deployer grants it");
+                    assert!(sockets.is_none(), "a plugin gets no sockets unless the deployer grants it");
+                }
+                other => unreachable!("only a wasm handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_the_plugin_capabilities_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "extra_data_handler:\n  kind: wasm\n  path: /opt/plugins/register.wasm\n  allowed_hosts:\n    - api.acme.internal\n  sockets:\n    allowed:\n      - db:5432\n      - rabbit:5672\n    io_timeout_ms: 500\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.extra_data_handler.expect("handler configured") {
+                ExtraDataHandlerConfig::Wasm { allowed_hosts, sockets, .. } => {
+                    assert_eq!(allowed_hosts, vec!["api.acme.internal".to_string()]);
+                    let sockets = sockets.expect("socket capability configured");
+                    assert_eq!(sockets.allowed, vec!["db:5432".to_string(), "rabbit:5672".to_string()]);
+                    assert_eq!(sockets.io_timeout_ms, 500);
+                    assert_eq!(sockets.max_idle_per_endpoint, 8);
+                    assert_eq!(sockets.max_open_per_call, 8);
+                    assert_eq!(sockets.idle_timeout_ms, 30_000);
                 }
                 other => unreachable!("only a wasm handler was configured, got {other:?}"),
             }
