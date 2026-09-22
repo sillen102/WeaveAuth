@@ -1,9 +1,10 @@
-//! The same probe plugin as `plugin_socket_flow`, against a real Postgres.
+//! A plugin that writes to a real Postgres with `deadpool-postgres`.
 //!
-//! This is the only layer that proves the wire protocol rather than a
-//! stand-in, and the only one that shows the rows actually landed. It needs
-//! a Docker daemon, so it is behind the `docker` feature:
-//! `mise run test-docker`.
+//! This is the layer that shows what the process model buys: the plugin
+//! holds an ordinary connection pool across registrations, and recovers from
+//! a terminated backend on its own, because it is a normal binary using a
+//! normal database library. It needs a Docker daemon, so it is behind the
+//! `docker` feature: `mise run test-docker`.
 
 #![cfg(feature = "docker")]
 
@@ -13,11 +14,16 @@ mod support;
 use std::time::Duration;
 
 use support::config::FINAL_REDIRECT;
-use support::plugin::{DB_NAME, DB_USER, plugin_handler, register, registration_fields, socket_defaults};
+use support::plugin::{env, plugin_handler, register, registration_fields};
 use support::servers::spawn_backend;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+const PG_PROBE: &str = env!("CARGO_BIN_EXE_pg-probe-plugin");
+
+const DB_USER: &str = "weaveauth";
+const DB_NAME: &str = "appdata";
 
 /// Kills every client backend except this test's own connection -- what a
 /// Postgres restart looks like to a connection idle in the plugin's pool.
@@ -34,10 +40,8 @@ struct Database {
 
 impl Database {
     async fn start() -> Self {
-        // `trust`, because the probe plugin implements only
-        // AuthenticationOk. Password exchange is protocol WeaveAuth has no
-        // business knowing about, and the plugin has nothing to prove about
-        // it.
+        // `trust`, because what this proves is the plugin's own pool, not
+        // Postgres authentication.
         let container = GenericImage::new("postgres", "17-alpine")
             .with_exposed_port(5432.tcp())
             .with_wait_for(WaitFor::message_on_stderr("database system is ready to accept connections"))
@@ -59,7 +63,7 @@ impl Database {
     }
 
     async fn profiles(&self) -> i64 {
-        self.client.query_one("select count(*) from profile", &[], ).await.expect("counts profiles").get(0)
+        self.client.query_one("select count(*) from profile", &[]).await.expect("counts profiles").get(0)
     }
 
     /// Connections Postgres currently has open other than this test's own --
@@ -77,12 +81,9 @@ impl Database {
     }
 
     async fn backend_url(&self) -> (String, tokio::task::JoinHandle<()>) {
+        let url = format!("postgres://{DB_USER}@127.0.0.1:{}/{DB_NAME}", self.port);
         let config = weaveauth::config::Config {
-            extra_data_handler: Some(plugin_handler(
-                vec![format!("127.0.0.1:{}", self.port)],
-                20,
-                socket_defaults(),
-            )),
+            extra_data_handler: Some(plugin_handler(PG_PROBE, env(&[("DATABASE_URL", &url)]), 20)),
             ..support::config::backend_config(vec![FINAL_REDIRECT.to_string()])
         };
         spawn_backend(&config).await.expect("backend starts")
@@ -113,22 +114,22 @@ async fn a_plugin_writes_to_a_real_postgres() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
 
-    let status = register(&backend_url, "alice@example.com", &registration_fields(database.port, "insert")).await;
+    let status = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
 
     assert_eq!(status, reqwest::StatusCode::CREATED);
     assert_eq!(database.profiles().await, 1);
 }
 
-// The whole reason the pool is host-side: the second registration's wasm
-// instance is brand new, yet it inherits a Postgres session already past
-// startup.
+// What the process model is for: the plugin outlives a single call, so the
+// second registration reuses the session the first one opened instead of
+// handshaking again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_registration_inherits_the_postgres_session() {
+async fn a_second_registration_reuses_the_plugins_pooled_session() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
 
     for email in ["alice@example.com", "bob@example.com"] {
-        let status = register(&backend_url, email, &registration_fields(database.port, "insert")).await;
+        let status = register(&backend_url, email, &registration_fields("insert")).await;
         assert_eq!(status, reqwest::StatusCode::CREATED, "{email} was rejected");
     }
 
@@ -143,39 +144,25 @@ async fn a_statement_postgres_rejects_fails_the_registration() {
     let (backend_url, _handle) = database.backend_url().await;
     database.client.batch_execute("drop table profile").await.expect("drops the table");
 
-    let status = register(&backend_url, "alice@example.com", &registration_fields(database.port, "insert")).await;
+    let status = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
 
     assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
 }
 
+// Recovery is the pool's job now, not WeaveAuth's: nothing in backend knows
+// the connection existed.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_recovers_from_a_backend_postgres_terminated() {
+async fn a_plugin_recovers_from_a_terminated_postgres_backend() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
 
-    let first = register(&backend_url, "alice@example.com", &registration_fields(database.port, "insert")).await;
+    let first = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
     assert_eq!(first, reqwest::StatusCode::CREATED);
     assert_eq!(database.plugin_backends().await, 1);
     database.client.batch_execute(TERMINATE_OTHERS).await.expect("terminates the pooled backend");
 
-    let second = register(&backend_url, "bob@example.com", &registration_fields(database.port, "insert")).await;
+    let second = register(&backend_url, "bob@example.com", &registration_fields("insert")).await;
 
-    assert_eq!(second, reqwest::StatusCode::CREATED, "the plugin did not retry onto a fresh session");
+    assert_eq!(second, reqwest::StatusCode::CREATED, "the pool handed out a dead session");
     assert_eq!(database.profiles().await, 2, "the retry lost the row it was supposed to write");
-}
-
-// Positive control: without a retry the same terminated backend is fatal.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_without_a_retry_fails_on_a_terminated_backend() {
-    let database = Database::start().await;
-    let (backend_url, _handle) = database.backend_url().await;
-
-    let first = register(&backend_url, "alice@example.com", &registration_fields(database.port, "no_retry")).await;
-    assert_eq!(first, reqwest::StatusCode::CREATED);
-    database.client.batch_execute(TERMINATE_OTHERS).await.expect("terminates the pooled backend");
-
-    let second = register(&backend_url, "bob@example.com", &registration_fields(database.port, "no_retry")).await;
-
-    assert_eq!(second, reqwest::StatusCode::BAD_GATEWAY, "a terminated backend looked healthy without a retry");
-    assert_eq!(database.profiles().await, 1);
 }

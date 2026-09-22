@@ -12,6 +12,8 @@ config_roots = [
     "common",
     "common/macros",
     "login",
+    "plugin-sdk/go",
+    "plugin-sdk/rust",
     "testing/downstream-service",
     "testing/user-service",
 ]
@@ -22,16 +24,15 @@ depends = [
     { task = "//bff:build" },
     { task = "//common:build" },
     { task = "//login:build" },
+    { task = "//plugin-sdk/go:build" },
+    { task = "//plugin-sdk/rust:build" },
 ]
 
 [tasks.test]
 depends = [
-    { task = "//backend:test" },
-    { task = "//bff:test" },
-    { task = "//common:test" },
-    { task = "//login:test" },
-    { task = "system-tests" },
+    { task = "//plugin-sdk/go:test" },
 ]
+run = "cargo test --workspace"
 
 [tasks.system-tests]
 description = "Run cross-service system tests (excludes the Docker-gated ones, see test-docker)"
@@ -44,6 +45,8 @@ depends = [
     { task = "//bff:lint" },
     { task = "//common:lint" },
     { task = "//login:lint" },
+    { task = "//plugin-sdk/go:lint" },
+    { task = "//plugin-sdk/rust:lint" },
 ]
 
 [tasks.services]

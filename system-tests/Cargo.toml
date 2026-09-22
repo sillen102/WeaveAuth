@@ -7,17 +7,33 @@ publish = false
 [features]
 # Tests that need a Docker daemon: they run a real Postgres via
 # testcontainers. Off by default so `cargo test` stays runnable without it.
-docker = ["dep:testcontainers", "dep:tokio-postgres"]
+docker = ["dep:testcontainers", "dep:tokio-postgres", "dep:deadpool-postgres"]
+
+# The probe plugins the system tests drive. They are bin targets of this
+# package rather than crates of their own, so `cargo test` builds them and
+# the tests find them through `CARGO_BIN_EXE_*` -- no nested cargo
+# invocation contending for the outer build's lock.
+[[bin]]
+name = "probe-plugin"
+path = "tests/fixtures/plugins/probe.rs"
+
+[[bin]]
+name = "pg-probe-plugin"
+path = "tests/fixtures/plugins/pg_probe.rs"
+required-features = ["docker"]
 
 [dependencies]
+weaveauth-plugin-sdk = { path = "../plugin-sdk/rust" }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
 testcontainers = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 weaveauth = { path = "../backend" }
 weaveauth-bff = { path = "../bff" }
 axum = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["json", "cookies"] }
 wiremock = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
@@ -28,4 +44,6 @@ serde_json = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
 url = { workspace = true }
-anyhow = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+hyper-util = { workspace = true, features = ["tokio"] }

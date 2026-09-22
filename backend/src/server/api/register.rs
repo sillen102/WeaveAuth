@@ -120,7 +120,7 @@ mod service {
     /// Bounds on extra registration fields, checked before anything else
     /// touches them (handler dispatch, storage) -- otherwise a single
     /// request could hand an unbounded number/size of fields to a webhook or
-    /// WASM plugin, limited only by axum's default body-size cap.
+    /// plugin process, limited only by axum's default body-size cap.
     const MAX_EXTRA_FIELDS: usize = 50;
     const MAX_EXTRA_FIELD_LEN: usize = 4096;
 
@@ -222,7 +222,6 @@ mod tests {
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
-            plugin_sockets: None,
         }
     }
 

@@ -1,168 +1,290 @@
-# WASM plugins
+# Plugins
 
-A deployment can mount a WASM module and have WeaveAuth call it at a point in
-a flow. The module is the deployer's; WeaveAuth ships the runtime, the sandbox
-and one generic capability, and knows nothing about what the plugin talks to.
+A plugin extends WeaveAuth at a point in a flow without a fork. It is an
+**ordinary executable** you mount: WeaveAuth starts it as a child process,
+hands it a private unix socket, and calls it over gRPC.
 
-Registration is the first flow wired up (see the [registration
-flow](flows/register.md#extra-data-handlers)). The runtime itself is
-flow-agnostic: a flow picks an export name and a JSON payload, so wiring a
-plugin into another flow is a new export, not a new runtime.
+Because it is an ordinary process, it is an ordinary program. It keeps its own
+runtime, its own connection pools and whatever libraries it likes — `sqlx`,
+`deadpool`, `database/sql`, an AMQP client, a vendor SDK. Nothing about the
+plugin mechanism constrains how you talk to your own systems.
 
-Relevant code:
-- `backend/src/plugin/mod.rs` -- `WasmPlugin`: compile, sandbox, call an export
-- `backend/src/plugin/sockets.rs` -- the socket capability and its pool
-- `backend/src/extra_data/wasm.rs` -- the registration flow's adapter
+> **A plugin is not sandboxed.** It runs as a child of WeaveAuth with the same
+> privileges. Mounting one is equivalent to shipping application code into this
+> deployment — see [Before you ship](#before-you-ship).
 
-## The call
+## The contract
 
-The module is compiled once at startup and a **fresh instance** is created per
-call. Compiling is the expensive part (~3.5ms); instantiating from the compiled
-module is ~50us, noise next to the argon2 hash a registration already pays for.
-Per-call instances mean no lock (a wasm instance owns one linear memory and
-can't take concurrent calls, so a shared one would serialize every request) and
-no state bleed (each call sees zeroed memory, so one user's fields aren't still
-sitting there for the next call's plugin to read).
+One gRPC service, in
+[`plugin-sdk/proto/weaveauth/plugin/plugin.proto`](../plugin-sdk/proto/weaveauth/plugin/plugin.proto):
 
-- Input is the flow's payload, JSON, in the plugin's standard Extism input.
-- Returning normally accepts. Trapping, timing out, or failing to instantiate
-  fails the call -- and for registration, no user is created.
-- The plugin's output bytes are handed back to the flow. Registration ignores
-  them; a flow that wants data back defines its own shape.
-- Guest language is free: anything with an Extism PDK. Instantiation cost is
-  not -- a TinyGo module carries a GC and runtime init, and a full-Go
-  (`GOOS=wasip1`) module is heavier still. Benchmark before assuming per-call
-  instantiation stays in the noise.
+```proto
+service Plugin {
+  rpc HandleRegistration(HandleRegistrationRequest) returns (HandleRegistrationResponse);
+}
 
-## Sandbox
-
-Configured under the `wasm` extra-data handler in backend's YAML:
-
-```yaml
-extra_data_handler:
-  kind: wasm
-  path: /plugins/register.wasm
-  timeout_secs: 5          # wasmtime epoch interruption; stops an infinite loop
-  memory_max_mb: 8         # linear memory cap, converted to 64KiB pages
-```
-
-The plugin runs without WASI. It gets no filesystem, no environment, and no
-network at all unless a capability below is granted.
-
-## Capability: HTTP
-
-```yaml
-  allowed_hosts:
-    - api.acme.internal
-```
-
-Grants Extism's built-in HTTP client, restricted to these hosts. This covers
-more than it looks: SOAP is an HTTP POST with an XML body, SQS/SNS and Azure
-Service Bus both have HTTP APIs, and anything REST is already there. Reach for
-it before sockets -- the downstream service owns its own connection pool, which
-is where that problem belongs.
-
-## Capability: sockets
-
-```yaml
-  sockets:
-    allowed: ["db:5432", "rabbit:5672"]
-    max_idle_per_endpoint: 8      # default 8
-    max_open_per_call: 8          # default 8
-    idle_timeout_ms: 30000        # default 30s
-    io_timeout_ms: 2000           # default 2s
-```
-
-Raw TCP, optionally wrapped in TLS host-side so the plugin doesn't have to
-carry a crypto stack into wasm. Everything above the byte stream -- Postgres
-wire, AMQP, Kafka, SMTP -- lives in the plugin. Omit `sockets` entirely and a
-module importing these fails to instantiate rather than silently getting no
-network.
-
-Four imports, in Extism's `extism:host/user` namespace. Every one takes a JSON
-request and returns a JSON response; byte payloads are base64 so the ABI is the
-same in every guest language. Failures come back as `{"status": "error",
-"code": ..., "message": ...}` data rather than a trap -- a refused endpoint or a
-dead peer is the plugin's to handle. `code` is the stable part
-(`not_allowed`, `timeout`, `unknown_handle`, `too_many_connections`,
-`bad_request`, `unavailable`, `io`); branch on it, not on the message.
-
-Rust and Go wrappers live in [`plugin-sdk/`](../plugin-sdk/), as a crate and a module you depend on rather than files you copy.
-
-| import | request | response on success |
-| --- | --- | --- |
-| `sock_open` | `{"host": str, "port": int, "tls": bool}` | `{"status": "ok", "handle": int, "fresh": bool}` |
-| `sock_write` | `{"handle": int, "data": base64}` | `{"status": "ok", "written": int}` |
-| `sock_read` | `{"handle": int, "max": int}` | `{"status": "ok", "data": base64, "eof": bool}` |
-| `sock_release` | `{"handle": int, "reuse": bool}` | `{"status": "ok"}` |
-
-### Connections outlive the instance; handles don't
-
-Connections are pooled **host-side**, keyed by `host:port:tls`, because a
-plugin instance is per-call and can't hold one. `sock_open` returns
-`fresh: false` when it handed back a pooled connection, which is what lets a
-plugin skip a protocol handshake it already performed:
-
-```go
-handle, fresh := sockOpen("db", 5432, false)
-if fresh {
-    pgStartup(handle, "plugin", "appdata")  // only on a new connection
+message HandleRegistrationRequest {
+  string user_id = 1;
+  string email = 2;
+  map<string, string> fields = 3;
 }
 ```
 
-- `sock_release` with `reuse: true` returns the connection to the pool. Only
-  release a connection in a clean, reusable state -- mid-protocol, release it
-  with `reuse: false` or leave it, and it is closed.
-- A connection left open when the call ends is **closed, not pooled**: the
-  plugin never declared it clean.
-- Handles are allocated per call. A handle from one call is not usable in the
-  next.
-- A pooled connection idle past `idle_timeout_ms` is dropped rather than handed
-  back -- past that the peer has likely closed it, and a plugin told
-  `fresh: false` would replay its session onto a dead socket.
-- A connection an operation already failed on is **never pooled**, whatever
-  `reuse` says: a failed read or write can leave unread bytes or a half-written
-  frame behind.
-- **`timeout_secs` is one wall-clock budget for the whole call**, wasm
-  execution and socket IO together; `io_timeout_ms` caps a single operation
-  within it. Both are load-bearing: epoch interruption interrupts *wasm* and
-  cannot interrupt a host call blocked on a socket, so without the shared
-  budget a plugin could chain operations past its timeout indefinitely.
-- A call may open at most `max_open_per_call` connections. Pooled connections
-  count.
-- A single `sock_read` returns at most 1MB regardless of the `max` requested.
-- Idle connections are swept on the same interval as the TTL'd stores, so an
-  endpoint that stops being used doesn't hold its sockets open.
+- **Return `OK` to accept.** The user is then created with that `user_id`.
+- **Return any other status to reject.** No user is created; the request gets
+  `502`. A timeout, a crash or a plugin that isn't running rejects the same
+  way.
+- `fields` is bounded before your plugin sees it: at most 50 entries, each key
+  and value at most 4096 bytes.
+- Your plugin runs *before* the user exists. Registration is only committed
+  once you accept, which is what makes it atomic.
+
+A plugin only has to implement the rpcs for the flows it is wired into; both
+SDKs give you `UNIMPLEMENTED` for the rest.
+
+## Running
+
+WeaveAuth sets two variables and the SDKs do the rest:
+
+| variable | is |
+| --- | --- |
+| `WA_PLUGIN_SOCKET` | the unix socket to listen on, in a private (`0700`) directory WeaveAuth owns |
+| `WA_PLUGIN_TOKEN` | a secret WeaveAuth generates at startup and presents on every call |
+
+A plugin never reads either directly — `serve()` / `Serve()` take them, listen,
+and reject any call that doesn't present the token before it reaches your
+code. A plugin started without them refuses to run rather than serving
+everyone.
+
+The token is regenerated every time WeaveAuth starts, and a plugin WeaveAuth
+restarts is handed the same one, so there is nothing to configure or rotate.
+It is defence in depth rather than a boundary: a process able to open the
+socket is running as the same user, and could read the token out of
+`/proc` anyway.
+
+## Rust
+
+```toml
+[dependencies]
+weaveauth-plugin-sdk = { git = "https://github.com/sillen102/WeaveAuth" }
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use weaveauth_plugin_sdk::{
+    HandleRegistrationRequest, HandleRegistrationResponse, Plugin, Request, Response, Status, serve,
+};
+
+struct Register {
+    pool: deadpool_postgres::Pool,
+}
+
+#[weaveauth_plugin_sdk::async_trait]
+impl Plugin for Register {
+    async fn handle_registration(
+        &self,
+        request: Request<HandleRegistrationRequest>,
+    ) -> Result<Response<HandleRegistrationResponse>, Status> {
+        let registration = request.into_inner();
+
+        let Some(company) = registration.fields.get("company").filter(|value| !value.is_empty()) else {
+            // Rejecting fails the whole registration; no user is created.
+            return Err(Status::invalid_argument("company is required"));
+        };
+
+        let client = self.pool.get().await.map_err(|e| Status::unavailable(e.to_string()))?;
+        client
+            .execute(
+                "insert into profile (user_id, email, company) values ($1, $2, $3)",
+                &[&registration.user_id, &registration.email, company],
+            )
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+
+        Ok(Response::new(HandleRegistrationResponse {}))
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let pool = build_pool()?;   // yours, built once, reused by every call
+    serve(Register { pool }).await?;
+    Ok(())
+}
+```
+
+```bash
+cargo build --release
+# target/release/register
+```
+
+## Go
+
+Generate the stubs from the contract first, the way you would for any other
+gRPC service — this SDK deliberately ships none, so nothing can drift from the
+`.proto`:
+
+```bash
+protoc -I path/to/weaveauth/plugin-sdk/proto \
+  --go_out=. --go-grpc_out=. weaveauth/plugin/plugin.proto
+```
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"log"
+	"os"
+
+	weaveauth "github.com/sillen102/WeaveAuth/plugin-sdk/go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	weaveauthv1 "example.com/myplugin/gen/weaveauth/plugin"
+)
+
+type plugin struct {
+	weaveauthv1.UnimplementedPluginServer
+	db *sql.DB
+}
+
+func (p *plugin) HandleRegistration(
+	ctx context.Context,
+	req *weaveauthv1.HandleRegistrationRequest,
+) (*weaveauthv1.HandleRegistrationResponse, error) {
+	company := req.Fields["company"]
+	if company == "" {
+		return nil, status.Error(codes.InvalidArgument, "company is required")
+	}
+
+	_, err := p.db.ExecContext(ctx,
+		"insert into profile (user_id, email, company) values ($1, $2, $3)",
+		req.UserId, req.Email, company)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return &weaveauthv1.HandleRegistrationResponse{}, nil
+}
+
+func main() {
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL")) // pooled, reused by every call
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Serve owns the socket and the token check; the callback owns the service.
+	err = weaveauth.Serve(func(server *grpc.Server) {
+		weaveauthv1.RegisterPluginServer(server, &plugin{db: db})
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+```bash
+go build -o register .
+```
+
+## Deploying
+
+```yaml
+extra_data_handler:
+  kind: process
+  command: /plugins/register
+  args: []                 # optional
+  env:                     # the plugin's ENTIRE environment
+    DATABASE_URL: postgres://plugin:secret@db/appdata
+  timeout_secs: 5          # default 5, deadline on one call
+  startup_timeout_secs: 10 # default 10, how long it has to start listening
+```
+
+```bash
+docker run -v ./register:/plugins/register \
+           -v ./config.yaml:/app/config.yaml weaveauth
+```
+
+**The plugin inherits nothing.** WeaveAuth's own environment holds signing
+keys, OIDC client secrets and database credentials, and none of it is passed
+on. If your plugin needs `PATH`, a `TZ` or CA bundle variables, say so. There
+are two ways to, and you can use both:
+
+### `env:` in the config file
+
+Exact names, written down where the rest of the deployment is described. Good
+for anything that isn't secret.
+
+### `WA_PLUGIN_<PLUGIN>_ENV_*` in WeaveAuth's environment
+
+Any variable in **WeaveAuth's own environment** named
+`WA_PLUGIN_<PLUGIN>_ENV_<NAME>` is forwarded to that plugin as `<NAME>`, with
+the prefix stripped. The plugin behind `extra_data_handler` is `REGISTRATION`:
+
+```bash
+WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL=postgres://plugin:secret@db/appdata
+WA_PLUGIN_REGISTRATION_ENV_AWS_ACCESS_KEY_ID=AKIA...
+WA_PLUGIN_REGISTRATION_ENV_STRIPE_API_KEY=sk_live_...
+```
+
+`<PLUGIN>` scopes the variables to one surface. As further plugin surfaces are
+added they get their own name, so a plugin only ever sees the credentials
+meant for it — a registration plugin can't read another plugin's database
+password just by running alongside it.
+
+The plugin sees `DATABASE_URL`, `AWS_ACCESS_KEY_ID` and `STRIPE_API_KEY` — the
+names its libraries already look for, so an AWS or Postgres client picks them
+up with no wiring. This is the way to give a plugin credentials: they stay in
+your orchestrator's secret mechanism (Docker/K8s secrets, a vault sidecar) and
+never touch `config.yaml`.
+
+Nothing else crosses over. A variable that doesn't carry this plugin's prefix
+— anything of WeaveAuth's own, another plugin's, `PATH`, `HOME` — is not
+forwarded, and `config.yaml`'s `env:` wins if both set the same name.
+
+A plugin needing several databases or services is exactly the case this is
+for: add as many `WA_PLUGIN_REGISTRATION_ENV_*` variables as it wants, no
+schema on our side.
+
+## Failure and lifecycle
+
+- **One process serves every call**, concurrently, over one HTTP/2 connection.
+  A slow call does not block the next one.
+- **It is started before the server serves traffic.** A missing binary, a
+  plugin that exits immediately, or one that doesn't listen within
+  `startup_timeout_secs` stops WeaveAuth from booting rather than turning into
+  failed registrations later.
+- **If it dies, WeaveAuth restarts it** after about a second. The call in
+  flight fails; later ones recover on their own.
+- **`timeout_secs` is the deadline on one call.** It arrives as the gRPC
+  deadline, so an SDK-provided `ctx`/`Request` already carries it — honour it
+  and your own downstream calls get cancelled with it.
+- **Your long-lived resources are yours.** A pool, a channel, a cached token:
+  build it in `main`, use it from every call. WeaveAuth neither knows nor
+  manages it.
 
 ## A worked example
 
-[`system-tests/tests/fixtures/plugins/pg-probe`](../system-tests/tests/fixtures/plugins/) is a complete plugin that
-talks to a real Postgres through the socket capability. The system tests build and run
-it, against a stand-in server by default and against a real Postgres under
-`mise run test-docker`, so it stays in step with the ABI above.
+[`system-tests/tests/fixtures/plugins/pg_probe.rs`](../system-tests/tests/fixtures/plugins/pg_probe.rs)
+is a complete plugin that holds a `deadpool-postgres` pool across
+registrations and recovers from a terminated database backend without
+WeaveAuth being involved. It is built and driven by the system tests, so it
+can't rot.
 
-## Security
+## Before you ship
 
-Mounting a `.wasm` is equivalent to shipping application code. Read this before
-granting a capability.
-
-- **The allowlists are the whole boundary.** `allowed_hosts` and
-  `sockets.allowed` are the only thing between a mounted module and both
-  request forgery into the internal network and exfiltration of every
-  registering user's email. There is no wildcard, and an empty
-  `sockets.allowed` is rejected at startup rather than read as "allow
-  everything".
-- **Endpoints are exact `host:port`.** A hostname is resolved at dial time, so
-  an allowlisted name that resolves into your internal network is reachable --
-  choose names you control.
-- **Give a plugin its own credentials.** A plugin with a database endpoint has
-  whatever that DSN's role has. Point it at a separate database, or at minimum
-  a role restricted to its own schema with no access to WeaveAuth's user and
-  credential tables.
-- **Bound what a plugin can dial.** `max_open_per_call` caps connections per
-  call and `max_idle_per_endpoint` caps what is kept afterwards; `timeout_secs`
-  bounds the whole call. Size the downstream system's own connection limit
-  accordingly.
-- **Extra registration fields are bounded before the plugin sees them** -- at
-  most 50 fields, each key and value at most 4096 bytes. See the
-  [registration flow](flows/register.md).
+- **A plugin is not sandboxed.** It is a process with WeaveAuth's privileges:
+  it can read the filesystem, open any connection and exhaust any resource the
+  host allows. There are no allowlists to configure because there is nothing
+  here that could enforce one. If you need isolation, it comes from the
+  platform — a separate container or user, a seccomp profile, a network policy
+  — not from WeaveAuth.
+- **Mounting a plugin is shipping application code.** Review it the same way.
+- **Give the plugin its own credentials.** The `DATABASE_URL` you put in `env`
+  grants whatever that role has. Use a separate database, or a role with no
+  access to WeaveAuth's user and credential tables.
+- **Rejecting is a real outcome.** A non-`OK` status fails the whole
+  registration and the user never exists — make sure that's what you meant.
+- **Crashing is survivable but not free.** The registration in flight fails.
+  Handle your own errors rather than panicking into a restart.

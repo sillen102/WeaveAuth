@@ -34,11 +34,12 @@ rsa = { workspace = true, features = ["pem"] }
 email_address = { workspace = true }
 native-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-extism = { workspace = true, features = ["wasmtime-default-features"] }
+weaveauth-plugin-sdk = { path = "../plugin-sdk/rust" }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 async-trait = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
-wat = { workspace = true }

@@ -1,62 +1,77 @@
 # plugin-sdk
 
-Wrappers for the socket capability a WeaveAuth plugin is granted. Depend on
-one and write protocol instead of base64 and JSON.
+The WeaveAuth plugin contract, and the server side of it for Rust and Go.
 
-| module | for |
+A plugin is an ordinary executable. WeaveAuth spawns it, hands it a private
+unix socket path in `WA_PLUGIN_SOCKET`, and calls the `Plugin` service over
+gRPC. Depend on one of these and you write a service implementation and a
+`main`, not a transport.
+
+| directory | holds |
 | --- | --- |
-| `rust/` (crate `weaveauth-plugin-sdk`) | a Rust plugin (`extism-pdk`, `serde`, `serde_json`, `base64`) |
-| `go/` (module `github.com/sillen102/WeaveAuth/plugin-sdk/go`, package `weaveauth`) | a TinyGo plugin (`github.com/extism/go-pdk`) |
+| `proto/` | `weaveauth/plugin/plugin.proto` — the contract itself |
+| `rust/` (crate `weaveauth-plugin-sdk`) | generated client + server, and `serve()` |
+| `go/` (package `weaveauth`) | `Serve()` — the socket and the token check, and **no generated code** |
 
 Neither is published — take a path dependency if your plugin lives in this
-repo (see `system-tests/tests/fixtures/plugins/pg-probe` for the Rust
-example), or a git dependency/`replace` directive otherwise. The ABI they
-wrap is in
-[`backend/src/plugin/README.md`](../backend/src/plugin/README.md#socket-abi);
-writing a registration plugin is in
-[`backend/src/extra_data/README.md`](../backend/src/extra_data/README.md).
+repo (see `system-tests/tests/fixtures/plugins/`), or a git dependency
+otherwise. Writing a plugin, with a worked example in both languages, is
+[`docs/plugins.md`](../docs/plugins.md).
 
 ## Shape
 
 ```rust
-let db = Socket::open("db", 5432, false)?;
-if db.fresh {
-    pg_startup(&db, "plugin", "appdata")?;   // pooled connections skip this
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    serve(MyPlugin { pool: build_pool()? }).await?;
+    Ok(())
 }
-db.write(&insert_profile(&reg))?;
-let reply = db.read_exact(5)?;
-db.release(true)?;                            // true only if it's clean
 ```
 
 ```go
-db, err := weaveauth.Open("db", 5432, false)
-if err != nil { return err }
-if db.Fresh {
-    if err := pgStartup(db, "plugin", "appdata"); err != nil { return err }
+func main() {
+	log.Fatal(weaveauth.Serve(func(server *grpc.Server) {
+		weaveauthv1.RegisterPluginServer(server, &plugin{db: db})
+	}))
 }
-if _, err := db.Write(insertProfile(reg)); err != nil { return err }
-reply, err := db.ReadExact(5)
-if err != nil { return err }
-return db.Release(true)
 ```
 
-## What the wrappers do for you
+## What the SDKs do for you
 
-- Frame every call as JSON and base64 the payloads.
-- Turn `{"status":"error"}` responses into real errors carrying a stable
-  `code` (`not_allowed`, `timeout`, `unknown_handle`, `too_many_connections`,
-  `bad_request`, `unavailable`, `io`) — match on that, not on the message.
-- `read_exact` / `ReadExact`, since one read returns only what had arrived.
-- Surface `fresh`, which is how you skip a handshake the pooled connection
-  already went through.
+- Read `WA_PLUGIN_SOCKET`, clear a socket file left by a previous process,
+  listen, and serve.
+- Enforce `WA_PLUGIN_TOKEN` on every call, with a constant-time comparison,
+  before it reaches your code — and refuse to start if it is missing, so
+  there's no configuration in which the check is silently off.
+- Give you the generated request/response types and a base implementation, so
+  a plugin wired into one flow returns `UNIMPLEMENTED` for the others rather
+  than failing to compile.
+- Carry WeaveAuth's per-call deadline as the gRPC deadline, so the `ctx` (Go)
+  or `Request` (Rust) you're handed already expires when the caller gives up.
 
 ## What they can't do for you
 
-- **Release honestly.** `reuse: true` means "this connection is back in a
-  clean protocol state". The host refuses to pool a connection an operation
-  already failed on, but it can't tell whether you stopped mid-frame.
-- **Beat the clock.** Every plugin call has one wall-clock budget covering
-  wasm execution *and* host IO. A `timeout` error means the call is over —
-  retrying in the same call cannot succeed.
-- **Open without limit.** A call may open at most `max_open_per_call`
-  connections (default 8), pooled or not.
+- **Sandbox you.** A plugin runs with WeaveAuth's privileges. Whatever your
+  process can reach, it can reach.
+- **Own your resources.** A connection pool, a broker channel, a cached token:
+  build it in `main` and reuse it. Nothing is created or torn down per call.
+- **Survive a panic cheaply.** WeaveAuth restarts a plugin that dies, but the
+  registration in flight has already failed.
+
+## Regenerating
+
+The Rust side regenerates from `proto/` on every `cargo build`. The Go stubs
+are checked in, and change only when the contract does:
+
+```bash
+mise run gen-proto
+```
+
+The proto package is `weaveauth.plugin`, unversioned. A breaking change gets a
+versioned package then, rather than carrying a `v1` that has never meant
+anything.
+
+`protoc-gen-go` is pinned to 1.35.2 there on purpose: 1.36 emits
+`unsafe.Slice`/`unsafe.StringData` in the generated file, and the checked-in
+code has no `unsafe` in it. (The protobuf and gRPC runtime modules it links
+against still do, as they do for every Go gRPC program.)

@@ -261,17 +261,23 @@ redirect_uri_allowlist:
 
 backend's `extra_data_handler` is YAML-only too. It decides what happens to fields a
 register request carries beyond `email`/`password`: `kind: webhook` POSTs them to a URL,
-`kind: wasm` calls a WASM module the deployer mounts. The plugin runtime is generic —
-sandboxed, no network unless the deployer grants an HTTP or raw-TCP allowlist, and
-reusable from other flows. See **[docs/plugins.md](docs/plugins.md)**.
+`kind: process` runs an executable the deployer mounts and calls it over gRPC. A plugin
+is an ordinary binary, so it uses ordinary libraries and keeps its own connection pools
+— and it is **not sandboxed**: mounting one is equivalent to shipping application code.
+See **[docs/plugins.md](docs/plugins.md)**.
 
 ```yaml
 extra_data_handler:
-  kind: wasm
-  path: /plugins/register.wasm
-  sockets:
-    allowed: ["db:5432"]
+  kind: process
+  command: /plugins/register
+  env:
+    LOG_LEVEL: info
 ```
+
+Credentials are better passed as `WA_PLUGIN_REGISTRATION_ENV_<NAME>` in backend's own
+environment — forwarded to that plugin as `<NAME>`, so they stay in your secret store
+rather than in `config.yaml`. The plugin inherits nothing else, and every call carries a token
+generated at startup that its SDK checks.
 
 ### Test doubles (`testing/`)
 
@@ -305,6 +311,7 @@ exercising bff's proxy):
 | `WA_CLAIM_ENRICHMENT_URL`    | backend             | *(unset)*                                               | Optional upstream claim-enrichment endpoint (unused yet)                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `WA_DOCS_ENABLED`            | bff                 | `false`                                                 | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off by default — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                              |
 | `WA_MAX_BCRYPT_COST`         | backend             | `12`                                                    | Highest bcrypt cost factor accepted when verifying an imported legacy-user password hash — caps how long a single login can tie up a blocking-pool thread                                                                                                                                                                                                                                                                                                                                        |
+| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`. The plugin inherits nothing else. `WA_PLUGIN_SOCKET`/`WA_PLUGIN_TOKEN` are set by backend and reserved |
 
 ## Testing
 

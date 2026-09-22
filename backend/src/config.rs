@@ -80,90 +80,39 @@ pub enum ExtraDataHandlerConfig {
         #[serde(default = "default_webhook_timeout_secs")]
         timeout_secs: u64,
     },
-    /// Runs the exported `handle_registration` function of the WASM module
-    /// at this path.
-    Wasm {
-        path: String,
-        /// How long a single plugin call may run before wasmtime interrupts
-        /// it and the registration fails.
-        #[serde(default = "default_wasm_timeout_secs")]
+    /// Runs the executable at `command` as a child process and calls it
+    /// over gRPC (see `plugin`).
+    Process {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The plugin's entire environment -- it inherits nothing from
+        /// WeaveAuth, so a database URL or an API token the plugin needs
+        /// goes here.
+        #[serde(default)]
+        env: HashMap<String, String>,
+        /// How long a single call to the plugin may take before the
+        /// registration fails.
+        #[serde(default = "default_plugin_timeout_secs")]
         timeout_secs: u64,
-        /// Cap on the plugin's linear memory, in MB -- stops a runaway
-        /// plugin from growing memory without bound. Rounded down to whole
-        /// 64KiB wasm pages.
-        #[serde(default = "default_wasm_memory_max_mb")]
-        memory_max_mb: u32,
-        /// Hosts the plugin may reach with extism's built-in HTTP client.
-        /// Empty (the default) means no HTTP at all.
-        #[serde(default)]
-        allowed_hosts: Vec<String>,
-        /// Raw TCP, for downstream systems that aren't reachable over HTTP.
-        /// Absent (the default) means the plugin gets no socket imports at
-        /// all and a module asking for them fails to load.
-        #[serde(default)]
-        sockets: Option<PluginSocketsConfig>,
+        /// How long the plugin has to start listening at startup. A plugin
+        /// that misses it stops the server from booting, rather than
+        /// surfacing as failed registrations later.
+        #[serde(default = "default_plugin_startup_timeout_secs")]
+        startup_timeout_secs: u64,
     },
-}
-
-/// The socket capability granted to a WASM plugin. Everything above the byte
-/// stream -- Postgres wire, AMQP, SMTP, a SOAP envelope -- lives in the
-/// plugin, which is what lets a deployer target a new kind of system without
-/// a change to WeaveAuth.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginSocketsConfig {
-    /// `host:port` endpoints the plugin may reach. There is no wildcard:
-    /// this list is the only thing standing between a mounted `.wasm` and
-    /// both request forgery into the internal network and exfiltration of
-    /// every registering user's email, so it is required and exact.
-    pub allowed: Vec<String>,
-    /// How many idle connections to keep per endpoint. Connections are
-    /// pooled host-side because a plugin instance is per-call and cannot
-    /// hold one itself.
-    #[serde(default = "default_socket_max_idle_per_endpoint")]
-    pub max_idle_per_endpoint: usize,
-    /// How many connections one plugin call may open. Bounds the dials a
-    /// runaway plugin can aim at a downstream system inside its deadline;
-    /// `max_idle_per_endpoint` only bounds what is kept afterwards.
-    #[serde(default = "default_socket_max_open_per_call")]
-    pub max_open_per_call: usize,
-    /// How long a pooled connection may sit idle before it's dropped rather
-    /// than handed back -- past this the peer has likely closed it.
-    #[serde(default = "default_socket_idle_timeout_ms")]
-    pub idle_timeout_ms: u64,
-    /// Deadline on a single connect/read/write. The plugin timeout is
-    /// wasmtime epoch interruption, which cannot interrupt a host call
-    /// blocked on a socket, so this is what stops a plugin waiting on a dead
-    /// peer from outliving it.
-    #[serde(default = "default_socket_io_timeout_ms")]
-    pub io_timeout_ms: u64,
 }
 
 fn default_webhook_timeout_secs() -> u64 {
     10
 }
 
-fn default_wasm_timeout_secs() -> u64 {
+fn default_plugin_timeout_secs() -> u64 {
     5
 }
 
-fn default_wasm_memory_max_mb() -> u32 {
-    8
-}
-
-fn default_socket_max_idle_per_endpoint() -> usize {
-    8
-}
-
-fn default_socket_max_open_per_call() -> usize {
-    8
-}
-
-fn default_socket_idle_timeout_ms() -> u64 {
-    30_000
-}
-
-fn default_socket_io_timeout_ms() -> u64 {
-    2_000
+fn default_plugin_startup_timeout_secs() -> u64 {
+    10
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -225,7 +174,15 @@ impl Config {
 
         let mut config: Config = Figment::from(Serialized::defaults(defaults))
             .merge(Yaml::file(&path))
-            .merge(Env::prefixed("WA_").ignore(&["config_file", "redirect_uri_allowlist"]))
+            // `WA_PLUGIN_*` belongs to the plugin process, not to this
+            // config -- see `plugin::forwarded_env`. Filtered rather than
+            // merely unmatched, so adding a `plugin` field here later can't
+            // silently start capturing a deployer's plugin variables.
+            .merge(
+                Env::prefixed("WA_")
+                    .ignore(&["config_file", "redirect_uri_allowlist"])
+                    .filter(|key| !key.starts_with("plugin_")),
+            )
             .extract()?;
 
         if let Ok(raw) = env::var("WA_REDIRECT_URI_ALLOWLIST") {
@@ -480,50 +437,46 @@ mod tests {
     }
 
     #[test]
-    fn loads_a_wasm_extra_data_handler_from_the_config_file() {
+    fn loads_a_process_extra_data_handler_from_the_config_file() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: wasm\n  path: /opt/plugins/register.wasm\n",
+                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb, allowed_hosts, sockets } => {
-                    assert_eq!(path, "/opt/plugins/register.wasm");
+                ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                    assert_eq!(command, "/opt/plugins/register");
                     assert_eq!(timeout_secs, 5);
-                    assert_eq!(memory_max_mb, 8);
-                    assert!(allowed_hosts.is_empty(), "a plugin gets no HTTP unless the deployer grants it");
-                    assert!(sockets.is_none(), "a plugin gets no sockets unless the deployer grants it");
+                    assert_eq!(startup_timeout_secs, 10);
+                    assert!(args.is_empty());
+                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
                 }
-                other => unreachable!("only a wasm handler was configured, got {other:?}"),
+                other => unreachable!("only a process handler was configured, got {other:?}"),
             }
             Ok(())
         });
     }
 
     #[test]
-    fn loads_the_plugin_capabilities_from_the_config_file() {
+    fn loads_the_plugin_command_line_and_environment_from_the_config_file() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: wasm\n  path: /opt/plugins/register.wasm\n  allowed_hosts:\n    - api.acme.internal\n  sockets:\n    allowed:\n      - db:5432\n      - rabbit:5672\n    io_timeout_ms: 500\n",
+                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Wasm { allowed_hosts, sockets, .. } => {
-                    assert_eq!(allowed_hosts, vec!["api.acme.internal".to_string()]);
-                    let sockets = sockets.expect("socket capability configured");
-                    assert_eq!(sockets.allowed, vec!["db:5432".to_string(), "rabbit:5672".to_string()]);
-                    assert_eq!(sockets.io_timeout_ms, 500);
-                    assert_eq!(sockets.max_idle_per_endpoint, 8);
-                    assert_eq!(sockets.max_open_per_call, 8);
-                    assert_eq!(sockets.idle_timeout_ms, 30_000);
+                ExtraDataHandlerConfig::Process { args, env, timeout_secs, .. } => {
+                    assert_eq!(args, vec!["--verbose".to_string()]);
+                    assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
+                    assert_eq!(timeout_secs, 20);
                 }
-                other => unreachable!("only a wasm handler was configured, got {other:?}"),
+                other => unreachable!("only a process handler was configured, got {other:?}"),
             }
             Ok(())
         });

@@ -1,176 +1,132 @@
-# `plugin` — the WASM plugin runtime
+# `plugin` — the plugin runtime
 
-A deployer mounts a WASM module; WeaveAuth calls one of its exports at a point
-in a flow. This module is the runtime and the sandbox. It knows nothing about
-what a plugin is *for* — registration is just its first caller.
+A deployer mounts an executable; WeaveAuth runs it as a child process and calls
+it over gRPC at a point in a flow. This module owns the process and the socket
+the two talk over. It knows nothing about what a plugin is *for* —
+registration is just its first caller.
 
 Deployer-facing docs live in [`docs/plugins.md`](../../../docs/plugins.md).
 This file is for working on WeaveAuth itself.
 
 | file | holds |
 | --- | --- |
-| `mod.rs` | `WasmPlugin` — compile, sandbox, call an export |
-| `sockets.rs` | the socket capability: allowlist, host-side pool, per-call handle table |
+| `mod.rs` | `PluginProcess` — spawn, wait for readiness, supervise, call |
+| [`plugin-sdk/proto`](../../../plugin-sdk/proto/) | the contract, and the only place a new flow is added |
 
 ## Calling a plugin from a flow
 
-A flow declares a `Hook` once and invokes it:
-
 ```rust
-let hook = Hook::new(plugin, "handle_registration");   // Hook<()> by default
-hook.invoke(&payload).await?;
+plugin.handle_registration(HandleRegistrationRequest { user_id, email, fields }).await?;
 ```
 
-`payload` is anything `Serialize`; it arrives as JSON in the plugin's Extism
-input. The output type is whatever implements `HookOutput` — only `()` today,
-since registration ignores what the plugin returns. A flow that wants data back
-adds its own impl; the crate denies `dead_code`, so a decoder can't sit unused
-waiting for a caller.
+`Ok` accepts; any `tonic::Status` rejects. A flow maps that status onto its own
+error type — don't leak it into an HTTP response.
 
-`Hook::invoke` logs the failure and hands the error back for the flow to map
-onto its own type. `WasmPlugin::call` is the layer underneath if a flow needs
-raw output bytes.
+Wiring a plugin into a second flow is **a new rpc on the `Plugin` service**
+plus the three-line wrapper next to `handle_registration`, not a new runtime.
+The contract is generated from `plugin-sdk/proto` at build time, so adding an
+rpc there is what makes it exist on both sides at once.
 
-That is the whole integration surface. **Wiring a plugin into a second flow is
-a new export name, not a new runtime** — see `extra_data/wasm.rs` for how thin
-the adapter ends up.
+## Why a process
 
-Errors: `PluginError::Instantiate` (module wouldn't start), `::Call` (trap,
-timeout, or missing export), `::Input` (payload wouldn't serialize). A flow
-maps these onto its own error type — don't leak them into an HTTP response.
+A plugin is a native binary. That is the whole point: it keeps its own async
+runtime, its own connection pools, its own TLS stack and whatever crates it
+likes — `deadpool`, `sqlx`, `lapin`, a vendor SDK. WeaveAuth holds none of
+that on its behalf, which is what a plugin talking to Postgres needs and what
+an in-process sandbox cannot give without reimplementing every protocol as a
+host capability.
 
-## Instance lifecycle
+The price is stated plainly in the deployer docs and again here: **a plugin is
+not sandboxed.** It runs with this process's privileges. Mounting one is
+equivalent to shipping application code, and isolation is the deployer's
+(container, user, seccomp). The one boundary WeaveAuth does enforce is the
+environment.
 
-Compiled once at startup, **fresh instance per call**. Compiling is the
-expensive part (~3.5ms); instantiating is ~50µs, noise next to the argon2 hash
-a registration already pays for. Two properties come from that, and tests pin
-both down:
+## The process lifecycle
 
-- **No lock.** A wasm instance owns one linear memory and can't take concurrent
-  calls (`Plugin::call` takes `&mut self`), so a shared one would serialize
-  every request. Per-call instances have nothing to share.
-- **No state bleed.** Each call sees zeroed memory, so one user's fields aren't
-  still sitting there for the next call's plugin to read.
-
-Concurrency is bounded by in-flight requests rather than a pool size someone
-has to guess. Anything that genuinely must outlive a call — a connection to a
-database or a broker — lives host-side in `SocketHost`.
-
-`call` is `async` but the wasm runs synchronously inside `block_in_place`;
-wasmtime has no async execution model here. The plugin's `timeout` is also the
-socket scope's wall-clock budget, so host IO shares one deadline with wasm
-execution rather than extending it.
-
-## Capabilities
-
-Nothing is granted by default: no WASI, no filesystem, no environment, no
-network. Each capability is opt-in from config, and a module importing one that
-wasn't granted fails to instantiate rather than silently getting nothing.
-
-- **HTTP** — `PluginLimits::allowed_hosts` feeds Extism's built-in client.
-- **Sockets** — `Some(Arc<SocketHost>)` registers the four imports below.
-
-### Socket ABI
-
-Four imports in Extism's `extism:host/user` namespace. Each takes a JSON
-request and returns a JSON response; byte payloads are base64, so the ABI is
-identical from every guest language.
-
-| import | request | response |
-| --- | --- | --- |
-| `sock_open` | `{"host", "port", "tls"}` | `{"status":"ok", "handle", "fresh"}` |
-| `sock_write` | `{"handle", "data": base64}` | `{"status":"ok", "written"}` |
-| `sock_read` | `{"handle", "max"}` | `{"status":"ok", "data": base64, "eof"}` |
-| `sock_release` | `{"handle", "reuse"}` | `{"status":"ok"}` |
-
-Failures return `{"status":"error","code":…,"message":…}` rather than trapping
-— a refused endpoint or a dead peer is the plugin's to handle, not a reason to
-kill the flow outright. `code` is the stable part (`not_allowed`, `timeout`,
-`unknown_handle`, `too_many_connections`, `bad_request`, `unavailable`, `io`)
-so a plugin can branch on the reason; the message is for a log.
-
-Ready-made guest wrappers live in [`plugin-sdk/`](../../../plugin-sdk/).
-
-### How pooling works
-
-Connections are pooled in `SocketHost`, keyed by `host:port:tls`, because a
-plugin instance is per-call and can't hold one. `sock_open` returns
-`fresh: false` for a pooled connection, which is what lets a plugin skip a
-handshake it already performed.
-
-Handles live in a per-call `CallScope`, reached from the host functions through
-a **thread-local**: wasmtime runs a host function synchronously on the thread
-executing the wasm call, so the scope doesn't have to be threaded through wasm
-as something the plugin could forge. `ScopeGuard::drop` clears it when the call
-returns, closing (not pooling) whatever the plugin left open.
+- **Startup is synchronous.** `PluginProcess::start` spawns the command and
+  polls the socket until the plugin accepts a connection. A missing binary, a
+  plugin that exits immediately, and a plugin that never listens all fail
+  `AppState::new`, so the server doesn't boot into a state where every
+  registration 502s.
+- **The socket path is fixed for the life of the `PluginProcess`.** That's what
+  lets the tonic `Channel` be built once and connect lazily: after a restart it
+  reconnects to the same path on its own, with no invalidation logic anywhere.
+- **A supervisor task restarts the plugin when it dies**, after
+  `RESTART_DELAY`. The call in flight fails; later ones recover. Without the
+  delay a plugin that fails on startup would be respawned as fast as the OS can
+  fork.
+- **Concurrency is the plugin's.** One process serves every registration over
+  one HTTP/2 connection, so a slow call doesn't block the next — there is no
+  pool size to guess and nothing to lock.
+- **Teardown.** `Drop` aborts the supervisor, which drops the `Child`
+  (`kill_on_drop`), then removes the socket directory.
 
 Invariants worth not breaking:
 
-- A handle from one call is never usable in the next.
-- A connection left open at call end is **closed**, not pooled — the plugin
-  never declared it clean.
-- A pooled connection idle past `idle_timeout` is dropped, not handed back:
-  the peer has likely closed it, and a plugin told `fresh: false` would replay
-  its session onto a dead socket.
-- **One budget for the whole call.** `CallScope` carries the plugin's own
-  timeout as a deadline; each operation gets `min(io_timeout, remaining)` and
-  is refused outright once it's spent. Without this a plugin could chain an
-  unbounded number of `io_timeout`-long operations and outlive its timeout
-  however many times over it liked — epoch interruption interrupts *wasm*
-  execution and cannot interrupt a host call blocked on a socket.
-- **A failed operation poisons its connection.** `Open::dirty` is set on any
-  IO error, and a dirty connection is never pooled whatever `reuse` says: a
-  failed read or write can leave unread bytes or a half-written frame behind.
-- A call may open at most `max_open_per_call` connections.
-- A single read allocates at most `MAX_READ_BYTES`, whatever `max` asks for.
-- `SocketHost::sweep_idle` runs on the same interval as the TTL'd stores.
-  `take_idle` only expires connections for the endpoint being *asked for*, so
-  without the sweep an endpoint that stopped being used would hold its sockets
-  until the process exits.
+- **The plugin inherits no environment.** `env_clear()`, then only what the
+  deployer named for it: `WA_PLUGIN_<PLUGIN>_ENV_*` from this process's
+  environment (prefix stripped by `forwarded_env`, which is scoped to one
+  plugin name so a second surface doesn't inherit this one's credentials), the
+  config file's `env`, and the two channel variables. This process's environment holds WeaveAuth's signing
+  keys, OIDC client secrets and database credentials.
+- **Every call presents `WA_PLUGIN_TOKEN`.** Generated per `PluginProcess`,
+  handed to the child on every spawn (including restarts, so the client never
+  changes), sent as the `x-weaveauth-token` metadata key. The SDK enforces it
+  before a call reaches the plugin's own code. It guards against the socket
+  directory's permissions being wrong, and it is what would make a future TCP
+  transport safe -- it is *not* a boundary against a hostile plugin, which
+  runs as this user and can read the token from `/proc`.
+- **The socket lives in a `0700` directory.** Anyone who can open it can drive
+  the plugin, and through it whatever credentials the deployer gave it. The
+  directory name is deliberately short: a unix socket path is capped around 104
+  bytes and macOS spends half of that on `$TMPDIR`.
+- **Every rpc carries the configured deadline** (`Request::set_timeout`), so a
+  plugin that hangs fails the registration instead of holding the HTTP request
+  open.
 
-## Adding a capability
+## Capabilities
 
-1. Host functions in a new file here, returning failures as data.
-2. Register them in `WasmPlugin::load`, **only when configured** — an
-   ungranted import must fail to instantiate.
-3. Config struct in `config.rs`, wired in `server/mod.rs`; reject a
-   nonsensical grant (e.g. an empty allowlist) at startup, not at first call.
-4. Give per-call state a scope with the same teardown guarantee as
-   `CallScope`, and bound every allocation the plugin can influence.
-5. Document the ABI in `docs/plugins.md`.
+There are none to grant, and nothing here to allowlist. A plugin reaches the
+network, the filesystem and the machine exactly as any other process run by
+this user does; WeaveAuth is not in a position to intercept any of it. The
+security boundary is the deployer's own isolation, plus the environment rule
+above.
 
 ## Tests
 
 | where | covers | needs |
 | --- | --- | --- |
-| `sockets.rs` unit tests | `CallScope` and the pool, driven directly | — |
-| `system-tests/tests/plugin_socket_flow.rs` | a real WASM plugin through backend's real `POST /register`, against a stand-in server | the `wasm32-unknown-unknown` target |
-| `system-tests/tests/plugin_postgres_flow.rs` | the same plugin against a real Postgres | Docker, `--features docker` |
+| `mod.rs` unit tests | startup failure modes, the private socket directory, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
+| `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check, both SDKs | — |
+| `system-tests/tests/plugin_auth.rs` | a caller with no/wrong token refused against a real plugin process | — |
+| `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register`: accept, reject, timeout, crash-and-restart, concurrency, environment isolation | — |
+| `system-tests/tests/plugin_postgres_flow.rs` | a plugin holding a `deadpool-postgres` pool across registrations | Docker, `--features docker` |
 
-The plugin is
-[`system-tests/tests/fixtures/plugins/pg-probe`](../../../system-tests/tests/fixtures/plugins/), built from
-source by the test. It takes its socket wrappers as a path dependency on
-[`plugin-sdk/rust`](../../../plugin-sdk/) (crate `weaveauth-plugin-sdk`), so
-the SDK is covered too — which is otherwise the one part of this feature
-nothing would exercise.
+The probe plugins are bin targets of the `weaveauth-system-tests` package
+(`tests/fixtures/plugins/`), built from
+[`plugin-sdk/rust`](../../../plugin-sdk/) — so the SDK is covered too, which
+is otherwise the one part of this feature nothing would exercise.
 
 ```bash
-cargo test                  # unit + the stand-in system tests
+cargo test                  # unit + the process system tests
 mise run test-docker        # adds the real Postgres layer
 ```
 
-A change to the socket ABI should show up in all three. The stand-in server
-only implements what `pg-probe` sends, so teaching the plugin a new message
-means teaching the stand-in to answer it.
+A change to the contract should show up in all three. Both SDKs pick it up on
+their own -- Rust regenerates in `build.rs`, and the Go SDK ships no generated
+code at all (the plugin author generates from `plugin-sdk/proto`).
 
 ## Mutation testing
 
-Not part of the per-change loop — see the repo `AGENTS.md`. When a deeper
-pass is warranted here (the sandbox limits and the allowlist are the parts
-worth it):
+Not part of the per-change loop — see the repo `AGENTS.md`. When a deeper pass
+is warranted here (the environment rule, the token, and the socket directory
+mode are the parts worth it):
 
 ```bash
-mise run mutants -- -p weaveauth --file backend/src/plugin/sockets.rs
-``` Note it shares `~/.cargo-target-shared` with everything else, so a
-concurrent `cargo test` will link against mutated artifacts and fail
-spuriously — use `CARGO_TARGET_DIR=/tmp/…` while it runs.
+mise run mutants -- -p weaveauth --file backend/src/plugin/mod.rs
+```
+
+Note it shares `~/.cargo-target-shared` with everything else, so a concurrent
+`cargo test` will link against mutated artifacts and fail spuriously — use
+`CARGO_TARGET_DIR=/tmp/…` while it runs.

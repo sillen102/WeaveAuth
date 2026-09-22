@@ -1,177 +1,248 @@
-//! The generic plugin mechanism: a deployer mounts a WASM module and
-//! WeaveAuth calls one of its exports at a point in a flow.
+//! The plugin mechanism: a deployer mounts an executable, WeaveAuth runs it
+//! as a child process and calls it over gRPC at a point in a flow.
 //!
-//! Nothing here knows what a plugin is *for*. A flow picks an export name
-//! and a JSON payload, hands both to [`WasmPlugin::call`], and gets the
-//! plugin's output bytes back -- so wiring a plugin into a new flow is a new
-//! export name, not a new runtime. Registration is the first caller (see
+//! This module owns the process -- spawning it, restarting it when it dies,
+//! and the unix socket the two talk over. The contract itself lives in
+//! `plugin-sdk/proto`, so a new flow is a new rpc on that service rather
+//! than a new runtime. Registration is the first caller (see
 //! `crate::extra_data`).
+//!
+//! A plugin is a native binary, so it keeps its own async runtime and its
+//! own long-lived resources: a `deadpool`/`sqlx` connection pool, an AMQP
+//! channel, a vendor SDK client. WeaveAuth holds none of that on its behalf.
+//! The price is that **a plugin is not sandboxed** -- it runs with this
+//! process's privileges, and mounting one is equivalent to shipping
+//! application code. Isolation, if wanted, is the deployer's (containers,
+//! users, seccomp), and the environment is the one thing enforced here:
+//! a plugin is given exactly the variables it was configured with.
 
-pub(crate) mod sockets;
-
-use std::marker::PhantomData;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
-use serde::Serialize;
-use thiserror::Error;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngExt;
+use tokio::process::{Child, Command};
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::{Channel, Endpoint, Uri};
+use weaveauth_plugin_sdk::plugin_client::PluginClient;
+use weaveauth_plugin_sdk::{HandleRegistrationRequest, SOCKET_ENV, TOKEN_ENV, TOKEN_METADATA_KEY};
 
-pub(crate) use sockets::{SocketHost, SocketLimits, parse_endpoint};
+/// How long to wait after the plugin process dies before starting it again.
+/// A plugin that fails on startup would otherwise be respawned as fast as
+/// the OS can fork.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
 
-/// Wasm linear memory is addressed in 64KiB pages, but a deployer thinks in
-/// megabytes -- so the config takes MB and this converts.
-const PAGES_PER_MB: u32 = 16;
+/// How often to poll for the plugin's socket while it starts up.
+const READINESS_POLL: Duration = Duration::from_millis(25);
 
-/// Converts a deployer-facing memory cap in MB to the wasm pages extism
-/// wants. Saturates rather than overflowing on an absurd value, and a cap
-/// below 1MB still gets a page so the plugin can hold its own input.
-fn memory_max_pages(memory_max_mb: u32) -> u32 {
-    memory_max_mb.saturating_mul(PAGES_PER_MB).max(1)
+/// The channel dials a unix socket through a connector, so the URI is never
+/// resolved -- but `Endpoint` still requires a syntactically valid one.
+const UNUSED_AUTHORITY: &str = "http://plugin.invalid";
+
+/// Variables in WeaveAuth's own environment named
+/// `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` are forwarded to that plugin as `<NAME>`,
+/// so a plugin reads the names its libraries already look for
+/// (`DATABASE_URL`, `AWS_ACCESS_KEY_ID`) while a deployer keeps its secrets
+/// wherever they keep every other secret, rather than in `config.yaml`.
+///
+/// The plugin name is part of the prefix so a second plugin surface gets its
+/// own variables rather than inheriting this one's credentials.
+fn forwarded_prefix(plugin: &str) -> String {
+    format!("WA_PLUGIN_{plugin}_ENV_")
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum PluginError {
-    #[error("plugin input could not be serialized: {0}")]
-    Input(#[from] serde_json::Error),
-    #[error("plugin failed to instantiate: {0}")]
-    Instantiate(String),
-    #[error("plugin export {export} failed: {message}")]
-    Call { export: String, message: String },
-}
-
-/// The sandbox a plugin runs in, all of it deployer-configured.
-pub(crate) struct PluginLimits {
-    /// How long a single call may run before wasmtime interrupts it.
+/// How a deployer describes the plugin to run.
+pub(crate) struct PluginConfig {
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    /// The plugin's entire environment. It inherits nothing, so this is also
+    /// where its credentials (a database URL, an API token) come from.
+    pub(crate) env: HashMap<String, String>,
+    /// Deadline on a single rpc.
     pub(crate) timeout: Duration,
-    /// Cap on linear memory, in MB.
-    pub(crate) memory_max_mb: u32,
-    /// Hosts reachable through extism's built-in HTTP. Empty means none.
-    pub(crate) allowed_hosts: Vec<String>,
+    /// How long the plugin has to start listening before startup fails.
+    pub(crate) startup_timeout: Duration,
 }
 
-/// A compiled deployer-supplied module plus the capabilities it was granted.
+/// A running plugin process and the typed client that talks to it.
 ///
-/// The module is compiled once at startup and a *fresh instance* is created
-/// per call. Compiling is the expensive part (~3.5ms); instantiating from
-/// the compiled module is ~50us, which is noise next to the argon2 hash a
-/// registration already pays for. That buys two things a shared instance
-/// can't give:
-///
-/// - No lock. A wasm instance owns one linear memory and cannot take
-///   concurrent calls (hence `Plugin::call`'s `&mut self`), so sharing one
-///   means serializing every call behind whichever one is in flight.
-///   Per-call instances have nothing to share.
-/// - No state bleed. Each call gets zeroed linear memory, so one user's
-///   email and form fields aren't still sitting in memory for the next
-///   call's plugin to read.
-///
-/// Concurrency is therefore bounded by in-flight requests rather than by a
-/// pool size that has to be guessed and kept in step with traffic. Anything
-/// that genuinely must outlive a single call -- a connection to a database
-/// or a broker -- lives host-side in [`SocketHost`] instead.
-pub(crate) struct WasmPlugin {
-    compiled: extism::CompiledPlugin,
-    sockets: Option<Arc<SocketHost>>,
+/// The socket path is fixed for the lifetime of this value, so the channel
+/// survives a restart: it reconnects to the same path once the replacement
+/// process binds it. Calls made in between fail with `UNAVAILABLE`, which is
+/// the same thing a flow does with any other plugin failure.
+#[derive(Debug)]
+pub(crate) struct PluginProcess {
+    client: PluginClient<Channel>,
     timeout: Duration,
+    /// Presented on every call; the plugin refuses anything without it.
+    token: MetadataValue<Ascii>,
+    /// Private directory holding the socket, removed on drop.
+    dir: PathBuf,
+    supervisor: tokio::task::JoinHandle<()>,
 }
 
-impl WasmPlugin {
-    pub(crate) fn load(
-        wasm_bytes: Vec<u8>,
-        limits: &PluginLimits,
-        sockets: Option<Arc<SocketHost>>,
-    ) -> Result<Self, extism::Error> {
-        // `with_timeout` is enforced by wasmtime epoch interruption, so it
-        // covers a plugin that loops forever as well as one that merely
-        // blocks -- without it, a runaway plugin burns a blocking-pool
-        // thread until the process dies.
-        let mut manifest = extism::Manifest::new([extism::Wasm::data(wasm_bytes)])
-            .with_timeout(limits.timeout)
-            .with_memory_max(memory_max_pages(limits.memory_max_mb));
-        for host in &limits.allowed_hosts {
-            manifest = manifest.with_allowed_host(host);
-        }
+impl PluginProcess {
+    /// Starts the plugin and waits for it to listen, so a missing or broken
+    /// command fails at startup rather than at the first registration.
+    pub(crate) async fn start(config: PluginConfig) -> anyhow::Result<Self> {
+        let dir = socket_dir()?;
+        let socket = dir.join("s");
+        let secret = generate_token();
+        let token = MetadataValue::try_from(&secret)?;
 
-        let mut builder = extism::PluginBuilder::new(manifest).with_wasi(false);
-        if sockets.is_some() {
-            builder = builder.with_functions(sockets::host_functions());
-        }
-        Ok(Self { compiled: builder.compile()?, sockets, timeout: limits.timeout })
-    }
-
-    /// Calls `export` with `input` serialized as JSON and returns the
-    /// plugin's raw output. A trap, a timeout or a failure to instantiate is
-    /// an error; interpreting the output bytes is the caller's job, since
-    /// what a plugin returns depends on the flow it was called from.
-    pub(crate) async fn call<I: Serialize>(&self, export: &str, input: &I) -> Result<Vec<u8>, PluginError> {
-        let input = serde_json::to_vec(input)?;
-
-        // `Plugin::call` runs the wasm module synchronously (wasmtime has no
-        // async execution model here) -- `block_in_place` keeps it from
-        // starving other tasks on this worker thread while it runs.
-        tokio::task::block_in_place(|| {
-            let mut plugin = extism::Plugin::new_from_compiled(&self.compiled)
-                .map_err(|error| PluginError::Instantiate(error.to_string()))?;
-
-            // Host functions run on this same thread, so the socket scope is
-            // installed thread-locally for the duration of the call. It
-            // carries the same deadline, so host IO shares one budget with
-            // wasm execution rather than extending it. Dropping the guard
-            // closes whatever the plugin left open.
-            let _scope = self
-                .sockets
-                .as_ref()
-                .map(|sockets| sockets::CallScope::enter(sockets, self.timeout));
-
-            plugin
-                .call::<&[u8], &[u8]>(export, &input)
-                .map(<[u8]>::to_vec)
-                .map_err(|error| PluginError::Call { export: export.to_string(), message: error.to_string() })
-        })
-    }
-}
-
-/// How a flow decodes what its plugin returned.
-///
-/// Only `()` -- ignore the output -- is implemented, because registration is
-/// the only caller and that is all it needs. A flow that wants data back adds
-/// its own impl here; the crate denies `dead_code`, so an unused decoder
-/// can't sit around waiting for one.
-pub(crate) trait HookOutput: Sized {
-    fn from_output(output: Vec<u8>) -> Result<Self, PluginError>;
-}
-
-impl HookOutput for () {
-    fn from_output(_: Vec<u8>) -> Result<Self, PluginError> {
-        Ok(())
-    }
-}
-
-/// One flow's plugin entry point: an export name bound to the output type
-/// that flow expects. A flow declares its hook once and calls
-/// [`Hook::invoke`], instead of repeating the call/decode/log sequence in
-/// every adapter.
-pub(crate) struct Hook<O = ()> {
-    plugin: Arc<WasmPlugin>,
-    export: &'static str,
-    _output: PhantomData<fn() -> O>,
-}
-
-impl<O: HookOutput> Hook<O> {
-    pub(crate) fn new(plugin: Arc<WasmPlugin>, export: &'static str) -> Self {
-        Self { plugin, export, _output: PhantomData }
-    }
-
-    /// Calls the plugin and decodes its output. Logs the failure here so
-    /// each flow doesn't have to, and hands back the error for the flow to
-    /// map onto its own type.
-    pub(crate) async fn invoke<I: Serialize>(&self, input: &I) -> Result<O, PluginError> {
-        let output = self.plugin.call(self.export, input).await.inspect_err(|error| {
-            tracing::warn!(%error, export = self.export, "plugin hook failed");
+        let child = spawn(&config, &socket, &secret)
+            .map_err(|error| anyhow::anyhow!("could not start plugin {:?}: {error}", config.command))?;
+        let child = wait_until_listening(child, &socket, config.startup_timeout).await.inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&dir);
         })?;
-        O::from_output(output).inspect_err(|error| {
-            tracing::warn!(%error, export = self.export, "plugin hook returned output this flow can't read");
+
+        let timeout = config.timeout;
+        let client = PluginClient::new(channel(socket.clone()));
+        let supervisor = tokio::spawn(supervise(child, config, socket, secret));
+
+        Ok(Self { client, timeout, token, dir, supervisor })
+    }
+
+    /// Hands the plugin the fields a register request carried beyond
+    /// email/password. `Ok` accepts the registration; any status rejects it
+    /// and no user is created.
+    pub(crate) async fn handle_registration(&self, request: HandleRegistrationRequest) -> Result<(), tonic::Status> {
+        let mut request = tonic::Request::new(request);
+        request.set_timeout(self.timeout);
+        request.metadata_mut().insert(TOKEN_METADATA_KEY, self.token.clone());
+
+        self.client.clone().handle_registration(request).await.map(|_| ())
+    }
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        // Aborting drops the `Child`, which is `kill_on_drop`.
+        self.supervisor.abort();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A directory only this user can enter, since anyone who can reach the
+/// socket inside it can drive the plugin -- and the plugin holds the
+/// credentials the deployer gave it.
+///
+/// The name is kept short on purpose: a unix socket path is capped at ~104
+/// bytes, and macOS already spends half of that on `$TMPDIR`.
+fn socket_dir() -> anyhow::Result<PathBuf> {
+    let unique = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    let dir = std::env::temp_dir().join(format!("wa-{unique}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+fn channel(socket: PathBuf) -> Channel {
+    // Lazy: the endpoint is already known to be listening, and connecting
+    // lazily is also what lets the channel recover on its own after a
+    // restart.
+    Endpoint::from_static(UNUSED_AUTHORITY).connect_with_connector_lazy(tower::service_fn(move |_: Uri| {
+        let socket = socket.clone();
+        async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(socket).await?)) }
+    }))
+}
+
+/// Bytes of entropy behind the plugin token -- the same size as a refresh
+/// token.
+const TOKEN_BYTES: usize = 32;
+
+/// A secret the plugin proves it holds on every call. Generated per
+/// `PluginProcess` rather than configured, so there is nothing to rotate and
+/// nothing to leave in a config file.
+fn generate_token() -> String {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The variables WeaveAuth passes on to `plugin` from its own environment,
+/// with the prefix stripped. Takes the variables rather than reading the
+/// process environment so the rule can be tested without mutating it.
+///
+/// `plugin` names the surface in upper case (`REGISTRATION`); another
+/// plugin's variables are left alone. A name that is only the prefix is
+/// dropped: an empty variable name isn't something a plugin could read
+/// anyway.
+pub(crate) fn forwarded_env<I>(vars: I, plugin: &str) -> Vec<(String, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let prefix = forwarded_prefix(plugin);
+
+    vars.into_iter()
+        .filter_map(|(key, value)| {
+            let name = key.into_string().ok()?.strip_prefix(&prefix)?.to_string();
+            (!name.is_empty()).then_some((name, value))
         })
+        .collect()
+}
+
+fn spawn(config: &PluginConfig, socket: &Path, token: &str) -> std::io::Result<Child> {
+    Command::new(&config.command)
+        .args(&config.args)
+        // The plugin inherits nothing: this process's environment holds
+        // WeaveAuth's own secrets (signing keys, OIDC client secrets,
+        // database credentials), and a plugin has no business reading them.
+        // Only what the deployer named for the plugin gets through.
+        .env_clear()
+        .envs(&config.env)
+        .env(SOCKET_ENV, socket)
+        .env(TOKEN_ENV, token)
+        // The plugin's own logs are its operator's, so they go where every
+        // other log from this container goes.
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+}
+
+/// Polls until the plugin accepts a connection, or gives up. Returns the
+/// child so a caller can't accidentally drop (and kill) it while waiting.
+async fn wait_until_listening(mut child: Child, socket: &Path, timeout: Duration) -> anyhow::Result<Child> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            return Ok(child);
+        }
+        // Distinguishes "still starting" from "already gave up", which is
+        // the difference between waiting out the timeout and reporting what
+        // actually happened.
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("plugin process exited during startup with {status}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("plugin did not listen on {} within {timeout:?}", socket.display());
+        }
+        tokio::time::sleep(READINESS_POLL).await;
+    }
+}
+
+/// Restarts the plugin for as long as this task lives. A plugin that dies
+/// mid-flight fails the request in progress; it must not also take every
+/// later one down with it.
+async fn supervise(mut child: Child, config: PluginConfig, socket: PathBuf, token: String) {
+    loop {
+        let status = child.wait().await;
+        tracing::error!(?status, command = %config.command, "plugin process exited, restarting");
+
+        child = loop {
+            tokio::time::sleep(RESTART_DELAY).await;
+            // The same token: the host holds it, so a replacement plugin is
+            // handed what its predecessor had and the client needs no update.
+            match spawn(&config, &socket, &token) {
+                Ok(child) => break child,
+                Err(error) => tracing::error!(%error, command = %config.command, "could not restart the plugin process"),
+            }
+        };
     }
 }
 
@@ -179,208 +250,118 @@ impl<O: HookOutput> Hook<O> {
 mod tests {
     use super::*;
 
-    /// Accepts every call.
-    pub(crate) const ACCEPTS: &str = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32) (i32.const 0)))
-    "#;
-
-    /// Traps, the way a plugin rejecting a registration does.
-    const REJECTS: &str = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32) (unreachable)))
-    "#;
-
-    /// Loops forever -- only the manifest timeout can stop it.
-    const HANGS: &str = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32)
-            (loop $spin (br $spin))
-            (i32.const 0)))
-    "#;
-
-    /// Traps if linear memory isn't zeroed on entry, then dirties it. A
-    /// second call on a reused instance would trap; on a fresh one it won't.
-    const FAILS_IF_MEMORY_IS_REUSED: &str = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32)
-            (if (i32.load (i32.const 0)) (then (unreachable)))
-            (i32.store (i32.const 0) (i32.const 1))
-            (i32.const 0)))
-    "#;
-
-    /// Grows linear memory by 32 pages (2MB) on every call.
-    const GROWS_MEMORY: &str = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32)
-            (if (i32.eq (memory.grow (i32.const 32)) (i32.const -1)) (then (unreachable)))
-            (i32.const 0)))
-    "#;
-
-    /// Imports the socket capability, so it only instantiates where the
-    /// deployer granted it.
-    const IMPORTS_A_SOCKET: &str = r#"
-        (module
-          (import "extism:host/user" "sock_open" (func $sock_open (param i64) (result i64)))
-          (memory (export "memory") 1)
-          (func (export "handle_registration") (result i32) (i32.const 0)))
-    "#;
-
-    fn limits(timeout: Duration, memory_max_mb: u32) -> PluginLimits {
-        PluginLimits { timeout, memory_max_mb, allowed_hosts: vec![] }
-    }
-
-    pub(crate) fn plugin(wat: &str, timeout: Duration) -> WasmPlugin {
-        WasmPlugin::load(wat::parse_str(wat).expect("valid wat"), &limits(timeout, 8), None)
-            .expect("module compiles")
-    }
-
-    async fn call(plugin: &WasmPlugin) -> Result<Vec<u8>, PluginError> {
-        plugin.call("handle_registration", &serde_json::json!({"hello": "world"})).await
-    }
-
-    #[test]
-    fn converts_a_memory_cap_from_mb_to_wasm_pages() {
-        assert_eq!(memory_max_pages(1), 16);
-        assert_eq!(memory_max_pages(8), 128);
-        assert_eq!(memory_max_pages(64), 1_024);
-        // A sub-1MB cap (i.e. 0) still leaves one page, so the plugin can at
-        // least hold its own input rather than failing to instantiate.
-        assert_eq!(memory_max_pages(0), 1);
-        // An absurd cap saturates instead of wrapping to a tiny one.
-        assert_eq!(memory_max_pages(u32::MAX), u32::MAX);
-    }
-
-    // `block_in_place` (used by the real call path) only works on the
-    // multi-threaded runtime -- matches how the app itself runs it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn succeeds_when_the_plugin_returns() {
-        assert!(call(&plugin(ACCEPTS, Duration::from_secs(5))).await.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fails_when_the_plugin_traps() {
-        assert!(call(&plugin(REJECTS, Duration::from_secs(5))).await.is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fails_when_the_export_is_missing() {
-        let plugin = plugin(ACCEPTS, Duration::from_secs(5));
-
-        let result = plugin.call("handle_login", &serde_json::json!({})).await;
-
-        assert!(result.is_err(), "a flow calling an export the plugin doesn't implement must fail loudly");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn kills_a_plugin_that_runs_past_its_timeout() {
-        let hanging = plugin(HANGS, Duration::from_millis(250));
-
-        let started = std::time::Instant::now();
-        let result = call(&hanging).await;
-
-        assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(5), "timeout didn't fire: {:?}", started.elapsed());
-    }
-
-    // A hung call must not wedge later ones -- the failure mode a single
-    // shared instance behind a lock would have.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_timed_out_call_does_not_block_the_next_one() {
-        let healthy = plugin(ACCEPTS, Duration::from_secs(5));
-        let hanging = plugin(HANGS, Duration::from_millis(500));
-
-        let (hung, ok) = tokio::join!(call(&hanging), call(&healthy));
-
-        assert!(hung.is_err());
-        assert!(ok.is_ok(), "a healthy plugin call was blocked by an unrelated hung one");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn each_call_gets_fresh_linear_memory() {
-        let stateful = plugin(FAILS_IF_MEMORY_IS_REUSED, Duration::from_secs(5));
-
-        for _ in 0..5 {
-            assert!(call(&stateful).await.is_ok(), "plugin saw a previous call's memory");
+    fn config(command: &str, args: &[&str]) -> PluginConfig {
+        PluginConfig {
+            command: command.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_millis(500),
         }
     }
 
-    // Pins down that `each_call_gets_fresh_linear_memory` isn't vacuous: the
-    // same module on a *reused* instance does trap on the second call, so
-    // that test would fail if this ever went back to sharing one.
-    #[test]
-    fn the_memory_probe_module_traps_when_an_instance_is_reused() {
-        let plugin = plugin(FAILS_IF_MEMORY_IS_REUSED, Duration::from_secs(5));
-        let mut instance = extism::Plugin::new_from_compiled(&plugin.compiled).expect("instantiates");
+    #[tokio::test]
+    async fn fails_to_start_when_the_command_does_not_exist() {
+        assert!(PluginProcess::start(config("/nonexistent/weaveauth-plugin", &[])).await.is_err());
+    }
 
-        assert!(instance.call::<&str, &str>("handle_registration", "{}").is_ok());
-        assert!(
-            instance.call::<&str, &str>("handle_registration", "{}").is_err(),
-            "probe module didn't trap on reuse -- the isolation test proves nothing"
+    #[tokio::test]
+    async fn fails_to_start_when_the_plugin_exits_immediately() {
+        let error = PluginProcess::start(config("/bin/sh", &["-c", "exit 3"])).await.expect_err("must not start");
+
+        assert!(error.to_string().contains("exited during startup"), "unhelpful error: {error}");
+    }
+
+    // A plugin that runs but never binds the socket is the case the
+    // readiness poll exists for -- without it the failure would surface as a
+    // rejected registration much later.
+    #[tokio::test]
+    async fn fails_to_start_when_the_plugin_never_listens() {
+        let error = PluginProcess::start(config("/bin/sh", &["-c", "sleep 30"])).await.expect_err("must not start");
+
+        assert!(error.to_string().contains("did not listen"), "unhelpful error: {error}");
+    }
+
+    /// What [`TOKEN_BYTES`] encodes to: unpadded base64 spends 4 characters
+    /// on every 3 bytes, with no rounding up to a whole group.
+    const TOKEN_LEN: usize = (TOKEN_BYTES * 4).div_ceil(3);
+
+    // `cargo-mutants` found both of these unguarded: a token that is empty or
+    // constant still authenticates, because both sides agree on whatever it
+    // is, so every end-to-end test stays green while the control is gone.
+    #[test]
+    fn generates_an_unpredictable_token_every_time() {
+        let first = generate_token();
+
+        assert_ne!(first, generate_token(), "the token is the same every time, so it is not a secret");
+        assert_eq!(first.len(), TOKEN_LEN, "the token is not the size it claims to be: {first:?}");
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs.iter().map(|(key, value)| (OsString::from(key), OsString::from(value))).collect()
+    }
+
+    #[test]
+    fn forwards_prefixed_variables_with_the_prefix_stripped() {
+        let forwarded =
+            forwarded_env(vars(&[("WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL", "postgres://db/appdata")]), "REGISTRATION");
+
+        // Stripped, because a plugin's libraries look for the name they
+        // always look for, not a WeaveAuth-flavoured one.
+        assert_eq!(forwarded, vec![("DATABASE_URL".to_string(), OsString::from("postgres://db/appdata"))]);
+    }
+
+    // The reason the plugin name is in the prefix: each surface gets its own
+    // credentials, so a registration plugin can't read the claims plugin's
+    // database password by being started alongside it.
+    #[test]
+    fn does_not_forward_another_plugins_variables() {
+        let forwarded = forwarded_env(
+            vars(&[
+                ("WA_PLUGIN_CLAIMS_ENV_DATABASE_URL", "postgres://db/claims"),
+                ("WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL", "postgres://db/appdata"),
+            ]),
+            "REGISTRATION",
         );
+
+        assert_eq!(forwarded, vec![("DATABASE_URL".to_string(), OsString::from("postgres://db/appdata"))]);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn enforces_the_configured_memory_cap() {
-        let wasm = wat::parse_str(GROWS_MEMORY).expect("valid wat");
+    // The whole point of `env_clear`: WeaveAuth's own configuration and
+    // secrets sit in variables that look very much like the forwarded ones.
+    #[test]
+    fn does_not_forward_weaveauths_own_variables() {
+        let forwarded = forwarded_env(
+            vars(&[
+            ("WA_MAX_BCRYPT_COST", "12"),
+            ("WA_OIDC_GOOGLE_CLIENT_SECRET", "hunter2"),
+            ("WA_PLUGIN_SOCKET", "/tmp/somewhere/s"),
+            ("WA_PLUGIN_TOKEN", "a-real-secret"),
+            ("WA_PLUGIN_ENV_DATABASE_URL", "postgres://db/unscoped"),
+            ("PATH", "/usr/bin"),
+            ("DATABASE_URL", "postgres://weaveauth/users"),
+        ]),
+        "REGISTRATION",
+    );
 
-        // 1MB cap = 16 pages: growing by 32 must fail.
-        let tight = WasmPlugin::load(wasm.clone(), &limits(Duration::from_secs(5), 1), None).expect("compiles");
-        assert!(call(&tight).await.is_err(), "plugin grew past its configured cap");
-
-        // 8MB cap = 128 pages: the same growth fits.
-        let roomy = WasmPlugin::load(wasm, &limits(Duration::from_secs(5), 8), None).expect("compiles");
-        assert!(call(&roomy).await.is_ok(), "plugin was capped below its configured limit");
+        assert!(forwarded.is_empty(), "a variable WeaveAuth never marked for the plugin was forwarded: {forwarded:?}");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_plugin_importing_a_socket_fails_without_the_capability() {
-        let plugin = plugin(IMPORTS_A_SOCKET, Duration::from_secs(5));
-
-        assert!(call(&plugin).await.is_err(), "a plugin got a socket import the deployer never granted");
+    #[test]
+    fn drops_a_variable_that_is_only_the_prefix() {
+        assert!(forwarded_env(vars(&[("WA_PLUGIN_REGISTRATION_ENV_", "orphan")]), "REGISTRATION").is_empty());
     }
 
-    // Positive control for the test above: with the capability configured,
-    // the same module runs -- so dropping the imports entirely would not
-    // leave the suite green.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_plugin_importing_a_socket_runs_with_the_capability() {
-        let sockets = Arc::new(SocketHost::new(
-            vec![],
-            SocketLimits {
-                max_idle_per_endpoint: 8,
-                max_open_per_call: 8,
-                idle_timeout: Duration::from_secs(30),
-                io_timeout: Duration::from_secs(2),
-            },
-        ));
-        let plugin = WasmPlugin::load(
-            wat::parse_str(IMPORTS_A_SOCKET).expect("valid wat"),
-            &limits(Duration::from_secs(5), 8),
-            Some(sockets),
-        )
-        .expect("compiles");
+    #[test]
+    fn gives_the_plugin_a_private_socket_directory() {
+        use std::os::unix::fs::PermissionsExt;
 
-        assert!(call(&plugin).await.is_ok());
-    }
+        let dir = socket_dir().expect("creates a directory");
+        let mode = std::fs::metadata(&dir).expect("readable").permissions().mode();
+        let _ = std::fs::remove_dir_all(&dir);
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn handles_concurrent_calls_without_a_lock() {
-        let shared = Arc::new(plugin(ACCEPTS, Duration::from_secs(5)));
-
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..16 {
-            let shared = shared.clone();
-            set.spawn(async move { call(&shared).await.is_ok() });
-        }
-
-        while let Some(result) = set.join_next().await {
-            assert!(result.expect("task completes"));
-        }
+        // Anyone who can open the socket can drive the plugin, and through
+        // it whatever credentials the deployer gave it.
+        assert_eq!(mode & 0o777, 0o700, "the socket directory is reachable by other users");
     }
 }

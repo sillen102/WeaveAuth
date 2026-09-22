@@ -293,7 +293,6 @@ mod tests {
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
-            plugin_sockets: None,
         }
     }
 

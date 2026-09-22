@@ -15,7 +15,7 @@ Relevant code:
 - `backend/src/server/api/register.rs` -- validation, hashing, user creation
 - `backend/src/extra_data/mod.rs` -- `ExtraDataHandler` trait and payload contract
 - `backend/src/extra_data/webhook.rs` -- HTTP handler
-- `backend/src/extra_data/wasm.rs` -- adapter onto the generic plugin runtime
+- `backend/src/extra_data/process.rs` -- adapter onto the generic plugin runtime
 - `backend/src/plugin/` -- the plugin runtime and its capabilities ([docs](../plugins.md))
 - `backend/src/crypto.rs` -- argon2 hashing primitives
 
@@ -56,7 +56,7 @@ Order matters here; each step gates the next.
 - **Extra-field bounds** are checked before anything else touches them: at most 50
   fields, each key and value at most 4096 bytes, else `400`
   (`ExtraDataTooLarge`). Without this a single request could hand an unbounded payload
-  to a webhook or WASM plugin, limited only by axum's default body-size cap.
+  to a webhook or plugin process, limited only by axum's default body-size cap.
 - **Email** is normalized (`normalize_email`) then validated (`EmailAddress::is_valid`)
   -> `400` (`InvalidEmail`).
 - **Password** is hashed with argon2 (`crypto::hash_password`, on the blocking pool).
@@ -102,24 +102,29 @@ An error from either kind fails the whole registration.
   registration request open.
 - Any transport error or non-2xx response fails the registration.
 
-**`kind: wasm`** -- calls the module at `path`, which must export `handle_registration`.
+**`kind: process`** -- runs the executable at `command` as a child process and calls
+its `HandleRegistration` rpc over gRPC.
 
-- The module is compiled once at startup; each call gets a **fresh instance**. A wasm
-  instance owns one linear memory and cannot take concurrent calls, so a shared one
-  would serialize every registration behind whichever call is in flight. Per-call
-  instances also mean each registration sees zeroed memory, so one user's fields aren't
-  still sitting there for the next call's plugin to read.
-- The plugin returning accepts the registration; trapping, timing out, or failing to
-  instantiate fails it. Its output bytes are ignored here.
-- `timeout_secs` (default 5) is enforced by wasmtime epoch interruption, so it stops a
-  plugin that loops forever, not just one that blocks.
-- `memory_max_mb` (default 8) caps linear memory; it's converted to 64KiB wasm pages.
-- The plugin runs without WASI and reaches nothing outside the sandbox unless the
-  deployer grants it `allowed_hosts` (HTTP) or `sockets` (raw TCP, pooled host-side).
-  Both are allowlists with no wildcard, and they are the whole network boundary -- see
-  **[WASM plugins](../plugins.md)** for the capability ABI and the security notes.
-- The runtime under this handler is flow-agnostic: other flows call other exports on the
-  same kind of module. Registration is just its first caller.
+- The process is started when `AppState` is built and **waited for**: a missing binary,
+  one that exits immediately, or one that doesn't listen within `startup_timeout_secs`
+  (default 10) fails startup, rather than turning into failed registrations later.
+- `OK` accepts the registration; any other gRPC status rejects it. A timeout, a crash,
+  or the plugin being down between restarts rejects the same way.
+- `timeout_secs` (default 5) is sent as the gRPC deadline and enforced here, so a hung
+  plugin fails the registration instead of holding the request open.
+- One process serves every registration concurrently over one connection, so a slow call
+  doesn't block the next. A plugin that dies is restarted; the call in flight fails.
+- **The plugin inherits no environment** -- `env_clear()` plus only what the deployer
+  named for it: the config's `env`, any `WA_PLUGIN_REGISTRATION_ENV_<NAME>` from
+  backend's own environment (forwarded as `<NAME>`), and the socket/token variables. This process's
+  environment holds the signing keys and OIDC client secrets.
+- **Every call carries a startup-generated token** the plugin's SDK checks before the
+  call reaches plugin code, so a local process that finds the socket can't drive it.
+- **The plugin is not sandboxed.** It runs with backend's privileges, and there are no
+  allowlists because nothing here could enforce one -- see **[Plugins](../plugins.md)**
+  for what that means before mounting one.
+- The runtime under this handler is flow-agnostic: other flows add other rpcs to the
+  same service. Registration is just its first caller.
 
 ## Known gaps
 

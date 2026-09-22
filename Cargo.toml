@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "bff", "common", "common/macros", "login", "system-tests"]
+members = ["backend", "bff", "common", "common/macros", "login", "plugin-sdk/rust", "system-tests"]
 resolver = "2"
 
 [profile.dev]
@@ -17,11 +17,15 @@ schemars = "1.2"
 async-trait = "0.1"
 argon2 = "0.6"
 bcrypt = "0.19"
-extism = { version = "1", default-features = false }
 jsonwebtoken = "11.1"
 openidconnect = { version = "4.0", default-features = false }
 rsa = "0.9"
 tokio = "1"
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+hyper-util = "0.1"
 tower-http = "0.7"
 serde = "1"
 serde_json = "1"
@@ -46,9 +50,13 @@ native-tls = "0.2"
 tera = "2"
 secrecy = "0.10"
 
+# Build-time protobuf codegen for the plugin contract
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
 # Test utilities
 tower = "0.5"
 wiremock = "0.6"
 testcontainers = "0.28"
 tokio-postgres = "0.7"
-wat = "1"
+deadpool-postgres = "0.14"
