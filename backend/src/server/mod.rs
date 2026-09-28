@@ -1,5 +1,7 @@
 use crate::config::{Config, ExtraDataHandlerConfig};
-use crate::extra_data::{ExtraDataHandler, WasmHandler, WebhookHandler};
+use crate::extra_data::process::PLUGIN_NAME;
+use crate::extra_data::{ExtraDataHandler, ProcessHandler, WebhookHandler};
+use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
 use crate::oidc::{self, OidcClient};
 use crate::server::router::router;
 use crate::storage::in_memory::{
@@ -55,7 +57,7 @@ impl AppState {
                 .build()?,
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
-        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref())?;
+        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref()).await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -77,7 +79,7 @@ impl AppState {
     }
 }
 
-fn build_extra_data_handler(
+async fn build_extra_data_handler(
     config: Option<&ExtraDataHandlerConfig>,
 ) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
     let handler: Arc<dyn ExtraDataHandler> = match config {
@@ -85,13 +87,25 @@ fn build_extra_data_handler(
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
             Arc::new(WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
-        Some(ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb }) => {
-            let wasm_bytes = std::fs::read(path)?;
-            Arc::new(WasmHandler::load(
-                wasm_bytes,
-                std::time::Duration::from_secs(*timeout_secs),
-                *memory_max_mb,
-            )?)
+        Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
+            // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
+            // file, so a deployer can override an inherited value without
+            // unsetting it.
+            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), PLUGIN_NAME)
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                .collect();
+            plugin_env.extend(env.clone());
+
+            let plugin = PluginProcess::start(PluginConfig {
+                command: command.clone(),
+                args: args.clone(),
+                env: plugin_env,
+                timeout: Duration::from_secs(*timeout_secs),
+                startup_timeout: Duration::from_secs(*startup_timeout_secs),
+            })
+            .await?;
+            Arc::new(ProcessHandler::new(plugin))
         }
     };
     Ok(Some(handler))

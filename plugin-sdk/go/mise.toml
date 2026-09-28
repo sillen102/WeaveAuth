@@ -1,0 +1,14 @@
+[tools]
+go = "1.27.1"
+
+[tasks.build]
+description = "Build the project"
+run = "go build ./..."
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run linters"
+run = ["go vet ./...", "test -z \"$(gofmt -l .)\""]

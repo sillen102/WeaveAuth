@@ -1,0 +1,18 @@
+[package]
+name = "weaveauth-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "signal", "rt"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

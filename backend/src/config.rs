@@ -80,19 +80,26 @@ pub enum ExtraDataHandlerConfig {
         #[serde(default = "default_webhook_timeout_secs")]
         timeout_secs: u64,
     },
-    /// Runs the exported `handle_registration` function of the WASM module
-    /// at this path.
-    Wasm {
-        path: String,
-        /// How long a single plugin call may run before wasmtime interrupts
-        /// it and the registration fails.
-        #[serde(default = "default_wasm_timeout_secs")]
+    /// Runs the executable at `command` as a child process and calls it
+    /// over gRPC (see `plugin`).
+    Process {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The plugin's entire environment -- it inherits nothing from
+        /// WeaveAuth, so a database URL or an API token the plugin needs
+        /// goes here.
+        #[serde(default)]
+        env: HashMap<String, String>,
+        /// How long a single call to the plugin may take before the
+        /// registration fails.
+        #[serde(default = "default_plugin_timeout_secs")]
         timeout_secs: u64,
-        /// Cap on the plugin's linear memory, in MB -- stops a runaway
-        /// plugin from growing memory without bound. Rounded down to whole
-        /// 64KiB wasm pages.
-        #[serde(default = "default_wasm_memory_max_mb")]
-        memory_max_mb: u32,
+        /// How long the plugin has to start listening at startup. A plugin
+        /// that misses it stops the server from booting, rather than
+        /// surfacing as failed registrations later.
+        #[serde(default = "default_plugin_startup_timeout_secs")]
+        startup_timeout_secs: u64,
     },
 }
 
@@ -100,12 +107,12 @@ fn default_webhook_timeout_secs() -> u64 {
     10
 }
 
-fn default_wasm_timeout_secs() -> u64 {
+fn default_plugin_timeout_secs() -> u64 {
     5
 }
 
-fn default_wasm_memory_max_mb() -> u32 {
-    8
+fn default_plugin_startup_timeout_secs() -> u64 {
+    10
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -167,7 +174,15 @@ impl Config {
 
         let mut config: Config = Figment::from(Serialized::defaults(defaults))
             .merge(Yaml::file(&path))
-            .merge(Env::prefixed("WA_").ignore(&["config_file", "redirect_uri_allowlist"]))
+            // `WA_PLUGIN_*` belongs to the plugin process, not to this
+            // config -- see `plugin::forwarded_env`. Filtered rather than
+            // merely unmatched, so adding a `plugin` field here later can't
+            // silently start capturing a deployer's plugin variables.
+            .merge(
+                Env::prefixed("WA_")
+                    .ignore(&["config_file", "redirect_uri_allowlist"])
+                    .filter(|key| !key.starts_with("plugin_")),
+            )
             .extract()?;
 
         if let Ok(raw) = env::var("WA_REDIRECT_URI_ALLOWLIST") {
@@ -422,22 +437,46 @@ mod tests {
     }
 
     #[test]
-    fn loads_a_wasm_extra_data_handler_from_the_config_file() {
+    fn loads_a_process_extra_data_handler_from_the_config_file() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: wasm\n  path: /opt/plugins/register.wasm\n",
+                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Wasm { path, timeout_secs, memory_max_mb } => {
-                    assert_eq!(path, "/opt/plugins/register.wasm");
+                ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                    assert_eq!(command, "/opt/plugins/register");
                     assert_eq!(timeout_secs, 5);
-                    assert_eq!(memory_max_mb, 8);
+                    assert_eq!(startup_timeout_secs, 10);
+                    assert!(args.is_empty());
+                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
                 }
-                other => unreachable!("only a wasm handler was configured, got {other:?}"),
+                other => unreachable!("only a process handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_the_plugin_command_line_and_environment_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.extra_data_handler.expect("handler configured") {
+                ExtraDataHandlerConfig::Process { args, env, timeout_secs, .. } => {
+                    assert_eq!(args, vec!["--verbose".to_string()]);
+                    assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
+                    assert_eq!(timeout_secs, 20);
+                }
+                other => unreachable!("only a process handler was configured, got {other:?}"),
             }
             Ok(())
         });

@@ -1,12 +1,11 @@
-pub(crate) mod wasm;
+pub(crate) mod process;
 pub(crate) mod webhook;
 
 use std::collections::HashMap;
 
-use serde::Serialize;
 use uuid::Uuid;
 
-pub(crate) use wasm::WasmHandler;
+pub(crate) use process::ProcessHandler;
 pub(crate) use webhook::WebhookHandler;
 
 /// Opaque failure signal -- callers only need to know the handler rejected
@@ -22,13 +21,4 @@ pub(crate) struct ExtraDataError;
 #[async_trait::async_trait]
 pub(crate) trait ExtraDataHandler: Send + Sync {
     async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError>;
-}
-
-/// The JSON payload sent to a webhook or a WASM plugin -- the one contract
-/// shared by every `ExtraDataHandler` implementation.
-#[derive(Serialize)]
-pub(crate) struct ExtraDataPayload<'a> {
-    pub(crate) user_id: Uuid,
-    pub(crate) email: &'a str,
-    pub(crate) fields: &'a HashMap<String, String>,
 }

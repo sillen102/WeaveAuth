@@ -3,7 +3,17 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::{ExtraDataError, ExtraDataHandler, ExtraDataPayload};
+use serde::Serialize;
+
+use super::{ExtraDataError, ExtraDataHandler};
+
+/// The JSON body posted to the webhook.
+#[derive(Serialize)]
+struct ExtraDataPayload<'a> {
+    user_id: Uuid,
+    email: &'a str,
+    fields: &'a HashMap<String, String>,
+}
 
 /// Forwards extra registration fields to a deployer-configured HTTP
 /// endpoint. Any transport error or non-2xx response fails the registration.

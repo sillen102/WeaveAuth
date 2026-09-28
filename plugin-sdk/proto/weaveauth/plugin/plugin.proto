@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package weaveauth.plugin;
+
+option go_package = "github.com/sillen102/WeaveAuth/plugin-sdk/go;weaveauth";
+
+// Implemented by a deployer-supplied plugin process. WeaveAuth dials it over
+// a unix socket whose path arrives in `WA_PLUGIN_SOCKET`, and calls one rpc
+// at a point in a flow.
+//
+// Every rpc is optional in the sense that WeaveAuth only calls the ones the
+// flows it has configured need; a plugin that isn't wired into a flow can
+// return UNIMPLEMENTED.
+service Plugin {
+  // Fields a register request carried beyond email/password. Returning OK
+  // accepts the registration and the user is then created; any other status
+  // rejects it and no user exists.
+  rpc HandleRegistration(HandleRegistrationRequest) returns (HandleRegistrationResponse);
+}
+
+message HandleRegistrationRequest {
+  // The id the user will be created with, if the plugin accepts.
+  string user_id = 1;
+  string email = 2;
+  // At most 50 entries, each key and value at most 4096 bytes -- WeaveAuth
+  // rejects the request before the plugin sees it otherwise.
+  map<string, string> fields = 3;
+}
+
+message HandleRegistrationResponse {}
