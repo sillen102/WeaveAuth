@@ -145,11 +145,15 @@ mod tests {
     use crate::crypto::ARGON2;
 
     async fn state_with_user_password(email: &str, password_hash: PasswordHash) -> AppState {
+        state_with_user_password_opt(email, Some(password_hash)).await
+    }
+
+    async fn state_with_user_password_opt(email: &str, password_hash: Option<PasswordHash>) -> AppState {
         let mut users = InMemoryUserStorage::new();
         let _ = users
             .create_user(User {
                 email: email.to_string(),
-                password: Some(password_hash),
+                password: password_hash,
                 ..User::default()
             })
             .await;
@@ -242,6 +246,19 @@ mod tests {
             "unknown-email login returned in {elapsed:?} -- looks like it short-circuited \
              before hashing, which reopens the email-enumeration timing hole"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_password_for_an_oidc_only_user() {
+        let state = state_with_user_password_opt("oidc-alice@example.com", None).await;
+        let req = LoginRequest {
+            email: "oidc-alice@example.com".to_string(),
+            password: String::new(),
+        };
+
+        let result = login(State(state), Json(req)).await;
+
+        assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
 
     #[tokio::test]
