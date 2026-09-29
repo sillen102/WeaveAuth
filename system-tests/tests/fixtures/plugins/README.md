@@ -12,15 +12,19 @@ itself rather than a parallel implementation.
 
 | plugin | used by | needs |
 | --- | --- | --- |
-| `probe.rs` → `probe-plugin` | `tests/plugin_process_flow.rs` | — |
+| `probe.rs` → `probe-plugin` | `tests/plugin_process_flow.rs`, `tests/login_claims_flow.rs` | — |
 | `pg_probe.rs` → `pg-probe-plugin` | `tests/plugin_postgres_flow.rs` | the `docker` feature |
 
 ## `probe`
 
-Implements only `HandleRegistration`, because that is all a system test can
-reach: the tests drive backend's real `POST /register`. Which behaviour to run
-is selected by a `probe` extra field — itself just an extra registration
-field, i.e. the mechanism under test:
+Implements the generic `Invoke` rpc for two hooks, dispatched on
+`request.hook` -- one per flow a system test can reach.
+
+### `hook: "registration"`
+
+Driven by `tests/plugin_process_flow.rs`'s real `POST /register`. Which
+behaviour to run is selected by a `probe` extra field — itself just an extra
+registration field, i.e. the mechanism under test:
 
 | `probe` | does |
 | --- | --- |
@@ -30,6 +34,18 @@ field, i.e. the mechanism under test:
 | `crash` | `exit(1)` without answering, so the next call only works if the supervisor restarted it |
 | `sleep` | sleep `sleep_ms` (default 500), so two concurrent calls show they overlap |
 | `env` | accept only if the environment is exactly the configured one — reject if `PATH` or `HOME` leaked through |
+
+### `hook: "login_claims"`
+
+`FetchLoginClaimsRequest`'s equivalent carries no extra field to select a
+probe with, so this hook is driven by the email's local part instead:
+
+| email local part | does |
+| --- | --- |
+| (anything else, default) | return `{"roles": ["admin"]}` as `data` |
+| `reject` | return `INVALID_ARGUMENT` |
+| `stall` | sleep past any configured timeout |
+| `reserved` | return `{"sub": "attacker-controlled"}`, a claim name that collides with a reserved one |
 
 ## `pg-probe`
 

@@ -59,6 +59,10 @@ pub struct Config {
     /// supported -- a register request carrying any is rejected.
     #[serde(default)]
     pub extra_data_handler: Option<ExtraDataHandlerConfig>,
+    /// Where extra JWT claims are fetched from on every token mint. `None`
+    /// means no extra claims are added.
+    #[serde(default)]
+    pub login_claims_handler: Option<LoginClaimsHandlerConfig>,
 }
 
 /// Where extra registration fields are forwarded. An error from either kind
@@ -98,6 +102,49 @@ pub enum ExtraDataHandlerConfig {
         /// How long the plugin has to start listening at startup. A plugin
         /// that misses it stops the server from booting, rather than
         /// surfacing as failed registrations later.
+        #[serde(default = "default_plugin_startup_timeout_secs")]
+        startup_timeout_secs: u64,
+    },
+}
+
+/// Where extra JWT claims are fetched from on every token mint (both
+/// `authorization_code` and `refresh_token` grants). An error from either
+/// kind fails the token request -- no token is ever issued without the
+/// claims it's configured to carry. See `login_claims`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoginClaimsHandlerConfig {
+    /// POSTs `{user_id, email}` as JSON to this URL and expects a JSON
+    /// object of claims back. Must be `https://` unless the host is
+    /// loopback (`localhost`/127.0.0.1/::1) -- the request carries the
+    /// user's email, so a plaintext `http://` hop to a non-local host would
+    /// ship that over the wire in the clear.
+    Webhook {
+        url: String,
+        /// How long to wait for the webhook before failing the token
+        /// request -- a hung endpoint must not hold the request open
+        /// indefinitely.
+        #[serde(default = "default_webhook_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// Runs the executable at `command` as a child process and calls it
+    /// over gRPC (see `plugin`).
+    Process {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The plugin's entire environment -- it inherits nothing from
+        /// WeaveAuth, so a database URL or an API token the plugin needs
+        /// goes here.
+        #[serde(default)]
+        env: HashMap<String, String>,
+        /// How long a single call to the plugin may take before the token
+        /// request fails.
+        #[serde(default = "default_plugin_timeout_secs")]
+        timeout_secs: u64,
+        /// How long the plugin has to start listening at startup. A plugin
+        /// that misses it stops the server from booting, rather than
+        /// surfacing as failed logins later.
         #[serde(default = "default_plugin_startup_timeout_secs")]
         startup_timeout_secs: u64,
     },
@@ -147,6 +194,7 @@ impl Default for Config {
             oidc_providers: HashMap::new(),
             max_bcrypt_cost: bcrypt::DEFAULT_COST,
             extra_data_handler: None,
+            login_claims_handler: None,
         }
     }
 }
@@ -475,6 +523,62 @@ mod tests {
                     assert_eq!(args, vec!["--verbose".to_string()]);
                     assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
                     assert_eq!(timeout_secs, 20);
+                }
+                other => unreachable!("only a process handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn defaults_to_no_login_claims_handler() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+
+            let config = Config::load().unwrap();
+            assert!(config.login_claims_handler.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_webhook_login_claims_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "login_claims_handler:\n  kind: webhook\n  url: https://internal.test/claims\n  timeout_secs: 3\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.login_claims_handler.expect("handler configured") {
+                LoginClaimsHandlerConfig::Webhook { url, timeout_secs } => {
+                    assert_eq!(url, "https://internal.test/claims");
+                    assert_eq!(timeout_secs, 3);
+                }
+                other => unreachable!("only a webhook handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_process_login_claims_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "login_claims_handler:\n  kind: process\n  command: /opt/plugins/claims\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.login_claims_handler.expect("handler configured") {
+                LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                    assert_eq!(command, "/opt/plugins/claims");
+                    assert_eq!(timeout_secs, 5);
+                    assert_eq!(startup_timeout_secs, 10);
+                    assert!(args.is_empty());
+                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
                 }
                 other => unreachable!("only a process handler was configured, got {other:?}"),
             }

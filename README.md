@@ -279,6 +279,28 @@ environment — forwarded to that plugin as `<NAME>`, so they stay in your secre
 rather than in `config.yaml`. The plugin inherits nothing else, and every call carries a token
 generated at startup that its SDK checks.
 
+backend's `login_claims_handler` is the same shape, wired into a different flow: it's
+called on every token mint (both `authorization_code` and `refresh_token` grants) and its
+output is merged into the issued JWT as extra claims. Same two kinds — `kind: webhook`
+POSTs `{user_id, email}` and expects a JSON object of claims back, `kind: process` calls the
+plugin's one generic rpc with `hook: "login_claims"` and expects a `google.protobuf.Struct`
+back (so claim values can nest, e.g. `roles: {"admin": ["user-1", "user-2"]}`). An error from
+either kind fails
+the token request — no token is ever issued without the claims it's configured to carry.
+A claim name the handler returns that collides with a reserved one (`sub`, `email`,
+`email_verified`, `iat`, `exp`) also fails the request, so a plugin/webhook can't spoof
+identity claims.
+
+```yaml
+login_claims_handler:
+  kind: process
+  command: /plugins/login-claims
+  env:
+    LOG_LEVEL: info
+```
+
+Credentials for it are passed the same way, as `WA_PLUGIN_LOGIN_CLAIMS_ENV_<NAME>`.
+
 ### Test doubles (`testing/`)
 
 Two standalone Rust binaries (own `Cargo.toml` with an empty `[workspace]` table each,
@@ -308,10 +330,9 @@ exercising bff's proxy):
 | `WA_LOGIN_SESSION_TTL_SECS`  | backend             | `60`                                                    | How long a `/oauth/login` session token stays valid for the follow-up `/oauth/authorize` call — just a server-to-server hop, so short-lived                                                                                                                                                                                                                                                                                                                                                        |
 | `WA_RATE_LIMIT_MAX_ATTEMPTS` | bff                 | `10`                                                    | Burst size for `/login`/`/register`'s per-IP rate limit (`tower_governor`) — independent bucket per route                                                                                                                                                                                                                                                                                                                                                                                          |
 | `WA_RATE_LIMIT_WINDOW_SECS`  | bff                 | `60`                                                    | Approximate window the burst size applies over; replenishes at `max_attempts / window_secs` per second                                                                                                                                                                                                                                                                                                                                                                                             |
-| `WA_CLAIM_ENRICHMENT_URL`    | backend             | *(unset)*                                               | Optional upstream claim-enrichment endpoint (unused yet)                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `WA_DOCS_ENABLED`            | bff                 | `false`                                                 | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off by default — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                              |
 | `WA_MAX_BCRYPT_COST`         | backend             | `12`                                                    | Highest bcrypt cost factor accepted when verifying an imported legacy-user password hash — caps how long a single login can tie up a blocking-pool thread                                                                                                                                                                                                                                                                                                                                        |
-| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`. The plugin inherits nothing else. `WA_PLUGIN_SOCKET`/`WA_PLUGIN_TOKEN` are set by backend and reserved |
+| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else. `WA_PLUGIN_SOCKET`/`WA_PLUGIN_TOKEN` are set by backend and reserved |
 
 ## Testing
 

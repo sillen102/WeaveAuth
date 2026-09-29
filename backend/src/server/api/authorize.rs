@@ -177,6 +177,7 @@ mod tests {
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
+            login_claims_handler: None,
         };
         (state, login_session, user_id)
     }

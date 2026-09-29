@@ -103,7 +103,7 @@ An error from either kind fails the whole registration.
 - Any transport error or non-2xx response fails the registration.
 
 **`kind: process`** -- runs the executable at `command` as a child process and calls
-its `HandleRegistration` rpc over gRPC.
+its one generic `Invoke` rpc with `hook: "registration"` over gRPC.
 
 - The process is started when `AppState` is built and **waited for**: a missing binary,
   one that exits immediately, or one that doesn't listen within `startup_timeout_secs`

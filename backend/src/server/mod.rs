@@ -1,8 +1,12 @@
-use crate::config::{Config, ExtraDataHandlerConfig};
-use crate::extra_data::process::PLUGIN_NAME;
-use crate::extra_data::{ExtraDataHandler, ProcessHandler, WebhookHandler};
-use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
+use crate::config::{Config, ExtraDataHandlerConfig, LoginClaimsHandlerConfig};
 use crate::oidc::{self, OidcClient};
+use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
+use crate::server::api::register::{
+    self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME,
+};
+use crate::server::api::token::{
+    self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
+};
 use crate::server::router::router;
 use crate::storage::in_memory::{
     InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
@@ -34,6 +38,7 @@ pub(crate) struct AppState {
     pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
     pub(crate) max_bcrypt_cost: u32,
     pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
+    pub(crate) login_claims_handler: Option<Arc<dyn LoginClaimsHandler>>,
 }
 
 impl AppState {
@@ -58,6 +63,7 @@ impl AppState {
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
         let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref()).await?;
+        let login_claims_handler = build_login_claims_handler(config.login_claims_handler.as_ref()).await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -75,6 +81,7 @@ impl AppState {
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
             max_bcrypt_cost: config.max_bcrypt_cost,
             extra_data_handler,
+            login_claims_handler,
         })
     }
 }
@@ -85,13 +92,13 @@ async fn build_extra_data_handler(
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
-            Arc::new(WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
+            Arc::new(register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
         Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
             // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
-            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), PLUGIN_NAME)
+            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), EXTRA_DATA_PLUGIN_NAME)
                 .into_iter()
                 .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
                 .collect();
@@ -105,7 +112,39 @@ async fn build_extra_data_handler(
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
             })
             .await?;
-            Arc::new(ProcessHandler::new(plugin))
+            Arc::new(register::ProcessHandler::new(plugin))
+        }
+    };
+    Ok(Some(handler))
+}
+
+async fn build_login_claims_handler(
+    config: Option<&LoginClaimsHandlerConfig>,
+) -> anyhow::Result<Option<Arc<dyn LoginClaimsHandler>>> {
+    let handler: Arc<dyn LoginClaimsHandler> = match config {
+        None => return Ok(None),
+        Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => {
+            Arc::new(token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
+        }
+        Some(LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
+            // Ambient `WA_PLUGIN_LOGIN_CLAIMS_ENV_*` first, then the config
+            // file, so a deployer can override an inherited value without
+            // unsetting it.
+            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), LOGIN_CLAIMS_PLUGIN_NAME)
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                .collect();
+            plugin_env.extend(env.clone());
+
+            let plugin = PluginProcess::start(PluginConfig {
+                command: command.clone(),
+                args: args.clone(),
+                env: plugin_env,
+                timeout: Duration::from_secs(*timeout_secs),
+                startup_timeout: Duration::from_secs(*startup_timeout_secs),
+            })
+            .await?;
+            Arc::new(token::ProcessHandler::new(plugin))
         }
     };
     Ok(Some(handler))

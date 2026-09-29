@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
-use weaveauth_plugin_sdk::{
-    HandleRegistrationRequest, HandleRegistrationResponse, Plugin, Request, Response, Status, serve,
-};
+use weaveauth_plugin_sdk::{Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve};
 
 const DATABASE_URL: &str = "DATABASE_URL";
 
@@ -22,23 +20,30 @@ struct PgProbe {
 
 #[weaveauth_plugin_sdk::async_trait]
 impl Plugin for PgProbe {
-    async fn handle_registration(
-        &self,
-        request: Request<HandleRegistrationRequest>,
-    ) -> Result<Response<HandleRegistrationResponse>, Status> {
-        let registration = request.into_inner();
-        let company = registration.fields.get("company").cloned().unwrap_or_default();
+    async fn invoke(&self, request: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+        let request = request.into_inner();
+        if request.hook != "registration" {
+            // This plugin is only ever wired into `extra_data_handler` -- see
+            // the proto's own comment on why unimplemented is the correct
+            // answer for a hook a plugin isn't wired into.
+            return Err(Status::unimplemented(format!("pg-probe-plugin does not handle hook {:?}", request.hook)));
+        }
+
+        let company = match request.data.as_ref().and_then(|data| data.fields.get("company")) {
+            Some(prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(company)) }) => company.clone(),
+            _ => String::new(),
+        };
 
         let client = self.pool.get().await.map_err(|error| Status::unavailable(error.to_string()))?;
         client
             .execute(
                 "insert into profile (user_id, email, company) values ($1, $2, $3)",
-                &[&registration.user_id, &registration.email, &company],
+                &[&request.user_id, &request.email, &company],
             )
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
 
-        Ok(Response::new(HandleRegistrationResponse {}))
+        Ok(Response::new(PluginResponse { data: None }))
     }
 }
 

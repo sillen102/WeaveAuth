@@ -4,27 +4,36 @@ package weaveauth.plugin;
 
 option go_package = "github.com/sillen102/WeaveAuth/plugin-sdk/go;weaveauth";
 
+import "google/protobuf/struct.proto";
+
 // Implemented by a deployer-supplied plugin process. WeaveAuth dials it over
-// a unix socket whose path arrives in `WA_PLUGIN_SOCKET`, and calls one rpc
-// at a point in a flow.
-//
-// Every rpc is optional in the sense that WeaveAuth only calls the ones the
-// flows it has configured need; a plugin that isn't wired into a flow can
-// return UNIMPLEMENTED.
+// a unix socket whose path arrives in `WA_PLUGIN_SOCKET`, and calls one
+// generic rpc at a point in a flow, selected by `hook` -- adding a new flow
+// (registration, login claims, an email notification, ...) is a new hook
+// name a plugin recognizes, not a new rpc.
 service Plugin {
-  // Fields a register request carried beyond email/password. Returning OK
-  // accepts the registration and the user is then created; any other status
-  // rejects it and no user exists.
-  rpc HandleRegistration(HandleRegistrationRequest) returns (HandleRegistrationResponse);
+  // `OK` with no `data` (or a plugin not wired into `hook` at all, via
+  // `UNIMPLEMENTED`) accepts a hook that only cares about accept/reject, like
+  // registration. `OK` with `data` set returns hook-specific output, like
+  // login-claims's extra JWT claims. Any other status rejects/fails the
+  // caller's flow the same way -- a timeout, a crash, or a plugin that isn't
+  // running fails it too.
+  rpc Invoke(PluginRequest) returns (PluginResponse);
 }
 
-message HandleRegistrationRequest {
-  // The id the user will be created with, if the plugin accepts.
-  string user_id = 1;
-  string email = 2;
-  // At most 50 entries, each key and value at most 4096 bytes -- WeaveAuth
-  // rejects the request before the plugin sees it otherwise.
-  map<string, string> fields = 3;
+message PluginRequest {
+  // Which flow this call belongs to, e.g. "registration" or "login_claims" --
+  // lets one plugin process implement more than one hook.
+  string hook = 1;
+  string user_id = 2;
+  string email = 3;
+  // Hook-specific input: registration's extra fields, or unset for a hook
+  // that needs nothing beyond user_id/email.
+  google.protobuf.Struct data = 4;
 }
 
-message HandleRegistrationResponse {}
+message PluginResponse {
+  // Hook-specific output, e.g. login-claims's extra JWT claims. Unset for a
+  // hook that only accepts/rejects.
+  google.protobuf.Struct data = 1;
+}

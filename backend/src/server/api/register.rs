@@ -1,5 +1,6 @@
 pub(crate) use controller::register;
 pub(crate) use controller::register_doc;
+pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, ProcessHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -193,10 +194,243 @@ mod service {
     }
 }
 
+/// Where extra registration fields are forwarded, over the generic plugin
+/// contract (`crate::plugin`) or a plain webhook. An error from either kind
+/// fails the whole registration; nothing is ever persisted by WeaveAuth
+/// itself.
+mod extra_data {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use serde::Serialize;
+    use uuid::Uuid;
+    use weaveauth_plugin_sdk::PluginRequest;
+
+    use crate::plugin::{self, PluginProcess};
+
+    /// Names this plugin surface in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables a
+    /// deployer sets. Upper case because environment variables are.
+    pub(crate) const PLUGIN_NAME: &str = "REGISTRATION";
+
+    /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
+    const HOOK: &str = "registration";
+
+    /// Opaque failure signal -- callers only need to know the handler rejected
+    /// the registration, not why (the deployer's own handler is responsible for
+    /// its own error reporting/logging).
+    #[derive(Debug)]
+    pub(crate) struct ExtraDataError;
+
+    /// Implemented by whatever a deployer configures to receive the fields a
+    /// register request carries beyond `email`/`password` (see
+    /// `config::ExtraDataHandlerConfig`). An error fails the whole registration
+    /// -- no user is created.
+    #[async_trait::async_trait]
+    pub(crate) trait ExtraDataHandler: Send + Sync {
+        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError>;
+    }
+
+    /// Forwards extra registration fields to a deployer-supplied plugin process
+    /// via the generic `Invoke` rpc's `"registration"` hook. The deployer can
+    /// write it in any language with a gRPC server; WeaveAuth only needs the
+    /// contract in `plugin-sdk/proto` on the way in and an `OK` on the way out.
+    pub(crate) struct ProcessHandler {
+        plugin: PluginProcess,
+    }
+
+    impl ProcessHandler {
+        pub(crate) fn new(plugin: PluginProcess) -> Self {
+            Self { plugin }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExtraDataHandler for ProcessHandler {
+        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
+            let data: serde_json::Map<String, serde_json::Value> =
+                fields.iter().map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone()))).collect();
+            let request = PluginRequest {
+                hook: HOOK.to_string(),
+                user_id: user_id.to_string(),
+                email: email.to_string(),
+                data: Some(plugin::json_to_struct(data)),
+            };
+
+            self.plugin.invoke(request).await.map(|_| ()).map_err(|status| {
+                // Registration only needs to know the plugin rejected it; the
+                // reason is the deployer's to read here.
+                tracing::warn!(code = ?status.code(), message = status.message(), "plugin rejected the registration");
+                ExtraDataError
+            })
+        }
+    }
+
+    /// The JSON body posted to the webhook.
+    #[derive(Serialize)]
+    struct ExtraDataPayload<'a> {
+        user_id: Uuid,
+        email: &'a str,
+        fields: &'a HashMap<String, String>,
+    }
+
+    /// Forwards extra registration fields to a deployer-configured HTTP
+    /// endpoint. Any transport error or non-2xx response fails the registration.
+    pub(crate) struct WebhookHandler {
+        client: reqwest::Client,
+        url: String,
+    }
+
+    impl WebhookHandler {
+        pub(crate) fn new(url: String, timeout: Duration) -> anyhow::Result<Self> {
+            require_https_or_loopback(&url)?;
+
+            // No redirects: this is a server-to-server call to a
+            // deployer-configured (should be internal-only) target, so
+            // following a redirect elsewhere would be a request-forgery vector
+            // -- same reasoning as `oidc_http_client` in `server::AppState::new`.
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .build()?;
+            Ok(Self { client, url })
+        }
+    }
+
+    /// Registration fields include the user's email and whatever the deployer's
+    /// form collects -- reject a plaintext hop to a non-local host so that
+    /// doesn't ship over the wire in the clear. `https://` is otherwise always
+    /// required; `http://` is only accepted for loopback, for local dev/testing
+    /// against a webhook running on the same machine.
+    fn require_https_or_loopback(url: &str) -> anyhow::Result<()> {
+        let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid extra-data webhook url {url:?}: {e}"))?;
+        if parsed.scheme() == "https" {
+            return Ok(());
+        }
+        let is_loopback = match parsed.host() {
+            Some(url::Host::Domain(domain)) => domain == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if is_loopback {
+            return Ok(());
+        }
+        anyhow::bail!("extra-data webhook url {url:?} must use https (http is only allowed for loopback hosts)")
+    }
+
+    #[async_trait::async_trait]
+    impl ExtraDataHandler for WebhookHandler {
+        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
+            let payload = ExtraDataPayload { user_id, email, fields };
+            let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
+                tracing::warn!(%error, url = %self.url, "extra-data webhook request failed");
+                ExtraDataError
+            })?;
+
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                tracing::warn!(status = %response.status(), url = %self.url, "extra-data webhook returned a non-success status");
+                Err(ExtraDataError)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn fields() -> HashMap<String, String> {
+            HashMap::from([("company".to_string(), "Acme".to_string())])
+        }
+
+        #[tokio::test]
+        async fn succeeds_on_a_2xx_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+
+            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn fails_on_a_5xx_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+
+            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn fails_when_the_endpoint_is_unreachable() {
+            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT).expect("valid client");
+
+            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn times_out_against_a_slow_endpoint() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+                .mount(&server)
+                .await;
+            let handler =
+                WebhookHandler::new(format!("{}/hook", server.uri()), Duration::from_millis(50)).expect("valid client");
+
+            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn accepts_https_urls() {
+            assert!(require_https_or_loopback("https://internal.example.com/hook").is_ok());
+        }
+
+        #[test]
+        fn accepts_http_for_loopback_hosts() {
+            assert!(require_https_or_loopback("http://127.0.0.1:9000/hook").is_ok());
+            assert!(require_https_or_loopback("http://localhost:9000/hook").is_ok());
+            assert!(require_https_or_loopback("http://[::1]:9000/hook").is_ok());
+        }
+
+        #[test]
+        fn rejects_plain_http_for_a_non_loopback_host() {
+            assert!(require_https_or_loopback("http://internal.example.com/hook").is_err());
+        }
+
+        #[test]
+        fn rejects_an_unparseable_url() {
+            assert!(require_https_or_loopback("not a url").is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use crate::extra_data::{ExtraDataError, ExtraDataHandler};
+    use super::extra_data::{ExtraDataError, ExtraDataHandler};
     use crate::storage::in_memory::InMemoryUserStorage;
     use crate::storage::UserStorage;
     use crate::server::AppState;
@@ -222,6 +456,7 @@ mod tests {
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
+            login_claims_handler: None,
         }
     }
 
