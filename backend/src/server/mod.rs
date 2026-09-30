@@ -32,6 +32,8 @@ pub(crate) struct AppState {
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
     pub(crate) refresh_token_ttl_secs: i64,
     pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
+    /// Per provider: `field name -> id_token claim name` (see `OidcProviderConfig::extra_claims`).
+    pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
     pub(crate) oidc_state: InMemoryOidcStateStorage,
     pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
@@ -54,6 +56,16 @@ impl AppState {
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
+        // Fail at boot rather than silently dropping the claims on every login.
+        if let Some((name, _)) = config.oidc_providers.iter().find(|(_, p)| !p.extra_claims.is_empty()) {
+            if config.extra_data_handler.is_none() {
+                anyhow::bail!("oidc provider '{name}' sets extra_claims but no extra_data_handler is configured");
+            }
+            if config.login_claims_handler.is_none() {
+                anyhow::bail!("oidc provider '{name}' sets extra_claims but no login_claims_handler is configured");
+            }
+        }
+
         // No redirects: an OIDC provider redirecting this server-side request
         // elsewhere would be a request-forgery vector, not a legitimate flow.
         let oidc_http_client = Arc::new(
@@ -75,6 +87,9 @@ impl AppState {
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
             oidc_providers: Arc::new(oidc_providers),
+            oidc_extra_claims: Arc::new(
+                config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.extra_claims.clone())).collect(),
+            ),
             oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
             pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
             oidc_http_client,
@@ -175,4 +190,61 @@ fn spawn_expiry_sweep(mut state: AppState, interval: Duration) {
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.
 pub async fn app(config: &Config) -> anyhow::Result<axum::Router> {
     Ok(router(AppState::new(config).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OidcProviderConfig;
+
+    fn webhook_pair() -> (ExtraDataHandlerConfig, LoginClaimsHandlerConfig) {
+        (
+            ExtraDataHandlerConfig::Webhook { url: "http://localhost:1/hook".to_string(), timeout_secs: 1 },
+            LoginClaimsHandlerConfig::Webhook { url: "http://localhost:1/claims".to_string(), timeout_secs: 1 },
+        )
+    }
+
+    fn config_with_extra_claims(
+        handler: Option<ExtraDataHandlerConfig>,
+        login_claims: Option<LoginClaimsHandlerConfig>,
+    ) -> Config {
+        let provider = OidcProviderConfig {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string().into(),
+            // Unreachable: the check under test must fire before discovery.
+            issuer: "http://127.0.0.1:1".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
+        };
+        Config {
+            oidc_providers: [("google".to_string(), provider)].into(),
+            extra_data_handler: handler,
+            login_claims_handler: login_claims,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_with_extra_claims_but_no_extra_data_handler() {
+        let error = AppState::new(&config_with_extra_claims(None, Some(webhook_pair().1))).await.err().expect("startup fails");
+
+        assert!(error.to_string().contains("extra_data_handler"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_with_extra_claims_but_no_login_claims_handler() {
+        let error = AppState::new(&config_with_extra_claims(Some(webhook_pair().0), None)).await.err().expect("startup fails");
+
+        assert!(error.to_string().contains("login_claims_handler"), "unexpected error: {error}");
+    }
+
+    // Positive control: with both handlers the check passes and startup only
+    // fails later, at the (unreachable) provider's discovery.
+    #[tokio::test]
+    async fn extra_claims_check_passes_when_both_handlers_are_configured() {
+        let (extra, login) = webhook_pair();
+        let error = AppState::new(&config_with_extra_claims(Some(extra), Some(login))).await.err().expect("discovery fails");
+
+        assert!(!error.to_string().contains("extra_claims"), "unexpected error: {error}");
+    }
 }

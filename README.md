@@ -102,9 +102,9 @@ owner's account. So:
 - Matching account exists but `email_verified: false` → backend returns
   `password_confirmation_required` instead of a session. The caller must submit that
   account's *current* password to `POST /oauth/oidc/confirm-link`; only on success does
-  the account become `email_verified: true` and the identity link. (There's currently no
-  password-reset flow, so if the matching account was squatted by someone else and the
-  real owner never had its password, they're stuck — see TODO ledger.)
+  the account become `email_verified: true` and the identity link. (There's no email
+  delivery for password resets yet, so if the matching account was squatted by someone else and the
+  real owner never had its password, they're stuck — see [TODO.md](TODO.md).)
 
 The email itself is only trusted as proof when it comes with independent confirmation —
 `resolve_oidc_login` takes a `VerifiedEmail`, a type that can only be constructed by
@@ -113,8 +113,7 @@ checked OIDC id_token). This is enforced by the type system, not just a doc comm
 future caller can't accidentally pass an unconfirmed email and reopen the same
 account-takeover hole for the "already verified" merge path.
 
-bff routes. Two independent per-IP rate-limit buckets (`tower_governor`, see TODO
-ledger) sit in front: one shared by `/login` + `/register`, one shared by every
+bff routes. Two independent per-IP rate-limit buckets (`tower_governor`) sit in front: one shared by `/login` + `/register`, one shared by every
 proxied route — hammering one side can't burn the other's budget. `/health` is
 exempt (a cheap liveness check infra commonly polls, shouldn't get caught in either
 bucket):
@@ -152,45 +151,6 @@ Backend routes:
 | GET    | `/oauth/oidc/{provider}/login`    | Not for the browser directly -- bff proxies this. Redirects to the provider's consent screen; `404` for an unknown `provider`                                                                                                                                                                                                                                             |
 | GET    | `/oauth/oidc/{provider}/callback` | Not for the provider directly -- bff forwards `code`+`state` here server-to-server. Resolves the OIDC identity to a user by verified email (see `UserStorage::resolve_oidc_login`); `{status: "authenticated", login_session}` on success, or `{status: "password_confirmation_required", pending_link_token, email}` if a matching account exists but isn't verified yet |
 | POST   | `/oauth/oidc/confirm-link`        | `{pending_link_token, password}`. Verifies the password against the account named in the pending link; on success marks it `email_verified` and links the identity, `{ login_session }`; `401` on wrong password, `400` if the token is invalid/expired                                                                                                                   |
-
-## TODO ledger
-
-Open items, in priority order (highest first):
-
-- [ ] **No password-reset flow.** An OIDC login whose email matches an existing
-      but unverified local account can't merge into it automatically (would be
-      an account-takeover vector -- see `UserStorage::resolve_oidc_login`), so
-      it's routed to `/oauth/oidc/confirm-link`, which requires that account's
-      *current* password. If the account was squatted by someone else (the
-      real owner never had a password for it, e.g. an attacker pre-registered
-      their email), there is currently no way back in -- the real owner is
-      stuck. The fix is a standard email-based password-reset flow (proves
-      mailbox control independently of any password), which also needs
-      outbound email infrastructure this app doesn't have yet (no
-      SMTP/transactional-email integration anywhere in the codebase). Once
-      built, a completed reset should also flip that account's
-      `email_verified` to `true` (mailbox control is proof of ownership,
-      same as an OIDC provider's), which then lets a subsequent OIDC login
-      link automatically via the existing verified-match path -- no special
-      case needed for the reset-then-OIDC order.
-- [ ] **No server-side password policy.** `minlength="8"` on `register.html` is
-      client-side only; `register.rs` accepts any length, including empty, via a
-      direct API call.
-- [ ] **Client authentication** — the bff's token-exchange request already carries
-      `client_id`/`client_secret` fields (currently always `None`); wiring real
-      client credentials into the backend's `/oauth/token` is future work for
-      defense in depth alongside PKCE.
-- [ ] **No CSRF token on the authenticated proxy layer.** Once a user has the
-      `wa_session` cookie, any state-changing request `proxy.rs` forwards is the
-      classic CSRF shape (ambient cookie auth, attached automatically regardless of
-      which site triggered the request). Currently mitigated only by
-      `SameSite=Lax` on the cookie (blocks it on cross-site POST, but still sent on
-      a top-level cross-site GET, and offers nothing if the cookie ever needs
-      `SameSite=None`, e.g. for a cross-site embedded frontend). A double-submit
-      cookie (random value set on login, required to match a header/field on
-      state-changing proxied requests) would add real defense-in-depth here,
-      independent of browser SameSite support. Lower priority than the items
-      above -- SameSite=Lax is a working mitigation today, this is belt-and-suspenders.
 
 ## Prerequisites
 
@@ -300,6 +260,31 @@ login_claims_handler:
 ```
 
 Credentials for it are passed the same way, as `WA_PLUGIN_LOGIN_CLAIMS_ENV_<NAME>`.
+
+An OIDC provider entry can also set `extra_claims: {<field>: <id_token claim>}` (e.g.
+`last_name: family_name`; claim names vary by provider, so nothing is mapped by default).
+On a user's first login through that provider the mapped claims are handed to
+`extra_data_handler` like a register request's extra fields; a handler failure fails the login
+(`502`) and no user is created.
+
+```yaml
+oidc_providers:
+  google:
+    client_id: set-in-.env
+    client_secret: set-in-.env
+    issuer: https://accounts.google.com
+    redirect_uri: https://bff.example.com/oidc/google/callback
+    extra_claims:
+      first_name: given_name    # Google's id_token claim names (`profile` scope)
+      last_name: family_name
+extra_data_handler:
+  kind: webhook
+  url: http://localhost:10001/hooks/register
+```
+
+Google returns no phone number over OIDC, so don't map one for it. Setting `extra_claims`
+without both an `extra_data_handler` and a `login_claims_handler` makes backend refuse to
+start (the fields are pointless unless they also come back as token claims).
 
 ### Test doubles (`testing/`)
 

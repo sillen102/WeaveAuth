@@ -69,14 +69,17 @@ mod controller {
 
     impl From<TokenServiceError> for TokenError {
         fn from(err: TokenServiceError) -> Self {
+            if let TokenServiceError::DownstreamServiceFailed(_) | TokenServiceError::ReservedClaimOverridden(_) = &err {
+                tracing::warn!(%err, "token request failed");
+            }
             match err {
                 TokenServiceError::InvalidCode => TokenError::InvalidCode,
                 TokenServiceError::RedirectUriMismatch => TokenError::RedirectUriMismatch,
                 TokenServiceError::InvalidCodeVerifier => TokenError::InvalidCodeVerifier,
                 TokenServiceError::MissingParameters => TokenError::MissingParameters,
                 TokenServiceError::InvalidRefreshToken => TokenError::InvalidRefreshToken,
-                TokenServiceError::DownstreamServiceFailed => TokenError::DownstreamServiceFailed,
-                TokenServiceError::ReservedClaimOverridden => TokenError::ReservedClaimOverridden,
+                TokenServiceError::DownstreamServiceFailed(_) => TokenError::DownstreamServiceFailed,
+                TokenServiceError::ReservedClaimOverridden(_) => TokenError::ReservedClaimOverridden,
                 TokenServiceError::UnexpectedError => TokenError::UnexpectedError,
             }
         }
@@ -143,10 +146,10 @@ mod service {
         MissingParameters,
         #[error("invalid or expired refresh token")]
         InvalidRefreshToken,
-        #[error("downstream login-claims handler failed")]
-        DownstreamServiceFailed,
-        #[error("downstream login-claims handler returned a reserved claim name")]
-        ReservedClaimOverridden,
+        #[error("downstream login-claims handler failed: {0}")]
+        DownstreamServiceFailed(String),
+        #[error("downstream login-claims handler returned reserved claim name '{0}'")]
+        ReservedClaimOverridden(String),
         #[error("internal error")]
         UnexpectedError,
     }
@@ -249,9 +252,9 @@ mod service {
 
         let extra = match &state.login_claims_handler {
             Some(handler) => {
-                let claims = handler.fetch(user_id, &user.email).await.map_err(|_| TokenServiceError::DownstreamServiceFailed)?;
-                if claims.keys().any(|key| RESERVED_CLAIM_NAMES.contains(&key.as_str())) {
-                    return Err(TokenServiceError::ReservedClaimOverridden);
+                let claims = handler.fetch(user_id, &user.email).await.map_err(|error| TokenServiceError::DownstreamServiceFailed(error.0))?;
+                if let Some(reserved) = claims.keys().find(|key| RESERVED_CLAIM_NAMES.contains(&key.as_str())) {
+                    return Err(TokenServiceError::ReservedClaimOverridden(reserved.clone()));
                 }
                 claims.into_iter().collect()
             }
@@ -314,13 +317,13 @@ mod login_claims {
     /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
     const HOOK: &str = "login_claims";
 
-    /// Opaque failure signal -- callers only need to know the handler
-    /// couldn't produce claims, not why (the deployer's own handler is
-    /// responsible for its own error reporting/logging). Fetching claims
-    /// fails closed: an error here fails the token request, and no token is
-    /// issued.
-    #[derive(Debug)]
-    pub(crate) struct LoginClaimsError;
+    /// Why the handler couldn't produce claims. Handlers only return it; it
+    /// is logged once, by the controller that turns it into a response.
+    /// Fetching claims fails closed: an error here fails the token request,
+    /// and no token is issued.
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    pub(crate) struct LoginClaimsError(pub(crate) String);
 
     /// Implemented by whatever a deployer configures to supply extra JWT
     /// claims at token issuance (see `config::LoginClaimsHandlerConfig`).
@@ -354,8 +357,7 @@ mod login_claims {
                 PluginRequest { hook: HOOK.to_string(), user_id: user_id.to_string(), email: email.to_string(), data: None };
 
             let response = self.plugin.invoke(request).await.map_err(|status| {
-                tracing::warn!(code = ?status.code(), message = status.message(), "plugin rejected the login-claims request");
-                LoginClaimsError
+                LoginClaimsError(format!("plugin rejected the login-claims request: {:?}: {}", status.code(), status.message()))
             })?;
 
             Ok(response.data.map(plugin::struct_to_json).unwrap_or_default())
@@ -419,24 +421,18 @@ mod login_claims {
         async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
             let payload = LoginClaimsPayload { user_id, email };
             let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
-                tracing::warn!(%error, url = %self.url, "login-claims webhook request failed");
-                LoginClaimsError
+                LoginClaimsError(format!("login-claims webhook request to {} failed: {error}", self.url))
             })?;
 
             if !response.status().is_success() {
-                tracing::warn!(status = %response.status(), url = %self.url, "login-claims webhook returned a non-success status");
-                return Err(LoginClaimsError);
+                return Err(LoginClaimsError(format!("login-claims webhook {} returned {}", self.url, response.status())));
             }
 
             match response.json::<serde_json::Value>().await {
                 Ok(serde_json::Value::Object(claims)) => Ok(claims),
-                Ok(other) => {
-                    tracing::warn!(url = %self.url, body = %other, "login-claims webhook did not return a JSON object");
-                    Err(LoginClaimsError)
-                }
+                Ok(_) => Err(LoginClaimsError(format!("login-claims webhook {} did not return a JSON object", self.url))),
                 Err(error) => {
-                    tracing::warn!(%error, url = %self.url, "login-claims webhook response was not valid JSON");
-                    Err(LoginClaimsError)
+                    Err(LoginClaimsError(format!("login-claims webhook {} response was not valid JSON: {error}", self.url)))
                 }
             }
         }
@@ -553,7 +549,7 @@ mod tests {
     #[async_trait::async_trait]
     impl LoginClaimsHandler for FailingClaimsHandler {
         async fn fetch(&self, _user_id: Uuid, _email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
-            Err(LoginClaimsError)
+            Err(LoginClaimsError("stub failed".to_string()))
         }
     }
 
@@ -569,6 +565,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_extra_claims: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),

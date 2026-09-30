@@ -2,16 +2,27 @@
 // header it received (401 if none was sent). Used to verify the bff's
 // cookie -> Bearer token proxy swap actually reaches a downstream service.
 //
+// Also backend's webhook target for both plugin hooks (see backend/config.yaml):
+// POST /hooks/register stores first/last name + phone number per user_id,
+// POST /hooks/login-claims returns them as token claims. In-memory only.
+//
 // Run: cargo run
 // Port: $PORT, default 10001.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use axum::extract::Request;
 use axum::http::{header, StatusCode};
 use axum::response::Html;
-use axum::routing::any;
+use axum::routing::{any, post};
+use axum::Json;
 use axum::Router;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use serde_json::{json, Map, Value};
+
+static PROFILES: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
 
 #[tokio::main]
 async fn main() {
@@ -20,12 +31,43 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(10001);
 
-    let app = Router::new().fallback(any(handler));
+    let app = Router::new()
+        .route("/hooks/register", post(register_hook))
+        .route("/hooks/login-claims", post(login_claims_hook))
+        .fallback(any(handler));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
     println!("downstream-service listening on :{port}");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Registration webhook: body is `{user_id, email, fields}`.
+async fn register_hook(Json(body): Json<Value>) -> StatusCode {
+    let (Some(user_id), Some(fields)) = (body["user_id"].as_str(), body["fields"].as_object()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let field = |name: &str| fields.get(name).and_then(Value::as_str).unwrap_or_default();
+    let profile = json!({
+        "firstName": field("first_name"),
+        "lastName": field("last_name"),
+        "phoneNumberVerified": !field("phone_number").is_empty(),
+    });
+    PROFILES
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(user_id.to_string(), profile);
+    StatusCode::OK
+}
+
+/// Login-claims webhook: body is `{user_id, email}`; users without a stored
+/// profile (e.g. registered before a restart, or via OIDC) get no extra claims.
+async fn login_claims_hook(Json(body): Json<Value>) -> Json<Value> {
+    let profile = body["user_id"].as_str().and_then(|id| {
+        PROFILES.lock().unwrap().as_ref()?.get(id).cloned()
+    });
+    Json(profile.unwrap_or_else(|| Value::Object(Map::new())))
 }
 
 /// Decodes one base64url JWT segment (header or payload) and pretty-prints it

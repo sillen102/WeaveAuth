@@ -16,3 +16,14 @@ oidc_providers:
     client_secret: set-in-.env
     issuer: https://accounts.google.com
     redirect_uri: http://localhost:8080/oidc/google/callback
+    # Sent to extra_data_handler on first login: field name -> id_token claim.
+    extra_claims:
+      first_name: given_name
+      last_name: family_name
+# Local-testing webhooks served by testing/downstream-service.
+extra_data_handler:
+  kind: webhook
+  url: http://localhost:10001/hooks/register
+login_claims_handler:
+  kind: webhook
+  url: http://localhost:10001/hooks/login-claims

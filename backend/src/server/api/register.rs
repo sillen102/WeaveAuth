@@ -1,5 +1,7 @@
 pub(crate) use controller::register;
 pub(crate) use controller::register_doc;
+#[cfg(test)]
+pub(crate) use extra_data::ExtraDataError;
 pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, ProcessHandler, WebhookHandler};
 
 mod controller {
@@ -54,12 +56,15 @@ mod controller {
 
     impl From<RegisterServiceError> for RegisterError {
         fn from(err: RegisterServiceError) -> Self {
+            if let RegisterServiceError::DownstreamServiceFailed(_) = &err {
+                tracing::warn!(%err, "registration failed");
+            }
             match err {
                 RegisterServiceError::InvalidEmail => RegisterError::InvalidEmail,
                 RegisterServiceError::EmailTaken => RegisterError::EmailTaken,
                 RegisterServiceError::ExtraDataNotSupported => RegisterError::ExtraDataNotSupported,
                 RegisterServiceError::ExtraDataTooLarge => RegisterError::ExtraDataTooLarge,
-                RegisterServiceError::DownstreamServiceFailed => RegisterError::DownstreamServiceFailed,
+                RegisterServiceError::DownstreamServiceFailed(_) => RegisterError::DownstreamServiceFailed,
                 RegisterServiceError::UnexpectedError => RegisterError::UnexpectedError,
             }
         }
@@ -112,8 +117,8 @@ mod service {
         ExtraDataNotSupported,
         #[error("too many extra registration fields, or a field is too large")]
         ExtraDataTooLarge,
-        #[error("downstream extra-data handler rejected the registration")]
-        DownstreamServiceFailed,
+        #[error("downstream extra-data handler rejected the registration: {0}")]
+        DownstreamServiceFailed(String),
         #[error("internal error")]
         UnexpectedError,
     }
@@ -168,7 +173,7 @@ mod service {
             handler
                 .handle(user_id, &email, &extra)
                 .await
-                .map_err(|_| RegisterServiceError::DownstreamServiceFailed)?;
+                .map_err(|error| RegisterServiceError::DownstreamServiceFailed(error.0))?;
         }
 
         let now = Utc::now();
@@ -215,11 +220,11 @@ mod extra_data {
     /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
     const HOOK: &str = "registration";
 
-    /// Opaque failure signal -- callers only need to know the handler rejected
-    /// the registration, not why (the deployer's own handler is responsible for
-    /// its own error reporting/logging).
-    #[derive(Debug)]
-    pub(crate) struct ExtraDataError;
+    /// Why the handler rejected the registration. Handlers only return it;
+    /// it is logged once, by the controller that turns it into a response.
+    #[derive(Debug, thiserror::Error, Eq, PartialEq)]
+    #[error("{0}")]
+    pub(crate) struct ExtraDataError(pub(crate) String);
 
     /// Implemented by whatever a deployer configures to receive the fields a
     /// register request carries beyond `email`/`password` (see
@@ -256,12 +261,11 @@ mod extra_data {
                 data: Some(plugin::json_to_struct(data)),
             };
 
-            self.plugin.invoke(request).await.map(|_| ()).map_err(|status| {
-                // Registration only needs to know the plugin rejected it; the
-                // reason is the deployer's to read here.
-                tracing::warn!(code = ?status.code(), message = status.message(), "plugin rejected the registration");
-                ExtraDataError
-            })
+            self.plugin
+                .invoke(request)
+                .await
+                .map(|_| ())
+                .map_err(|status| ExtraDataError(format!("plugin rejected the registration: {:?}: {}", status.code(), status.message())))
         }
     }
 
@@ -323,15 +327,13 @@ mod extra_data {
         async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
             let payload = ExtraDataPayload { user_id, email, fields };
             let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
-                tracing::warn!(%error, url = %self.url, "extra-data webhook request failed");
-                ExtraDataError
+                ExtraDataError(format!("extra-data webhook request to {} failed: {error}", self.url))
             })?;
 
             if response.status().is_success() {
                 Ok(())
             } else {
-                tracing::warn!(status = %response.status(), url = %self.url, "extra-data webhook returned a non-success status");
-                Err(ExtraDataError)
+                Err(ExtraDataError(format!("extra-data webhook {} returned {}", self.url, response.status())))
             }
         }
     }
@@ -450,6 +452,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_extra_claims: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
@@ -553,7 +556,7 @@ mod tests {
             if self.succeed {
                 Ok(())
             } else {
-                Err(ExtraDataError)
+                Err(ExtraDataError("stub rejected".to_string()))
             }
         }
     }

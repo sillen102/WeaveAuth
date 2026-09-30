@@ -48,6 +48,11 @@ module outside the Cargo workspace, built by its own mise tasks.
 - Avoid functions that return `bool` for a success/failure outcome; return `Result<T, MyError>` with an error enum instead, so callers can match on and log the actual failure reason.
 - Async: use `async/await` with `tokio` runtime for IO-bound operations.
 - Logging: use `tracing` for structured logging; avoid logging sensitive information.
+  - **Log an error or return it, never both.** An error is logged exactly once. Code that
+    returns an error (service, storage, handler impls) carries the cause in it and does not log
+    it; the top level (the controller, or `From<XyzServiceError> for XyzError`) logs it just
+    before handing over the response. Code that swallows an error instead of returning it logs
+    it at that spot.
 - Never use ignore in documentation tests.
 - Keep changes minimal and localized; prefer the shortest working change.
 
@@ -158,8 +163,7 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   storage (`InMemoryPkceStorage`) is single-use and TTL'd; `redirect_uri` is
   allowlist-checked in `server/api/authorize.rs`. `model/user.rs` /
   `InMemoryUserStorage` and `model/session.rs` / `InMemorySessionStorage` exist but are
-  intentionally unwired (real user auth and session ownership are deferred to bff —
-  see README TODO ledger).
+  intentionally unwired (real user auth and session ownership are deferred to bff).
 - `bff/src/server/mod.rs` — `AppState::new(Config)` + `router(AppState)`, also exposed
   as `app(Config)` for tests. Owns `InMemorySessionStorage` (session_id →
   access/refresh token). The `http_client` has `redirect::Policy::none()` — needed so
@@ -176,7 +180,7 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   mints a session, sets the `Set-Cookie` header directly (no cookie crate
   dependency), and only then replies to the browser with one 303 to the caller's
   `redirect_uri`. This relies on backend's `/oauth/authorize` having no interactive
-  step; see README TODO ledger item 5.
+  step.
 - `bff/src/server/api/proxy.rs` — `.fallback(proxy)` in the router: any request not
   matching `/health` or `/login` is checked against `Config::routes` (longest
   `path_prefix` wins), the session cookie is resolved to an access token via

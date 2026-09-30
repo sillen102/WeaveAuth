@@ -176,6 +176,13 @@ pub struct OidcProviderConfig {
     /// not backend's own address. bff forwards the provider's callback
     /// request to backend's matching route server-to-server.
     pub redirect_uri: String,
+    /// Extra profile fields to take from this provider's id_token, as
+    /// `field name -> id_token claim name` (e.g. `last_name: family_name`).
+    /// Claim names differ per provider, so nothing is forwarded by default.
+    /// On a user's first login through this provider the fields are handed to
+    /// the extra-data handler, same as a register request's extra fields.
+    #[serde(default)]
+    pub extra_claims: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -404,6 +411,30 @@ mod tests {
             assert_eq!(google.client_secret.expose_secret(), "my-client-secret");
             assert_eq!(google.issuer, "https://accounts.google.com");
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
+            assert!(google.extra_claims.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_oidc_providers_extra_claims_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  \
+                 google:\n    \
+                 client_id: my-client-id\n    \
+                 client_secret: my-client-secret\n    \
+                 issuer: https://accounts.google.com\n    \
+                 redirect_uri: http://bff.test/oidc/google/callback\n    \
+                 extra_claims:\n      \
+                 last_name: family_name\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            assert_eq!(google.extra_claims.get("last_name").map(String::as_str), Some("family_name"));
             Ok(())
         });
     }

@@ -99,6 +99,10 @@ pub(crate) trait UserStorage {
     /// concurrent logins for the same new identity can't create two separate
     /// accounts.
     ///
+    /// `new_user_id` is the id case 4 gives the created user, chosen by the
+    /// caller so it can tell a downstream service about the user before the
+    /// user exists. Unused for cases 1-3.
+    ///
     /// `email` is a [`VerifiedEmail`], not a bare string, specifically so
     /// case 2 above -- merging into an *already-verified* account -- can't
     /// be reached with an unconfirmed claim by accident: an attacker who can
@@ -106,7 +110,13 @@ pub(crate) trait UserStorage {
     /// able to attach themselves to a victim's verified account. Constructing
     /// a `VerifiedEmail` forces the call site to name its actual proof (see
     /// `VerifiedEmail::new`).
-    async fn resolve_oidc_login(&mut self, provider: &str, subject: &str, email: &VerifiedEmail) -> OidcLinkOutcome;
+    async fn resolve_oidc_login(
+        &mut self,
+        provider: &str,
+        subject: &str,
+        email: &VerifiedEmail,
+        new_user_id: Uuid,
+    ) -> OidcLinkOutcome;
     /// Links `(provider, subject)` to `user_id` and marks it `email_verified`.
     /// `None` if `user_id` no longer exists.
     ///
