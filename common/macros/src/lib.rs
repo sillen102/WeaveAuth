@@ -13,11 +13,7 @@
 )]
 #![cfg_attr(
     test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing
-    )
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
 use proc_macro::TokenStream;

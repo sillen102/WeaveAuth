@@ -9,7 +9,8 @@ async fn main() -> anyhow::Result<()> {
     // as the same user: bff, login, and any plugin configured as this uid.
     // First, so the window in which they're readable is as short as it gets.
     #[cfg(target_os = "linux")]
-    let dumpable = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    let dumpable =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
 
     let config = Config::load()?;
 

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::server::router::router;
-use crate::storage::in_memory::InMemorySessionStorage;
 use crate::storage::ExpiryMaintenance;
+use crate::storage::in_memory::InMemorySessionStorage;
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use weaveauth_login::{app, Config};
+use weaveauth_login::{Config, app};
 
 fn test_config() -> Config {
     Config {
@@ -120,7 +120,11 @@ async fn login_page_shows_the_generic_error_message() {
     let app = app(test_config());
 
     let resp = app
-        .oneshot(Request::get("/login.html?error=1").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/login.html?error=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -225,7 +229,11 @@ async fn register_page_shows_the_taken_email_error_message() {
     let app = app(test_config());
 
     let resp = app
-        .oneshot(Request::get("/register.html?error=1").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/register.html?error=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 

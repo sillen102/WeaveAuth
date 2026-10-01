@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
-use weaveauth_plugin_sdk::{Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve};
+use weaveauth_plugin_sdk::{
+    Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve,
+};
 
 const DATABASE_URL: &str = "DATABASE_URL";
 
@@ -20,21 +22,37 @@ struct PgProbe {
 
 #[weaveauth_plugin_sdk::async_trait]
 impl Plugin for PgProbe {
-    async fn invoke(&self, request: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+    async fn invoke(
+        &self,
+        request: Request<PluginRequest>,
+    ) -> Result<Response<PluginResponse>, Status> {
         let request = request.into_inner();
         if request.hook != "registration" {
             // This plugin is only ever wired into `extra_data_handler` -- see
             // the proto's own comment on why unimplemented is the correct
             // answer for a hook a plugin isn't wired into.
-            return Err(Status::unimplemented(format!("pg-probe-plugin does not handle hook {:?}", request.hook)));
+            return Err(Status::unimplemented(format!(
+                "pg-probe-plugin does not handle hook {:?}",
+                request.hook
+            )));
         }
 
-        let company = match request.data.as_ref().and_then(|data| data.fields.get("company")) {
-            Some(prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(company)) }) => company.clone(),
+        let company = match request
+            .data
+            .as_ref()
+            .and_then(|data| data.fields.get("company"))
+        {
+            Some(prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(company)),
+            }) => company.clone(),
             _ => String::new(),
         };
 
-        let client = self.pool.get().await.map_err(|error| Status::unavailable(error.to_string()))?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
         client
             .execute(
                 "insert into profile (user_id, email, company) values ($1, $2, $3)",
@@ -55,8 +73,13 @@ async fn main() -> anyhow::Result<()> {
     // `Verified` rather than `Fast`: a pooled connection whose backend
     // Postgres terminated has to be replaced, and only a round trip proves
     // it is still there.
-    let manager =
-        Manager::from_config(config, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Verified });
+    let manager = Manager::from_config(
+        config,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Verified,
+        },
+    );
     let pool = Pool::builder(manager)
         .create_timeout(Some(Duration::from_secs(5)))
         .runtime(Runtime::Tokio1)

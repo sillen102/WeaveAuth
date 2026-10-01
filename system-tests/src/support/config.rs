@@ -18,7 +18,11 @@ pub fn backend_config(redirect_uri_allowlist: Vec<String>) -> weaveauth::config:
     }
 }
 
-pub fn bff_config(backend_url: String, bff_url: String, trusted_origins: Vec<String>) -> weaveauth_bff::config::Config {
+pub fn bff_config(
+    backend_url: String,
+    bff_url: String,
+    trusted_origins: Vec<String>,
+) -> weaveauth_bff::config::Config {
     weaveauth_bff::config::Config {
         bff_url,
         backend_url,

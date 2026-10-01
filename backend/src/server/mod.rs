@@ -1,19 +1,19 @@
-use crate::config::{Config, ExtraDataHandlerConfig, LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig};
+use crate::config::{
+    Config, ExtraDataHandlerConfig, LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig,
+};
 use crate::oidc::{self, OidcClient};
 use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
-use crate::server::api::register::{
-    self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME,
-};
+use crate::server::api::register::{self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME};
 use crate::server::api::token::{
     self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
 };
 use crate::server::router::router;
+use crate::storage::ExpiryMaintenance;
 use crate::storage::in_memory::{
     InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
     InMemoryPasswordResetTokenStorage, InMemoryPendingOidcLinkStorage, InMemoryPkceStorage,
     InMemoryRefreshTokenStorage, InMemoryUserStorage,
 };
-use crate::storage::ExpiryMaintenance;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,14 +62,23 @@ impl AppState {
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
         // Fail at boot rather than silently dropping the claims on every login.
-        let maps_extra_claims =
-            |p: &OidcProviderConfig| !p.extra_claims.is_empty() || p.profile_apis.iter().any(|api| !api.claims.is_empty());
-        if let Some((name, _)) = config.oidc_providers.iter().find(|(_, p)| maps_extra_claims(p)) {
+        let maps_extra_claims = |p: &OidcProviderConfig| {
+            !p.extra_claims.is_empty() || p.profile_apis.iter().any(|api| !api.claims.is_empty())
+        };
+        if let Some((name, _)) = config
+            .oidc_providers
+            .iter()
+            .find(|(_, p)| maps_extra_claims(p))
+        {
             if config.extra_data_handler.is_none() {
-                anyhow::bail!("oidc provider '{name}' maps extra claims but no extra_data_handler is configured");
+                anyhow::bail!(
+                    "oidc provider '{name}' maps extra claims but no extra_data_handler is configured"
+                );
             }
             if config.login_claims_handler.is_none() {
-                anyhow::bail!("oidc provider '{name}' maps extra claims but no login_claims_handler is configured");
+                anyhow::bail!(
+                    "oidc provider '{name}' maps extra claims but no login_claims_handler is configured"
+                );
             }
         }
         for api in config.oidc_providers.values().flat_map(|p| &p.profile_apis) {
@@ -83,9 +92,18 @@ impl AppState {
                 .redirect(openidconnect::reqwest::redirect::Policy::none())
                 .build()?,
         );
-        let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
-        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref(), config.setuid_helper.as_deref()).await?;
-        let login_claims_handler = build_login_claims_handler(config.login_claims_handler.as_ref(), config.setuid_helper.as_deref()).await?;
+        let oidc_providers =
+            oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
+        let extra_data_handler = build_extra_data_handler(
+            config.extra_data_handler.as_ref(),
+            config.setuid_helper.as_deref(),
+        )
+        .await?;
+        let login_claims_handler = build_login_claims_handler(
+            config.login_claims_handler.as_ref(),
+            config.setuid_helper.as_deref(),
+        )
+        .await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -98,16 +116,34 @@ impl AppState {
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
             oidc_providers: Arc::new(oidc_providers),
             oidc_profile_apis: Arc::new(
-                config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.profile_apis.clone())).collect(),
+                config
+                    .oidc_providers
+                    .iter()
+                    .map(|(name, p)| (name.clone(), p.profile_apis.clone()))
+                    .collect(),
             ),
-            oidc_scopes: Arc::new(config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.scopes.clone())).collect()),
+            oidc_scopes: Arc::new(
+                config
+                    .oidc_providers
+                    .iter()
+                    .map(|(name, p)| (name.clone(), p.scopes.clone()))
+                    .collect(),
+            ),
             oidc_extra_claims: Arc::new(
-                config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.extra_claims.clone())).collect(),
+                config
+                    .oidc_providers
+                    .iter()
+                    .map(|(name, p)| (name.clone(), p.extra_claims.clone()))
+                    .collect(),
             ),
             oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
-            pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
+            pending_oidc_links: InMemoryPendingOidcLinkStorage::new(
+                config.pending_oidc_link_ttl_secs,
+            ),
             oidc_http_client,
-            password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
+            password_reset_tokens: InMemoryPasswordResetTokenStorage::new(
+                config.password_reset_token_ttl_secs,
+            ),
             max_bcrypt_cost: config.max_bcrypt_cost,
             extra_data_handler,
             login_claims_handler,
@@ -121,17 +157,26 @@ async fn build_extra_data_handler(
 ) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
-        Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
-            Arc::new(register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
-        }
-        Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid }) => {
+        Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
+            register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
+        ),
+        Some(ExtraDataHandlerConfig::Process {
+            command,
+            args,
+            env,
+            timeout_secs,
+            startup_timeout_secs,
+            uid,
+            gid,
+        }) => {
             // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
-            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), EXTRA_DATA_PLUGIN_NAME)
-                .into_iter()
-                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-                .collect();
+            let mut plugin_env: HashMap<_, _> =
+                forwarded_env(std::env::vars_os(), EXTRA_DATA_PLUGIN_NAME)
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                    .collect();
             plugin_env.extend(env.clone());
 
             let plugin = PluginProcess::start(PluginConfig {
@@ -157,17 +202,26 @@ async fn build_login_claims_handler(
 ) -> anyhow::Result<Option<Arc<dyn LoginClaimsHandler>>> {
     let handler: Arc<dyn LoginClaimsHandler> = match config {
         None => return Ok(None),
-        Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => {
-            Arc::new(token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
-        }
-        Some(LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid }) => {
+        Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
+            token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
+        ),
+        Some(LoginClaimsHandlerConfig::Process {
+            command,
+            args,
+            env,
+            timeout_secs,
+            startup_timeout_secs,
+            uid,
+            gid,
+        }) => {
             // Ambient `WA_PLUGIN_LOGIN_CLAIMS_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
-            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), LOGIN_CLAIMS_PLUGIN_NAME)
-                .into_iter()
-                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-                .collect();
+            let mut plugin_env: HashMap<_, _> =
+                forwarded_env(std::env::vars_os(), LOGIN_CLAIMS_PLUGIN_NAME)
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                    .collect();
             plugin_env.extend(env.clone());
 
             let plugin = PluginProcess::start(PluginConfig {
@@ -193,7 +247,10 @@ pub async fn app_start(config: &Config) -> anyhow::Result<()> {
     tracing::info!("listening on {addr}");
 
     let state = AppState::new(config).await?;
-    spawn_expiry_sweep(state.clone(), Duration::from_secs(config.expiry_sweep_interval_secs));
+    spawn_expiry_sweep(
+        state.clone(),
+        Duration::from_secs(config.expiry_sweep_interval_secs),
+    );
 
     axum::serve(listener, router(state)).await?;
     Ok(())
@@ -220,8 +277,14 @@ mod tests {
 
     fn webhook_pair() -> (ExtraDataHandlerConfig, LoginClaimsHandlerConfig) {
         (
-            ExtraDataHandlerConfig::Webhook { url: "http://localhost:1/hook".to_string(), timeout_secs: 1 },
-            LoginClaimsHandlerConfig::Webhook { url: "http://localhost:1/claims".to_string(), timeout_secs: 1 },
+            ExtraDataHandlerConfig::Webhook {
+                url: "http://localhost:1/hook".to_string(),
+                timeout_secs: 1,
+            },
+            LoginClaimsHandlerConfig::Webhook {
+                url: "http://localhost:1/claims".to_string(),
+                timeout_secs: 1,
+            },
         )
     }
 
@@ -237,7 +300,7 @@ mod tests {
             redirect_uri: "http://localhost/callback".to_string(),
             extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
             scopes: vec!["email".to_string()],
-                profile_apis: Vec::new(),
+            profile_apis: Vec::new(),
         };
         Config {
             oidc_providers: [("google".to_string(), provider)].into(),
@@ -271,7 +334,10 @@ mod tests {
 
         let error = AppState::new(&config).await.err().expect("startup fails");
 
-        assert!(error.to_string().contains("extra_data_handler"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("extra_data_handler"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -280,7 +346,10 @@ mod tests {
 
         let error = AppState::new(&config).await.err().expect("startup fails");
 
-        assert!(error.to_string().contains("profile api url"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("profile api url"),
+            "unexpected error: {error}"
+        );
     }
 
     // Positive control: https passes the url check, so startup only fails
@@ -291,21 +360,36 @@ mod tests {
 
         let error = AppState::new(&config).await.err().expect("discovery fails");
 
-        assert!(!error.to_string().contains("profile api url"), "unexpected error: {error}");
+        assert!(
+            !error.to_string().contains("profile api url"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
     async fn refuses_to_start_with_extra_claims_but_no_extra_data_handler() {
-        let error = AppState::new(&config_with_extra_claims(None, Some(webhook_pair().1))).await.err().expect("startup fails");
+        let error = AppState::new(&config_with_extra_claims(None, Some(webhook_pair().1)))
+            .await
+            .err()
+            .expect("startup fails");
 
-        assert!(error.to_string().contains("extra_data_handler"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("extra_data_handler"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
     async fn refuses_to_start_with_extra_claims_but_no_login_claims_handler() {
-        let error = AppState::new(&config_with_extra_claims(Some(webhook_pair().0), None)).await.err().expect("startup fails");
+        let error = AppState::new(&config_with_extra_claims(Some(webhook_pair().0), None))
+            .await
+            .err()
+            .expect("startup fails");
 
-        assert!(error.to_string().contains("login_claims_handler"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("login_claims_handler"),
+            "unexpected error: {error}"
+        );
     }
 
     // Positive control: with both handlers the check passes and startup only
@@ -313,8 +397,14 @@ mod tests {
     #[tokio::test]
     async fn extra_claims_check_passes_when_both_handlers_are_configured() {
         let (extra, login) = webhook_pair();
-        let error = AppState::new(&config_with_extra_claims(Some(extra), Some(login))).await.err().expect("discovery fails");
+        let error = AppState::new(&config_with_extra_claims(Some(extra), Some(login)))
+            .await
+            .err()
+            .expect("discovery fails");
 
-        assert!(!error.to_string().contains("extra_claims"), "unexpected error: {error}");
+        assert!(
+            !error.to_string().contains("extra_claims"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -33,29 +33,39 @@ impl Plugin {
     fn start() -> Self {
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         writeln!(ours, "{TOKEN}").expect("hands over the token");
-        let child =
-            Command::new(PROBE).env_clear().stdin(Stdio::from(OwnedFd::from(theirs))).spawn().expect("the probe starts");
+        let child = Command::new(PROBE)
+            .env_clear()
+            .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .spawn()
+            .expect("the probe starts");
 
         ours.set_nonblocking(true).expect("nonblocking");
         let mut ours = Some(tokio::net::UnixStream::from_std(ours).expect("tokio stream"));
-        let channel = Endpoint::from_static("http://plugin.invalid").connect_with_connector_lazy(tower::service_fn(
-            move |_: Uri| {
+        let channel = Endpoint::from_static("http://plugin.invalid").connect_with_connector_lazy(
+            tower::service_fn(move |_: Uri| {
                 let stream = ours.take();
                 async move {
                     let stream = stream.ok_or(std::io::ErrorKind::NotConnected)?;
                     Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
                 }
-            },
-        ));
-        Self { child, client: PluginClient::new(channel) }
+            }),
+        );
+        Self {
+            child,
+            client: PluginClient::new(channel),
+        }
     }
 
     /// Calls the plugin presenting `token`, or nothing at all.
     async fn call(&self, token: Option<&str>) -> Result<(), tonic::Status> {
-        let mut request =
-            tonic::Request::new(PluginRequest { hook: "registration".to_string(), ..Default::default() });
+        let mut request = tonic::Request::new(PluginRequest {
+            hook: "registration".to_string(),
+            ..Default::default()
+        });
         if let Some(token) = token {
-            request.metadata_mut().insert(TOKEN_METADATA_KEY, token.parse().expect("ascii"));
+            request
+                .metadata_mut()
+                .insert(TOKEN_METADATA_KEY, token.parse().expect("ascii"));
         }
         self.client.clone().invoke(request).await.map(|_| ())
     }
@@ -76,14 +86,20 @@ async fn a_caller_on_the_socket_pair_presenting_the_token_is_served() {
 
     let result = plugin.call(Some(TOKEN)).await;
 
-    assert!(result.is_ok(), "the probe didn't serve its own connection: {result:?}");
+    assert!(
+        result.is_ok(),
+        "the probe didn't serve its own connection: {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_presenting_no_token_is_refused() {
     let plugin = Plugin::start();
 
-    let status = plugin.call(None).await.expect_err("an unauthenticated caller was served");
+    let status = plugin
+        .call(None)
+        .await
+        .expect_err("an unauthenticated caller was served");
 
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
@@ -92,7 +108,10 @@ async fn a_caller_presenting_no_token_is_refused() {
 async fn a_caller_presenting_the_wrong_token_is_refused() {
     let plugin = Plugin::start();
 
-    let status = plugin.call(Some("not-the-token")).await.expect_err("a caller with a bad token was served");
+    let status = plugin
+        .call(Some("not-the-token"))
+        .await
+        .expect_err("a caller with a bad token was served");
 
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
@@ -105,8 +124,11 @@ async fn a_caller_presenting_the_wrong_token_is_refused() {
 async fn a_plugin_exits_once_its_connection_closes() {
     let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
     writeln!(ours, "{TOKEN}").expect("hands over the token");
-    let mut child =
-        Command::new(PROBE).env_clear().stdin(Stdio::from(OwnedFd::from(theirs))).spawn().expect("the probe starts");
+    let mut child = Command::new(PROBE)
+        .env_clear()
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .spawn()
+        .expect("the probe starts");
 
     drop(ours);
 
@@ -121,12 +143,19 @@ async fn a_plugin_exits_once_its_connection_closes() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
-    assert!(status.success(), "the probe failed instead of stopping: {status}");
+    assert!(
+        status.success(),
+        "the probe failed instead of stopping: {status}"
+    );
 }
 
 /// Runs the probe with `stdin`, returning what it printed once it gave up.
 fn run_with_stdin(stdin: Stdio) -> std::process::Output {
-    Command::new(PROBE).env_clear().stdin(stdin).output().expect("the probe runs")
+    Command::new(PROBE)
+        .env_clear()
+        .stdin(stdin)
+        .output()
+        .expect("the probe runs")
 }
 
 // Started by hand (or by anything but WeaveAuth), a plugin has no
@@ -135,7 +164,10 @@ fn run_with_stdin(stdin: Stdio) -> std::process::Output {
 async fn a_plugin_without_a_socket_on_stdin_refuses_to_run() {
     let output = run_with_stdin(Stdio::null());
 
-    assert!(!output.status.success(), "a plugin with /dev/null for stdin started anyway");
+    assert!(
+        !output.status.success(),
+        "a plugin with /dev/null for stdin started anyway"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("stdin is not a unix socket"),
         "the failure doesn't say what's missing: {}",
@@ -147,7 +179,10 @@ async fn a_plugin_without_a_socket_on_stdin_refuses_to_run() {
 async fn a_plugin_with_a_pipe_on_stdin_refuses_to_run() {
     let output = run_with_stdin(Stdio::piped());
 
-    assert!(!output.status.success(), "a plugin with a pipe for stdin started anyway");
+    assert!(
+        !output.status.success(),
+        "a plugin with a pipe for stdin started anyway"
+    );
 }
 
 // An empty token is worse than none: it would authenticate every caller that
@@ -159,7 +194,10 @@ async fn a_plugin_given_an_empty_token_refuses_to_run() {
 
     let output = run_with_stdin(Stdio::from(OwnedFd::from(theirs)));
 
-    assert!(!output.status.success(), "a plugin with an empty token started anyway");
+    assert!(
+        !output.status.success(),
+        "a plugin with an empty token started anyway"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("no token"),
         "the failure doesn't say what's missing: {}",

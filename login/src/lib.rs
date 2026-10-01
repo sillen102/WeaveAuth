@@ -12,22 +12,18 @@
 )]
 #![cfg_attr(
     test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing
-    )
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
-use std::env;
+use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
-use figment::providers::{Env, Serialized};
 use figment::Figment;
+use figment::providers::{Env, Serialized};
 use serde::{Deserialize, Serialize};
+use std::env;
 use tera::{Context, Tera};
 use tower_http::services::ServeDir;
 

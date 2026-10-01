@@ -1,6 +1,6 @@
-use std::str::FromStr;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub(crate) enum CodeChallengeMethod {
@@ -27,7 +27,10 @@ mod tests {
 
     #[test]
     fn test_parses_supported_method() {
-        assert_eq!("S256".parse::<CodeChallengeMethod>(), Ok(CodeChallengeMethod::S256));
+        assert_eq!(
+            "S256".parse::<CodeChallengeMethod>(),
+            Ok(CodeChallengeMethod::S256)
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@ pub(crate) use controller::jwks_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::extract::State;
     use axum::Json;
+    use axum::extract::State;
     use serde_json::Value;
 
     use crate::server::AppState;
@@ -22,7 +22,6 @@ mod controller {
         Json(service::jwk_set(&state).await)
     }
 }
-
 
 mod service {
     use serde_json::Value;

@@ -1,17 +1,17 @@
 pub(crate) use controller::start_login;
 
 mod controller {
+    use axum::Form;
     use axum::body::Body;
     use axum::extract::State;
-    use axum::Form;
-    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::{IntoResponse, Response};
+    use common_macros::ErrorResponses;
     use serde::Deserialize;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
-    use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
+    use crate::server::origin_check::require_trusted_origin;
 
     use super::service::{self, LoginOutcome, LoginServiceError};
 
@@ -29,7 +29,10 @@ mod controller {
     #[error_response_no_openapi]
     pub(crate) enum LoginError {
         #[error("request did not come from a trusted origin")]
-        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        #[error_response(
+            StatusCode::FORBIDDEN,
+            details = "request did not come from a trusted origin"
+        )]
         UntrustedOrigin,
         #[error("redirect_uri is not allowed")]
         #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
@@ -38,7 +41,10 @@ mod controller {
         #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
         TokenExchangeFailed,
         #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
         BackendUnavailable,
     }
 
@@ -82,7 +88,10 @@ mod controller {
             }
             LoginOutcome::Authenticated(cookie) => Ok((
                 StatusCode::SEE_OTHER,
-                [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)],
+                [
+                    (header::LOCATION, req.redirect_uri),
+                    (header::SET_COOKIE, cookie),
+                ],
                 Body::empty(),
             )
                 .into_response()),
@@ -95,8 +104,8 @@ mod service {
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
-    use crate::server::api::complete_login::{complete_login, CompleteLoginServiceError};
     use crate::server::AppState;
+    use crate::server::api::complete_login::{CompleteLoginServiceError, complete_login};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum LoginServiceError {
@@ -202,9 +211,9 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
+    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
-    use axum::Form;
 
     use crate::config::Config;
     use crate::server::AppState;

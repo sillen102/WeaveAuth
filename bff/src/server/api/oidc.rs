@@ -3,21 +3,25 @@ pub(crate) use controller::oidc_confirm_link;
 pub(crate) use controller::start_oidc_login;
 
 mod controller {
+    use axum::Form;
     use axum::body::Body;
     use axum::extract::{Path, Query, State};
-    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::{AppendHeaders, IntoResponse, Response};
-    use axum::Form;
     use common_macros::ErrorResponses;
     use serde::Deserialize;
     use thiserror::Error;
 
-    use crate::server::cookie::{build_cookie, build_cross_site_cookie, clear_cookie, extract_cookie};
-    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
     use crate::server::AppState;
+    use crate::server::cookie::{
+        build_cookie, build_cross_site_cookie, clear_cookie, extract_cookie,
+    };
+    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
 
     use super::service::{self, ConfirmLinkOutcome, OidcCallbackOutcome};
-    use super::service::{OidcCallbackServiceError, OidcConfirmLinkServiceError, OidcLoginServiceError};
+    use super::service::{
+        OidcCallbackServiceError, OidcConfirmLinkServiceError, OidcLoginServiceError,
+    };
 
     #[derive(Deserialize)]
     pub(crate) struct OidcLoginRequest {
@@ -56,10 +60,16 @@ mod controller {
         #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
         UnknownProvider,
         #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
         BackendUnavailable,
         #[error("next is not a same-origin path or a trusted origin")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "next is not a same-origin path or a trusted origin"
+        )]
         InvalidNext,
     }
 
@@ -67,10 +77,16 @@ mod controller {
     #[error_response_no_openapi]
     pub(crate) enum OidcCallbackError {
         #[error("missing or expired oidc flow state")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "missing or expired oidc flow state")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "missing or expired oidc flow state"
+        )]
         MissingFlowState,
         #[error("oidc state does not match the browser's flow cookie")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "oidc state does not match the browser's flow cookie")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "oidc state does not match the browser's flow cookie"
+        )]
         StateMismatch,
         #[error("unknown oidc provider")]
         #[error_response(StatusCode::NOT_FOUND, details = "unknown oidc provider")]
@@ -81,16 +97,25 @@ mod controller {
     #[error_response_no_openapi]
     pub(crate) enum OidcConfirmLinkError {
         #[error("request did not come from a trusted origin")]
-        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        #[error_response(
+            StatusCode::FORBIDDEN,
+            details = "request did not come from a trusted origin"
+        )]
         UntrustedOrigin,
         #[error("redirect_uri is not allowed")]
         #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
         InvalidRedirectUri,
         #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
         BackendUnavailable,
         #[error("next is not a same-origin path or a trusted origin")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "next is not a same-origin path or a trusted origin")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "next is not a same-origin path or a trusted origin"
+        )]
         InvalidNext,
     }
 
@@ -168,8 +193,20 @@ mod controller {
             FLOW_COOKIE_TTL_SECS,
             secure,
         );
-        let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
-        let state_cookie = build_cookie(STATE_COOKIE, &started.csrf_state, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
+        let next_cookie = build_cookie(
+            NEXT_COOKIE,
+            &req.next,
+            FLOW_COOKIE_PATH,
+            FLOW_COOKIE_TTL_SECS,
+            secure,
+        );
+        let state_cookie = build_cookie(
+            STATE_COOKIE,
+            &started.csrf_state,
+            FLOW_COOKIE_PATH,
+            FLOW_COOKIE_TTL_SECS,
+            secure,
+        );
         let cookie_header = |cookie: &str| {
             HeaderValue::from_str(cookie)
                 .map(|value| (header::SET_COOKIE, value))
@@ -211,9 +248,18 @@ mod controller {
         }
         let secure = state.config.secure_cookies();
         let clear_flow_cookies = [
-            (header::SET_COOKIE, clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH, secure)),
-            (header::SET_COOKIE, clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH, secure)),
-            (header::SET_COOKIE, clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure)),
+            (
+                header::SET_COOKIE,
+                clear_cookie(REDIRECT_URI_COOKIE, FLOW_COOKIE_PATH, secure),
+            ),
+            (
+                header::SET_COOKIE,
+                clear_cookie(NEXT_COOKIE, FLOW_COOKIE_PATH, secure),
+            ),
+            (
+                header::SET_COOKIE,
+                clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure),
+            ),
         ];
 
         // These bail with the flow cookies cleared rather than `?` straight
@@ -262,7 +308,9 @@ mod controller {
             return Ok(with_cleared_cookies(OidcCallbackError::StateMismatch));
         }
 
-        match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri).await {
+        match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri)
+            .await
+        {
             Err(OidcCallbackServiceError::ConsentRequired) => {
                 tracing::info!("oidc callback refused: required permission not granted");
                 Ok(error_redirect_with(&next, "consent_required"))
@@ -271,7 +319,10 @@ mod controller {
                 tracing::warn!(%error, "oidc callback failed");
                 Ok(error_redirect(&next))
             }
-            Ok(OidcCallbackOutcome::PasswordConfirmationRequired { pending_link_token, email }) => {
+            Ok(OidcCallbackOutcome::PasswordConfirmationRequired {
+                pending_link_token,
+                email,
+            }) => {
                 // `email` (not sensitive, and also what the login page gates
                 // the confirm-link form on) goes on the URL, but
                 // `pending_link_token` (half a credential) goes in a
@@ -333,7 +384,11 @@ mod controller {
         // below rather than only on success.
         let clear_pending_link_cookie = (
             header::SET_COOKIE,
-            clear_cookie(PENDING_LINK_TOKEN_COOKIE, FLOW_COOKIE_PATH, state.config.secure_cookies()),
+            clear_cookie(
+                PENDING_LINK_TOKEN_COOKIE,
+                FLOW_COOKIE_PATH,
+                state.config.secure_cookies(),
+            ),
         );
 
         // `req.next` is already validated above, so both a missing/expired
@@ -345,7 +400,10 @@ mod controller {
             (
                 StatusCode::SEE_OTHER,
                 [clear_pending_link_cookie.clone()],
-                [(header::LOCATION, format!("{}{sep}error=link_failed", req.next))],
+                [(
+                    header::LOCATION,
+                    format!("{}{sep}error=link_failed", req.next),
+                )],
             )
                 .into_response()
         };
@@ -354,7 +412,14 @@ mod controller {
             return Ok(link_failed_redirect());
         };
 
-        match service::confirm_oidc_link(&mut state, &pending_link_token, &req.password, &req.redirect_uri).await? {
+        match service::confirm_oidc_link(
+            &mut state,
+            &pending_link_token,
+            &req.password,
+            &req.redirect_uri,
+        )
+        .await?
+        {
             ConfirmLinkOutcome::Failed => {
                 // Send the browser back to the plain login page rather than
                 // re-showing a confirm-link form that can no longer succeed.
@@ -372,12 +437,12 @@ mod controller {
 }
 
 mod service {
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
-    use crate::server::api::complete_login::complete_login;
     use crate::server::AppState;
+    use crate::server::api::complete_login::complete_login;
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum OidcLoginServiceError {
@@ -404,7 +469,9 @@ mod service {
         BackendUnavailable(String),
     }
 
-    impl From<crate::server::api::complete_login::CompleteLoginServiceError> for OidcConfirmLinkServiceError {
+    impl From<crate::server::api::complete_login::CompleteLoginServiceError>
+        for OidcConfirmLinkServiceError
+    {
         fn from(err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
             use crate::server::api::complete_login::CompleteLoginServiceError as E;
             match err {
@@ -414,7 +481,9 @@ mod service {
         }
     }
 
-    impl From<crate::server::api::complete_login::CompleteLoginServiceError> for OidcCallbackServiceError {
+    impl From<crate::server::api::complete_login::CompleteLoginServiceError>
+        for OidcCallbackServiceError
+    {
         fn from(err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
             OidcCallbackServiceError::ExchangeFailed(err.to_string())
         }
@@ -423,8 +492,13 @@ mod service {
     #[derive(Deserialize)]
     #[serde(tag = "status", rename_all = "snake_case")]
     pub(crate) enum OidcCallbackResponse {
-        Authenticated { login_session: String },
-        PasswordConfirmationRequired { pending_link_token: String, email: String },
+        Authenticated {
+            login_session: String,
+        },
+        PasswordConfirmationRequired {
+            pending_link_token: String,
+            email: String,
+        },
     }
 
     #[derive(Serialize)]
@@ -442,7 +516,10 @@ mod service {
     /// value like `..%2Fhealth` could steer the server-to-server request at
     /// arbitrary backend GET routes.
     pub(crate) fn is_valid_provider(provider: &str) -> bool {
-        !provider.is_empty() && provider.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        !provider.is_empty()
+            && provider
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     }
 
     pub(crate) struct StartedOidcLogin {
@@ -457,14 +534,20 @@ mod service {
     /// bound to this browser via a cookie (backend only keeps the CSRF state
     /// server-side, so without this the state token proves "some flow was
     /// started", not "this browser started it").
-    pub(crate) async fn start_oidc_login(state: &mut AppState, provider: &str) -> Result<StartedOidcLogin, OidcLoginServiceError> {
+    pub(crate) async fn start_oidc_login(
+        state: &mut AppState,
+        provider: &str,
+    ) -> Result<StartedOidcLogin, OidcLoginServiceError> {
         if !is_valid_provider(provider) {
             return Err(OidcLoginServiceError::UnknownProvider);
         }
 
         let backend_resp = state
             .http_client
-            .get(format!("{}/oauth/oidc/{provider}/login", state.config.backend_url))
+            .get(format!(
+                "{}/oauth/oidc/{provider}/login",
+                state.config.backend_url
+            ))
             .send()
             .await
             .map_err(|error| {
@@ -504,14 +587,22 @@ mod service {
                 OidcLoginServiceError::BackendUnavailable("login redirect carries no state".into())
             })?;
 
-        Ok(StartedOidcLogin { provider_auth_url, csrf_state })
+        Ok(StartedOidcLogin {
+            provider_auth_url,
+            csrf_state,
+        })
     }
 
     pub(crate) enum OidcCallbackOutcome {
-        Authenticated { cookie: String },
+        Authenticated {
+            cookie: String,
+        },
         /// Not a failure -- the login page renders a "confirm your password
         /// to link this account" form for this case.
-        PasswordConfirmationRequired { pending_link_token: String, email: String },
+        PasswordConfirmationRequired {
+            pending_link_token: String,
+            email: String,
+        },
     }
 
     /// Server-to-server half of the code exchange: hands `code`/`state` to
@@ -531,9 +622,13 @@ mod service {
                 let cookie = complete_login(state, &login_session, redirect_uri).await?;
                 Ok(OidcCallbackOutcome::Authenticated { cookie })
             }
-            OidcCallbackResponse::PasswordConfirmationRequired { pending_link_token, email } => {
-                Ok(OidcCallbackOutcome::PasswordConfirmationRequired { pending_link_token, email })
-            }
+            OidcCallbackResponse::PasswordConfirmationRequired {
+                pending_link_token,
+                email,
+            } => Ok(OidcCallbackOutcome::PasswordConfirmationRequired {
+                pending_link_token,
+                email,
+            }),
         }
     }
 
@@ -548,7 +643,10 @@ mod service {
     ) -> Result<OidcCallbackResponse, OidcCallbackServiceError> {
         let resp = state
             .http_client
-            .get(format!("{}/oauth/oidc/{provider}/callback", state.config.backend_url))
+            .get(format!(
+                "{}/oauth/oidc/{provider}/callback",
+                state.config.backend_url
+            ))
             .query(&[("code", code), ("state", req_state)])
             .send()
             .await
@@ -576,7 +674,9 @@ mod service {
     }
 
     pub(crate) enum ConfirmLinkOutcome {
-        Authenticated { cookie: String },
+        Authenticated {
+            cookie: String,
+        },
         /// Wrong password, or the (single-use) pending-link token is already
         /// dead -- either way there's nothing to retry with.
         Failed,
@@ -595,8 +695,14 @@ mod service {
     ) -> Result<ConfirmLinkOutcome, OidcConfirmLinkServiceError> {
         let backend_resp = state
             .http_client
-            .post(format!("{}/oauth/oidc/confirm-link", state.config.backend_url))
-            .json(&ConfirmLinkBackendRequest { pending_link_token, password })
+            .post(format!(
+                "{}/oauth/oidc/confirm-link",
+                state.config.backend_url
+            ))
+            .json(&ConfirmLinkBackendRequest {
+                pending_link_token,
+                password,
+            })
             .send()
             .await
             .map_err(|error| {
@@ -606,7 +712,9 @@ mod service {
                 ))
             })?;
 
-        if backend_resp.status() == StatusCode::UNAUTHORIZED || backend_resp.status() == StatusCode::BAD_REQUEST {
+        if backend_resp.status() == StatusCode::UNAUTHORIZED
+            || backend_resp.status() == StatusCode::BAD_REQUEST
+        {
             return Ok(ConfirmLinkOutcome::Failed);
         }
         if !backend_resp.status().is_success() {
@@ -634,14 +742,14 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
+    use axum::Form;
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue};
-    use axum::Form;
 
-    use crate::config::Config;
-    use crate::server::api::complete_login::CompleteLoginServiceError;
-    use crate::server::AppState;
     use super::service::OidcConfirmLinkServiceError;
+    use crate::config::Config;
+    use crate::server::AppState;
+    use crate::server::api::complete_login::CompleteLoginServiceError;
 
     fn state_with_trusted_origins(trusted_origins: Vec<String>) -> AppState {
         AppState::new(Config {
@@ -685,7 +793,8 @@ mod tests {
             next: "http://login.test/".to_string(),
         };
 
-        let result = start_oidc_login(State(state), Path("../health".to_string()), Query(req)).await;
+        let result =
+            start_oidc_login(State(state), Path("../health".to_string()), Query(req)).await;
 
         assert_eq!(result.err(), Some(OidcLoginError::UnknownProvider));
     }
@@ -698,8 +807,13 @@ mod tests {
             state: Some("s".to_string()),
         };
 
-        let result =
-            oidc_callback(State(state), Path("../health".to_string()), Query(req), HeaderMap::new()).await;
+        let result = oidc_callback(
+            State(state),
+            Path("../health".to_string()),
+            Query(req),
+            HeaderMap::new(),
+        )
+        .await;
 
         assert_eq!(result.err(), Some(OidcCallbackError::UnknownProvider));
     }

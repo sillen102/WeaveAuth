@@ -366,7 +366,8 @@ impl Config {
 /// always accepted; `http://` only for loopback, for local dev/testing against
 /// a service on the same machine. `what` names the setting in the error.
 pub(crate) fn require_https_or_loopback(what: &str, url: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid {what} {url:?}: {e}"))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid {what} {url:?}: {e}"))?;
     let is_loopback = match parsed.host() {
         Some(url::Host::Domain(domain)) => domain == "localhost",
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -399,9 +400,13 @@ mod tests {
             jail.create_file("config.yaml", "port: 1984\n")?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
 
-            let error = Config::load().expect_err("an unreadable config must not fall back to defaults");
+            let error =
+                Config::load().expect_err("an unreadable config must not fall back to defaults");
 
-            assert!(error.to_string().contains("config.yaml/nested.yaml"), "unhelpful error: {error}");
+            assert!(
+                error.to_string().contains("config.yaml/nested.yaml"),
+                "unhelpful error: {error}"
+            );
             Ok(())
         });
     }
@@ -420,7 +425,8 @@ mod tests {
 
     #[test]
     fn rejects_plain_http_for_a_non_loopback_host_naming_what_it_checked() {
-        let error = require_https_or_loopback("hook url", "http://internal.example.com/hook").unwrap_err();
+        let error =
+            require_https_or_loopback("hook url", "http://internal.example.com/hook").unwrap_err();
 
         assert!(error.to_string().contains("hook url"), "{error}");
     }
@@ -552,13 +558,19 @@ mod tests {
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
-            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            let google = config
+                .oidc_providers
+                .get("google")
+                .expect("google provider loaded");
             assert_eq!(google.client_id, "my-client-id");
             assert_eq!(google.client_secret.expose_secret(), "my-client-secret");
             assert_eq!(google.issuer, "https://accounts.google.com");
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
             assert!(google.extra_claims.is_empty());
-            assert_eq!(google.scopes, vec!["email".to_string(), "profile".to_string()]);
+            assert_eq!(
+                google.scopes,
+                vec!["email".to_string(), "profile".to_string()]
+            );
             assert!(google.profile_apis.is_empty());
             Ok(())
         });
@@ -588,10 +600,17 @@ mod tests {
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
-            let apis = &config.oidc_providers.get("google").expect("google provider loaded").profile_apis;
+            let apis = &config
+                .oidc_providers
+                .get("google")
+                .expect("google provider loaded")
+                .profile_apis;
             assert_eq!(apis.len(), 2);
             assert_eq!(apis[0].url, "https://people.test/me");
-            assert_eq!(apis[0].claims.get("phone_number").map(String::as_str), Some("/phoneNumbers/0/value"));
+            assert_eq!(
+                apis[0].claims.get("phone_number").map(String::as_str),
+                Some("/phoneNumbers/0/value")
+            );
             assert!(!apis[0].required, "not required unless asked");
             assert_eq!(apis[0].scope, None);
             assert_eq!(apis[1].scope.as_deref(), Some("https://other.test/scope"));
@@ -617,7 +636,10 @@ mod tests {
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
-            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            let google = config
+                .oidc_providers
+                .get("google")
+                .expect("google provider loaded");
             assert_eq!(google.scopes, vec!["email".to_string()]);
             Ok(())
         });
@@ -640,8 +662,14 @@ mod tests {
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
-            let google = config.oidc_providers.get("google").expect("google provider loaded");
-            assert_eq!(google.extra_claims.get("last_name").map(String::as_str), Some("family_name"));
+            let google = config
+                .oidc_providers
+                .get("google")
+                .expect("google provider loaded");
+            assert_eq!(
+                google.extra_claims.get("last_name").map(String::as_str),
+                Some("family_name")
+            );
             Ok(())
         });
     }
@@ -663,7 +691,10 @@ mod tests {
             jail.set_env("WA_OIDC_GOOGLE_CLIENT_SECRET", "env-client-secret");
 
             let config = Config::load().unwrap();
-            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            let google = config
+                .oidc_providers
+                .get("google")
+                .expect("google provider loaded");
             assert_eq!(google.client_id, "env-client-id");
             assert_eq!(google.client_secret.expose_secret(), "env-client-secret");
             // Non-secret fields still come from the file, untouched.
@@ -715,7 +746,9 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Webhook { timeout_secs, .. } => assert_eq!(timeout_secs, 10),
+                ExtraDataHandlerConfig::Webhook { timeout_secs, .. } => {
+                    assert_eq!(timeout_secs, 10)
+                }
                 other => unreachable!("only a webhook handler was configured, got {other:?}"),
             }
             Ok(())
@@ -729,7 +762,10 @@ mod tests {
             jail.set_env("WA_SETUID_HELPER", "/usr/local/bin/weaveauth-plugin-exec");
 
             let config = Config::load().unwrap();
-            assert_eq!(config.setuid_helper.as_deref(), Some("/usr/local/bin/weaveauth-plugin-exec"));
+            assert_eq!(
+                config.setuid_helper.as_deref(),
+                Some("/usr/local/bin/weaveauth-plugin-exec")
+            );
             Ok(())
         });
     }
@@ -745,13 +781,28 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid } => {
+                ExtraDataHandlerConfig::Process {
+                    command,
+                    args,
+                    env,
+                    timeout_secs,
+                    startup_timeout_secs,
+                    uid,
+                    gid,
+                } => {
                     assert_eq!(command, "/opt/plugins/register");
-                    assert_eq!((uid, gid), (1001, 1001), "a plugin runs as its own user unless told otherwise");
+                    assert_eq!(
+                        (uid, gid),
+                        (1001, 1001),
+                        "a plugin runs as its own user unless told otherwise"
+                    );
                     assert_eq!(timeout_secs, 5);
                     assert_eq!(startup_timeout_secs, 10);
                     assert!(args.is_empty());
-                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
+                    assert!(
+                        env.is_empty(),
+                        "a plugin is given no environment unless the deployer sets one"
+                    );
                 }
                 other => unreachable!("only a process handler was configured, got {other:?}"),
             }
@@ -770,10 +821,20 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process { args, env, timeout_secs, uid, gid, .. } => {
+                ExtraDataHandlerConfig::Process {
+                    args,
+                    env,
+                    timeout_secs,
+                    uid,
+                    gid,
+                    ..
+                } => {
                     assert_eq!((uid, gid), (2000, 2001));
                     assert_eq!(args, vec!["--verbose".to_string()]);
-                    assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
+                    assert_eq!(
+                        env.get("DATABASE_URL").map(String::as_str),
+                        Some("postgres://plugin@db/appdata")
+                    );
                     assert_eq!(timeout_secs, 20);
                 }
                 other => unreachable!("only a process handler was configured, got {other:?}"),
@@ -825,13 +886,28 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.login_claims_handler.expect("handler configured") {
-                LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid } => {
+                LoginClaimsHandlerConfig::Process {
+                    command,
+                    args,
+                    env,
+                    timeout_secs,
+                    startup_timeout_secs,
+                    uid,
+                    gid,
+                } => {
                     assert_eq!(command, "/opt/plugins/claims");
-                    assert_eq!((uid, gid), (1002, 1002), "a plugin runs as its own user unless told otherwise");
+                    assert_eq!(
+                        (uid, gid),
+                        (1002, 1002),
+                        "a plugin runs as its own user unless told otherwise"
+                    );
                     assert_eq!(timeout_secs, 5);
                     assert_eq!(startup_timeout_secs, 10);
                     assert!(args.is_empty());
-                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
+                    assert!(
+                        env.is_empty(),
+                        "a plugin is given no environment unless the deployer sets one"
+                    );
                 }
                 other => unreachable!("only a process handler was configured, got {other:?}"),
             }

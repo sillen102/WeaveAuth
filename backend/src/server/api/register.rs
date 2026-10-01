@@ -6,14 +6,14 @@ pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, ProcessHandler, Webho
 
 mod controller {
     use aide::transform::TransformOperation;
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::Json;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
@@ -41,13 +41,22 @@ mod controller {
         #[error_response(StatusCode::CONFLICT, details = "email already taken")]
         EmailTaken,
         #[error("extra registration fields are not supported by this deployment")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "extra registration fields are not supported by this deployment")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "extra registration fields are not supported by this deployment"
+        )]
         ExtraDataNotSupported,
         #[error("too many extra registration fields, or a field is too large")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "too many extra registration fields, or a field is too large")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "too many extra registration fields, or a field is too large"
+        )]
         ExtraDataTooLarge,
         #[error("downstream extra-data handler rejected the registration")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "downstream extra-data handler rejected the registration")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "downstream extra-data handler rejected the registration"
+        )]
         DownstreamServiceFailed,
         #[error("internal error")]
         #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
@@ -70,7 +79,9 @@ mod controller {
                 RegisterServiceError::EmailTaken => RegisterError::EmailTaken,
                 RegisterServiceError::ExtraDataNotSupported => RegisterError::ExtraDataNotSupported,
                 RegisterServiceError::ExtraDataTooLarge => RegisterError::ExtraDataTooLarge,
-                RegisterServiceError::DownstreamServiceFailed(_) => RegisterError::DownstreamServiceFailed,
+                RegisterServiceError::DownstreamServiceFailed(_) => {
+                    RegisterError::DownstreamServiceFailed
+                }
                 RegisterServiceError::UnexpectedError(_) => RegisterError::UnexpectedError,
             }
         }
@@ -143,7 +154,9 @@ mod service {
         extra: HashMap<String, String>,
     ) -> Result<(), RegisterServiceError> {
         if extra.len() > MAX_EXTRA_FIELDS
-            || extra.iter().any(|(key, value)| key.len() > MAX_EXTRA_FIELD_LEN || value.len() > MAX_EXTRA_FIELD_LEN)
+            || extra.iter().any(|(key, value)| {
+                key.len() > MAX_EXTRA_FIELD_LEN || value.len() > MAX_EXTRA_FIELD_LEN
+            })
         {
             return Err(RegisterServiceError::ExtraDataTooLarge);
         }
@@ -177,7 +190,10 @@ mod service {
                 return Err(RegisterServiceError::EmailTaken);
             }
 
-            let handler = state.extra_data_handler.as_ref().ok_or(RegisterServiceError::ExtraDataNotSupported)?;
+            let handler = state
+                .extra_data_handler
+                .as_ref()
+                .ok_or(RegisterServiceError::ExtraDataNotSupported)?;
             handler
                 .handle(user_id, &email, &extra)
                 .await
@@ -240,7 +256,12 @@ mod extra_data {
     /// -- no user is created.
     #[async_trait::async_trait]
     pub(crate) trait ExtraDataHandler: Send + Sync {
-        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError>;
+        async fn handle(
+            &self,
+            user_id: Uuid,
+            email: &str,
+            fields: &HashMap<String, String>,
+        ) -> Result<(), ExtraDataError>;
     }
 
     /// Forwards extra registration fields to a deployer-supplied plugin process
@@ -259,9 +280,16 @@ mod extra_data {
 
     #[async_trait::async_trait]
     impl ExtraDataHandler for ProcessHandler {
-        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
-            let data: serde_json::Map<String, serde_json::Value> =
-                fields.iter().map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone()))).collect();
+        async fn handle(
+            &self,
+            user_id: Uuid,
+            email: &str,
+            fields: &HashMap<String, String>,
+        ) -> Result<(), ExtraDataError> {
+            let data: serde_json::Map<String, serde_json::Value> = fields
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                .collect();
             let request = PluginRequest {
                 hook: HOOK.to_string(),
                 user_id: user_id.to_string(),
@@ -273,7 +301,13 @@ mod extra_data {
                 .invoke(request)
                 .await
                 .map(|_| ())
-                .map_err(|status| ExtraDataError(format!("plugin rejected the registration: {:?}: {}", status.code(), status.message())))
+                .map_err(|status| {
+                    ExtraDataError(format!(
+                        "plugin rejected the registration: {:?}: {}",
+                        status.code(),
+                        status.message()
+                    ))
+                })
         }
     }
 
@@ -337,7 +371,10 @@ mod extra_data {
             if response.status().is_success() {
                 Ok(())
             } else {
-                Err(ExtraDataError(format!("extra-data webhook returned {}", response.status())))
+                Err(ExtraDataError(format!(
+                    "extra-data webhook returned {}",
+                    response.status()
+                )))
             }
         }
     }
@@ -362,9 +399,12 @@ mod extra_data {
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&server)
                 .await;
-            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT)
+                .expect("valid client");
 
-            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+            let result = handler
+                .handle(Uuid::new_v4(), "alice@example.com", &fields())
+                .await;
 
             assert!(result.is_ok());
         }
@@ -377,18 +417,24 @@ mod extra_data {
                 .respond_with(ResponseTemplate::new(500))
                 .mount(&server)
                 .await;
-            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT)
+                .expect("valid client");
 
-            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+            let result = handler
+                .handle(Uuid::new_v4(), "alice@example.com", &fields())
+                .await;
 
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn fails_when_the_endpoint_is_unreachable() {
-            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT)
+                .expect("valid client");
 
-            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+            let result = handler
+                .handle(Uuid::new_v4(), "alice@example.com", &fields())
+                .await;
 
             assert!(result.is_err());
         }
@@ -402,9 +448,12 @@ mod extra_data {
                 .mount(&server)
                 .await;
             let handler =
-                WebhookHandler::new(format!("{}/hook", server.uri()), Duration::from_millis(50)).expect("valid client");
+                WebhookHandler::new(format!("{}/hook", server.uri()), Duration::from_millis(50))
+                    .expect("valid client");
 
-            let result = handler.handle(Uuid::new_v4(), "alice@example.com", &fields()).await;
+            let result = handler
+                .handle(Uuid::new_v4(), "alice@example.com", &fields())
+                .await;
 
             assert!(result.is_err());
         }
@@ -415,9 +464,9 @@ mod extra_data {
 mod tests {
     use super::controller::*;
     use super::extra_data::{ExtraDataError, ExtraDataHandler};
-    use crate::storage::in_memory::InMemoryUserStorage;
-    use crate::storage::UserStorage;
     use crate::server::AppState;
+    use crate::storage::UserStorage;
+    use crate::storage::in_memory::InMemoryUserStorage;
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
     use std::collections::HashMap;
@@ -429,7 +478,8 @@ mod tests {
             users: InMemoryUserStorage::new(),
             login_sessions: crate::storage::in_memory::InMemoryLoginSessionStorage::new(60),
             redirect_uri_allowlist: Arc::new(vec![]),
-            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new()
+                .expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
@@ -440,7 +490,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
@@ -484,7 +535,10 @@ mod tests {
         assert_eq!(req.password, "hunter2");
         assert_eq!(
             req.extra,
-            HashMap::from([("company".to_string(), "Acme".to_string()), ("plan".to_string(), "pro".to_string())])
+            HashMap::from([
+                ("company".to_string(), "Acme".to_string()),
+                ("plan".to_string(), "pro".to_string())
+            ])
         );
     }
 
@@ -492,7 +546,11 @@ mod tests {
     async fn registers_user_with_hashed_password() {
         let state = state();
 
-        let result = register(State(state.clone()), Json(req("alice@example.com", "hunter2"))).await;
+        let result = register(
+            State(state.clone()),
+            Json(req("alice@example.com", "hunter2")),
+        )
+        .await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
     }
@@ -536,7 +594,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExtraDataHandler for StubHandler {
-        async fn handle(&self, _user_id: uuid::Uuid, _email: &str, _fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
+        async fn handle(
+            &self,
+            _user_id: uuid::Uuid,
+            _email: &str,
+            _fields: &HashMap<String, String>,
+        ) -> Result<(), ExtraDataError> {
             if self.succeed {
                 Ok(())
             } else {
@@ -567,7 +630,13 @@ mod tests {
         let result = register(State(state.clone()), Json(req)).await;
 
         assert_eq!(result, Err(RegisterError::DownstreamServiceFailed));
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_none());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_none()
+        );
     }
 
     struct CountingHandler {
@@ -576,7 +645,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExtraDataHandler for CountingHandler {
-        async fn handle(&self, _user_id: uuid::Uuid, _email: &str, _fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
+        async fn handle(
+            &self,
+            _user_id: uuid::Uuid,
+            _email: &str,
+            _fields: &HashMap<String, String>,
+        ) -> Result<(), ExtraDataError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -585,15 +659,27 @@ mod tests {
     #[tokio::test]
     async fn does_not_invoke_the_handler_for_an_already_taken_email() {
         let mut state = state();
-        let handler = Arc::new(CountingHandler { calls: std::sync::atomic::AtomicUsize::new(0) });
+        let handler = Arc::new(CountingHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
         state.extra_data_handler = Some(handler.clone());
 
-        let first = register(State(state.clone()), Json(req("alice@example.com", "hunter2"))).await;
+        let first = register(
+            State(state.clone()),
+            Json(req("alice@example.com", "hunter2")),
+        )
+        .await;
         assert_eq!(first, Ok(StatusCode::CREATED));
-        assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no extra fields on the first request");
+        assert_eq!(
+            handler.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no extra fields on the first request"
+        );
 
         let mut second_req = req("alice@example.com", "different-password");
-        second_req.extra.insert("company".to_string(), "Acme".to_string());
+        second_req
+            .extra
+            .insert("company".to_string(), "Acme".to_string());
         let second = register(State(state), Json(second_req)).await;
 
         assert_eq!(second, Err(RegisterError::EmailTaken));
@@ -610,7 +696,9 @@ mod tests {
     #[tokio::test]
     async fn invokes_the_handler_once_for_a_new_email() {
         let mut state = state();
-        let handler = Arc::new(CountingHandler { calls: std::sync::atomic::AtomicUsize::new(0) });
+        let handler = Arc::new(CountingHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
         state.extra_data_handler = Some(handler.clone());
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
@@ -619,7 +707,13 @@ mod tests {
 
         assert_eq!(result, Ok(StatusCode::CREATED));
         assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_some());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -34,29 +34,44 @@ mod tests {
 
     #[test]
     fn strips_plus_tag_from_local_part() {
-        assert_eq!(normalize_email("alice+newsletter@example.com"), "alice@example.com");
+        assert_eq!(
+            normalize_email("alice+newsletter@example.com"),
+            "alice@example.com"
+        );
     }
 
     #[test]
     fn keeps_hyphenated_local_parts_distinct() {
         assert_eq!(normalize_email("jane-doe@corp.com"), "jane-doe@corp.com");
-        assert_ne!(normalize_email("jane-doe@corp.com"), normalize_email("jane@corp.com"));
+        assert_ne!(
+            normalize_email("jane-doe@corp.com"),
+            normalize_email("jane@corp.com")
+        );
     }
 
     #[test]
     fn does_not_empty_a_local_part_that_starts_with_a_plus() {
         assert_eq!(normalize_email("+weird@corp.com"), "+weird@corp.com");
-        assert_ne!(normalize_email("+weird@corp.com"), normalize_email("+other@corp.com"));
+        assert_ne!(
+            normalize_email("+weird@corp.com"),
+            normalize_email("+other@corp.com")
+        );
     }
 
     #[test]
     fn lowercases_the_whole_address() {
-        assert_eq!(normalize_email("Alice+Tag@Example.com"), "alice@example.com");
+        assert_eq!(
+            normalize_email("Alice+Tag@Example.com"),
+            "alice@example.com"
+        );
     }
 
     #[test]
     fn trims_surrounding_whitespace() {
-        assert_eq!(normalize_email("  alice@example.com  "), "alice@example.com");
+        assert_eq!(
+            normalize_email("  alice@example.com  "),
+            "alice@example.com"
+        );
     }
 
     #[test]

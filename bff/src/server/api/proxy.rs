@@ -1,20 +1,20 @@
 pub(crate) use controller::proxy_router;
 
 mod controller {
-    use axum::http::StatusCode;
     use axum::Router;
     use axum::extract::{Request, State};
+    use axum::http::StatusCode;
     use axum::http::header;
     use axum::middleware::{self, Next};
     use axum::response::Response;
     use axum_reverse_proxy::ReverseProxy;
     use common::model::token::TokenType;
+    use common_macros::ErrorResponses;
     use secrecy::ExposeSecret;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
-    use crate::server::cookie::extract_cookie;
     use crate::server::AppState;
+    use crate::server::cookie::extract_cookie;
 
     use super::service::{self, ProxyServiceError};
 
@@ -53,7 +53,8 @@ mod controller {
             .routes
             .iter()
             .fold(Router::new(), |router, route| {
-                let upstream: Router = ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
+                let upstream: Router =
+                    ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
                 router.merge(upstream)
             });
 

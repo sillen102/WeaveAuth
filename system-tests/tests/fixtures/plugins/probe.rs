@@ -7,13 +7,18 @@
 
 use std::time::Duration;
 
-use weaveauth_plugin_sdk::{Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve};
+use weaveauth_plugin_sdk::{
+    Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve,
+};
 
 struct Probe;
 
 #[weaveauth_plugin_sdk::async_trait]
 impl Plugin for Probe {
-    async fn invoke(&self, request: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+    async fn invoke(
+        &self,
+        request: Request<PluginRequest>,
+    ) -> Result<Response<PluginResponse>, Status> {
         let request = request.into_inner();
         match request.hook.as_str() {
             "registration" => handle_registration(&request).await,
@@ -48,14 +53,22 @@ async fn handle_login_claims(request: &PluginRequest) -> Result<Response<PluginR
         Some("reject") => return Err(Status::invalid_argument("the probe was told to reject")),
         // Same reasoning as `handle_registration`'s "stall".
         Some("stall") => tokio::time::sleep(Duration::from_secs(600)).await,
-        Some("reserved") => return Ok(Response::new(PluginResponse { data: Some(reserved_claim()) })),
+        Some("reserved") => {
+            return Ok(Response::new(PluginResponse {
+                data: Some(reserved_claim()),
+            }));
+        }
         _ => {}
     }
-    Ok(Response::new(PluginResponse { data: Some(roles_claim()) }))
+    Ok(Response::new(PluginResponse {
+        data: Some(roles_claim()),
+    }))
 }
 
 fn sleep_ms(request: &PluginRequest) -> u64 {
-    string_field(request, "sleep_ms").and_then(|value| value.parse().ok()).unwrap_or(500)
+    string_field(request, "sleep_ms")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500)
 }
 
 /// Reads a string-valued field out of `request.data`, mirroring how
@@ -73,11 +86,13 @@ fn roles_claim() -> prost_types::Struct {
         fields: [(
             "roles".to_string(),
             prost_types::Value {
-                kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue {
-                    values: vec![prost_types::Value {
-                        kind: Some(prost_types::value::Kind::StringValue("admin".to_string())),
-                    }],
-                })),
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: vec![prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue("admin".to_string())),
+                        }],
+                    },
+                )),
             },
         )]
         .into(),
@@ -90,7 +105,11 @@ fn reserved_claim() -> prost_types::Struct {
     prost_types::Struct {
         fields: [(
             "sub".to_string(),
-            prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("attacker-controlled".to_string())) },
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(
+                    "attacker-controlled".to_string(),
+                )),
+            },
         )]
         .into(),
     }
@@ -103,12 +122,16 @@ fn reserved_claim() -> prost_types::Struct {
 fn check_environment() -> Result<(), Status> {
     for leaked in ["PATH", "HOME"] {
         if std::env::var_os(leaked).is_some() {
-            return Err(Status::permission_denied(format!("inherited {leaked} from WeaveAuth")));
+            return Err(Status::permission_denied(format!(
+                "inherited {leaked} from WeaveAuth"
+            )));
         }
     }
     match std::env::var("PLUGIN_CONFIGURED").as_deref() {
         Ok("yes") => Ok(()),
-        _ => Err(Status::failed_precondition("the configured environment never arrived")),
+        _ => Err(Status::failed_precondition(
+            "the configured environment never arrived",
+        )),
     }
 }
 
@@ -119,7 +142,8 @@ fn check_environment() -> Result<(), Status> {
 /// read is really attempted. Linux-only (`/proc`); driven from the container
 /// test.
 fn check_privilege_separation() -> Result<(), Status> {
-    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| Status::internal(error.to_string()))?;
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| Status::internal(error.to_string()))?;
     let uid = status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
@@ -127,7 +151,9 @@ fn check_privilege_separation() -> Result<(), Status> {
         .ok_or_else(|| Status::internal("no Uid line in /proc/self/status"))?;
     let expected = std::env::var("PLUGIN_EXPECTED_UID").unwrap_or_default();
     if uid != expected {
-        return Err(Status::permission_denied(format!("running as uid {uid}, expected {expected:?}")));
+        return Err(Status::permission_denied(format!(
+            "running as uid {uid}, expected {expected:?}"
+        )));
     }
 
     let target = match std::env::var("PLUGIN_ENVIRON_OF").as_deref() {
@@ -135,7 +161,9 @@ fn check_privilege_separation() -> Result<(), Status> {
         _ => std::os::unix::process::parent_id().to_string(),
     };
     if std::fs::read(format!("/proc/{target}/environ")).is_ok() {
-        return Err(Status::permission_denied(format!("could read /proc/{target}/environ")));
+        return Err(Status::permission_denied(format!(
+            "could read /proc/{target}/environ"
+        )));
     }
     Ok(())
 }
@@ -145,7 +173,9 @@ fn check_privilege_separation() -> Result<(), Status> {
 fn check_setuid_helper_denied() -> Result<(), Status> {
     match std::process::Command::new("/usr/local/bin/weaveauth-plugin-exec").output() {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
-        Err(error) => Err(Status::internal(format!("could not try the helper: {error}"))),
+        Err(error) => Err(Status::internal(format!(
+            "could not try the helper: {error}"
+        ))),
         Ok(_) => Err(Status::permission_denied("could run weaveauth-plugin-exec")),
     }
 }
@@ -156,8 +186,14 @@ fn check_setuid_helper_denied() -> Result<(), Status> {
 fn check_stdin_released() -> Result<(), Status> {
     use std::os::fd::AsFd;
 
-    let stdin = std::io::stdin().as_fd().try_clone_to_owned().map_err(|error| Status::internal(error.to_string()))?;
-    if std::os::unix::net::UnixStream::from(stdin).local_addr().is_ok() {
+    let stdin = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if std::os::unix::net::UnixStream::from(stdin)
+        .local_addr()
+        .is_ok()
+    {
         return Err(Status::failed_precondition("stdin is still the connection"));
     }
     Ok(())

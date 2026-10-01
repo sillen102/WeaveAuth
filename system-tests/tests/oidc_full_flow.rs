@@ -16,13 +16,16 @@ use weaveauth_system_tests::support;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use reqwest::cookie::CookieStore;
 use reqwest::Url;
+use reqwest::cookie::CookieStore;
 use support::config::{FINAL_REDIRECT, NEXT, NEXT_ORIGIN};
 use support::http::{redirect_target, stop_at_real_hosts, urlencoding};
 use support::{fake_idp, servers};
 
-fn backend_config_with_provider(issuer: String, oidc_callback_url: String) -> weaveauth::config::Config {
+fn backend_config_with_provider(
+    issuer: String,
+    oidc_callback_url: String,
+) -> weaveauth::config::Config {
     let mut providers = HashMap::new();
     providers.insert(
         "google".to_string(),
@@ -58,12 +61,19 @@ async fn oidc_login_authenticates_through_every_real_hop() -> anyhow::Result<()>
     let bff_url = format!("http://{bff_addr}");
     let callback_url = format!("{bff_url}/oidc/google/callback");
 
-    let (backend_url, _backend_handle) =
-        servers::spawn_backend(&backend_config_with_provider(idp.issuer.clone(), callback_url)).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config_with_provider(
+        idp.issuer.clone(),
+        callback_url,
+    ))
+    .await?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
     let jar = Arc::new(reqwest::cookie::Jar::default());
-    let client = reqwest::Client::builder().cookie_provider(jar.clone()).redirect(stop_at_real_hosts()).build()?;
+    let client = reqwest::Client::builder()
+        .cookie_provider(jar.clone())
+        .redirect(stop_at_real_hosts())
+        .build()?;
 
     let login_url = format!(
         "{bff_url}/oidc/google/login?redirect_uri={}&next={}",
@@ -73,12 +83,24 @@ async fn oidc_login_authenticates_through_every_real_hop() -> anyhow::Result<()>
     let resp = client.get(&login_url).send().await?;
     let status = resp.status();
     let target = redirect_target(&resp);
-    assert!(status.is_redirection(), "expected the chain to stop on a redirect to {FINAL_REDIRECT}, got {status}");
-    assert_eq!(target, FINAL_REDIRECT, "should land on the caller's redirect_uri");
+    assert!(
+        status.is_redirection(),
+        "expected the chain to stop on a redirect to {FINAL_REDIRECT}, got {status}"
+    );
+    assert_eq!(
+        target, FINAL_REDIRECT,
+        "should land on the caller's redirect_uri"
+    );
 
     let bff_origin: Url = bff_url.parse()?;
-    let cookies = jar.cookies(&bff_origin).map(|v| v.to_str().unwrap_or_default().to_string()).unwrap_or_default();
-    assert!(cookies.contains("wa_session="), "expected a real bff session cookie, got: {cookies}");
+    let cookies = jar
+        .cookies(&bff_origin)
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    assert!(
+        cookies.contains("wa_session="),
+        "expected a real bff session cookie, got: {cookies}"
+    );
 
     Ok(())
 }
@@ -96,11 +118,18 @@ async fn oidc_login_with_unverified_email_does_not_authenticate() -> anyhow::Res
     let bff_url = format!("http://{bff_addr}");
     let callback_url = format!("{bff_url}/oidc/google/callback");
 
-    let (backend_url, _backend_handle) =
-        servers::spawn_backend(&backend_config_with_provider(idp.issuer.clone(), callback_url)).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config_with_provider(
+        idp.issuer.clone(),
+        callback_url,
+    ))
+    .await?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().cookie_store(true).redirect(stop_at_real_hosts()).build()?;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(stop_at_real_hosts())
+        .build()?;
 
     let login_url = format!(
         "{bff_url}/oidc/google/login?redirect_uri={}&next={}",
@@ -110,7 +139,11 @@ async fn oidc_login_with_unverified_email_does_not_authenticate() -> anyhow::Res
     let resp = client.get(&login_url).send().await?;
     let target = redirect_target(&resp);
 
-    assert_eq!(target, format!("{NEXT}?error=1"), "unverified email must not authenticate");
+    assert_eq!(
+        target,
+        format!("{NEXT}?error=1"),
+        "unverified email must not authenticate"
+    );
 
     Ok(())
 }

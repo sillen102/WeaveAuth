@@ -1,9 +1,9 @@
-pub(crate) use service::{complete_login, CompleteLoginServiceError};
+pub(crate) use service::{CompleteLoginServiceError, complete_login};
 
 mod service {
-    use axum::http::{header, StatusCode};
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use axum::http::{StatusCode, header};
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Utc};
     use rand::RngExt;
     use serde::{Deserialize, Serialize};
@@ -12,8 +12,8 @@ mod service {
     use uuid::Uuid;
 
     use crate::model::session::SessionData;
-    use crate::server::cookie::build_cookie;
     use crate::server::AppState;
+    use crate::server::cookie::build_cookie;
     use crate::storage::SessionStorage;
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -84,7 +84,10 @@ mod service {
 
         let authorize_resp = state
             .http_client
-            .get(format!("{}/oauth/authorize?{}", state.config.backend_url, qs))
+            .get(format!(
+                "{}/oauth/authorize?{}",
+                state.config.backend_url, qs
+            ))
             .send()
             .await
             .map_err(|error| {

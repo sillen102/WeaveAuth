@@ -127,11 +127,20 @@ pub(crate) trait UserStorage {
     /// path that turns an *unverified* account's email into a verified one,
     /// so skipping that proof is exactly the account-takeover vector
     /// `resolve_oidc_login` refuses to do on its own.
-    async fn link_verified_oidc_identity(&mut self, user_id: Uuid, provider: &str, subject: &str) -> Option<User>;
+    async fn link_verified_oidc_identity(
+        &mut self,
+        user_id: Uuid,
+        provider: &str,
+        subject: &str,
+    ) -> Option<User>;
     /// Overwrites `user_id`'s password hash (used by `/oauth/password-reset/confirm`
     /// and, later, a "change password" endpoint). `UserNotFound` if `user_id`
     /// doesn't exist.
-    async fn set_password(&mut self, user_id: Uuid, password_hash: PasswordHash) -> SetPasswordOutcome;
+    async fn set_password(
+        &mut self,
+        user_id: Uuid,
+        password_hash: PasswordHash,
+    ) -> SetPasswordOutcome;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -242,7 +251,13 @@ pub(crate) struct OidcLoginState {
 /// verify the ID token once the user comes back from the provider. Keyed by
 /// the CSRF state token round-tripped through the provider's redirect.
 pub(crate) trait OidcStateStorage {
-    async fn save_state(&mut self, csrf_state: String, provider: String, pkce_verifier: String, nonce: String);
+    async fn save_state(
+        &mut self,
+        csrf_state: String,
+        provider: String,
+        pkce_verifier: String,
+        nonce: String,
+    );
     /// Consumes the entry; returns it if it existed and hasn't expired.
     async fn take_state(&mut self, csrf_state: &str) -> Option<OidcLoginState>;
 }
@@ -263,7 +278,12 @@ pub(crate) struct PendingOidcLink {
 /// link to. `/oauth/oidc/confirm-link` consumes it once the caller has
 /// supplied that account's correct password.
 pub(crate) trait PendingOidcLinkStorage {
-    async fn save_pending_link(&mut self, provider: String, subject: String, existing_user_id: Uuid) -> String;
+    async fn save_pending_link(
+        &mut self,
+        provider: String,
+        subject: String,
+        existing_user_id: Uuid,
+    ) -> String;
     /// Consumes the entry; returns it if it existed and hasn't expired.
     /// Single-use deliberately -- a wrong password burns the token and
     /// forces the whole OIDC flow to restart, which is an acceptable, simple

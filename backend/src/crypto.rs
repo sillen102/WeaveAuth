@@ -2,12 +2,12 @@ use std::sync::LazyLock;
 
 use argon2::password_hash::phc::PasswordHash as Argon2PasswordHash;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::EncodingKey;
+use rsa::RsaPrivateKey;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
@@ -61,19 +61,27 @@ pub(crate) async fn verify_password(
 ) -> Result<PasswordVerifyOutcome, PasswordVerifyError> {
     tokio::task::spawn_blocking(move || match hash {
         PasswordHash::Argon2(s) => match Argon2PasswordHash::new(s.expose_secret()) {
-            Ok(parsed) if ARGON2.verify_password(password.expose_secret().as_bytes(), &parsed).is_ok() => {
+            Ok(parsed)
+                if ARGON2
+                    .verify_password(password.expose_secret().as_bytes(), &parsed)
+                    .is_ok() =>
+            {
                 Ok(PasswordVerifyOutcome::Verified)
             }
             Ok(_) => Ok(PasswordVerifyOutcome::NotVerified),
             Err(e) => Err(anyhow::anyhow!("stored argon2 hash didn't parse: {e}").into()),
         },
         PasswordHash::Bcrypt(s) => match bcrypt_cost(s.expose_secret()) {
-            Some(cost) if cost <= max_bcrypt_cost => match bcrypt::verify(password.expose_secret(), s.expose_secret()) {
-                Ok(true) => Ok(PasswordVerifyOutcome::Verified),
-                Ok(false) => Ok(PasswordVerifyOutcome::NotVerified),
-                Err(e) => Err(anyhow::anyhow!("bcrypt verification failed: {e}").into()),
-            },
-            Some(cost) => Err(anyhow::anyhow!("bcrypt cost {cost} exceeds the allowed maximum").into()),
+            Some(cost) if cost <= max_bcrypt_cost => {
+                match bcrypt::verify(password.expose_secret(), s.expose_secret()) {
+                    Ok(true) => Ok(PasswordVerifyOutcome::Verified),
+                    Ok(false) => Ok(PasswordVerifyOutcome::NotVerified),
+                    Err(e) => Err(anyhow::anyhow!("bcrypt verification failed: {e}").into()),
+                }
+            }
+            Some(cost) => {
+                Err(anyhow::anyhow!("bcrypt cost {cost} exceeds the allowed maximum").into())
+            }
             None => Err(anyhow::anyhow!("stored bcrypt hash didn't parse").into()),
         },
     })
@@ -139,7 +147,7 @@ impl JwtKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, Header, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, encode};
     use serde::Deserialize;
 
     #[derive(Serialize, Deserialize)]
@@ -180,9 +188,17 @@ mod tests {
     #[tokio::test]
     async fn verify_password_rejects_bcrypt_hashes_above_the_cost_cap() {
         let max_cost = 12;
-        let inflated = format!("$2b${}$abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx", max_cost + 1);
+        let inflated = format!(
+            "$2b${}$abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx",
+            max_cost + 1
+        );
 
-        let result = verify_password(PasswordHash::Bcrypt(inflated.into()), "whatever".into(), max_cost).await;
+        let result = verify_password(
+            PasswordHash::Bcrypt(inflated.into()),
+            "whatever".into(),
+            max_cost,
+        )
+        .await;
 
         assert!(result.is_err());
     }

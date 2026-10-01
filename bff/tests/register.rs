@@ -126,14 +126,21 @@ async fn registering_immediately_logs_in_and_lands_on_redirect_uri() -> anyhow::
     let app = app(test_config(backend)).unwrap();
 
     let resp = app
-        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
+        .oneshot(register_request(
+            "alice",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://admin.test/"));
 
-    let set_cookie = resp.headers().get("set-cookie").and_then(|v| v.to_str().ok());
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok());
     assert!(set_cookie.is_some_and(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
     Ok(())
 }
@@ -144,7 +151,11 @@ async fn appends_error_query_param_when_backend_rejects() -> anyhow::Result<()> 
     let app = app(test_config(backend)).unwrap();
 
     let resp = app
-        .oneshot(register_request("taken", "http://admin.test/", "http://login.test/register.html")?)
+        .oneshot(register_request(
+            "taken",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -183,12 +194,20 @@ async fn rate_limits_repeated_attempts_from_the_same_ip() -> anyhow::Result<()> 
 
     let first = app
         .clone()
-        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
+        .oneshot(register_request(
+            "alice",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
         .await?;
     assert_eq!(first.status(), StatusCode::SEE_OTHER);
 
     let second = app
-        .oneshot(register_request("bob", "http://admin.test/", "http://login.test/register.html")?)
+        .oneshot(register_request(
+            "bob",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
         .await?;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
@@ -199,7 +218,11 @@ async fn returns_bad_gateway_when_backend_unreachable() -> anyhow::Result<()> {
     let app = app(test_config("http://127.0.0.1:1".into())).unwrap();
 
     let resp = app
-        .oneshot(register_request("alice", "http://admin.test/", "http://login.test/register.html")?)
+        .oneshot(register_request(
+            "alice",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

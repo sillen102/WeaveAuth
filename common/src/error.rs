@@ -31,15 +31,26 @@ mod tests {
 
     impl std::error::Error for Layer {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.1.as_deref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            self.1
+                .as_deref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
         }
     }
 
     #[test]
     fn joins_every_source_outermost_first() {
-        let error = Layer("error sending request", Some(Box::new(Layer("tcp connect error", Some(Box::new(Layer("connection refused", None)))))));
+        let error = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "tcp connect error",
+                Some(Box::new(Layer("connection refused", None))),
+            ))),
+        );
 
-        assert_eq!(cause_chain(&error), "error sending request: tcp connect error: connection refused");
+        assert_eq!(
+            cause_chain(&error),
+            "error sending request: tcp connect error: connection refused"
+        );
     }
 
     #[test]

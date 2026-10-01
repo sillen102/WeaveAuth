@@ -51,11 +51,18 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Spec, ParseError> {
     if uid == 0 || gid == 0 {
         return Err(ParseError::Root);
     }
-    Ok(Spec { uid, gid, command, args: args.collect() })
+    Ok(Spec {
+        uid,
+        gid,
+        command,
+        args: args.collect(),
+    })
 }
 
 fn id(raw: OsString) -> Result<u32, ParseError> {
-    raw.to_str().and_then(|text| text.parse().ok()).ok_or(ParseError::NotAnId(raw))
+    raw.to_str()
+        .and_then(|text| text.parse().ok())
+        .ok_or(ParseError::NotAnId(raw))
 }
 
 fn main() -> ExitCode {
@@ -78,16 +85,30 @@ fn exec(spec: Spec) -> String {
     const NEEDS: &str = "this needs CAP_SETUID and CAP_SETGID: check for no-new-privileges, \
                          --cap-drop or capabilities.drop: [ALL]";
 
-    let Spec { uid, gid, command, args } = spec;
+    let Spec {
+        uid,
+        gid,
+        command,
+        args,
+    } = spec;
     // Setting a uid also makes std clear the supplementary groups, so the
     // plugin doesn't keep group read access to backend's files (its config).
-    let error = std::process::Command::new(&command).args(&args).uid(uid).gid(gid).exec();
+    let error = std::process::Command::new(&command)
+        .args(&args)
+        .uid(uid)
+        .gid(gid)
+        .exec();
     format!("could not start {command:?} as uid {uid}/gid {gid}: {error} ({NEEDS})")
 }
 
 #[cfg(not(target_os = "linux"))]
 fn exec(spec: Spec) -> String {
-    let Spec { uid, gid, command, args } = spec;
+    let Spec {
+        uid,
+        gid,
+        command,
+        args,
+    } = spec;
     format!("cannot start {command:?} {args:?} as uid {uid}/gid {gid}: only supported on Linux")
 }
 
@@ -106,7 +127,12 @@ mod tests {
 
         assert_eq!(
             spec,
-            Spec { uid: 1001, gid: 1002, command: "/plugins/register".into(), args: args(&["--verbose"]) }
+            Spec {
+                uid: 1001,
+                gid: 1002,
+                command: "/plugins/register".into(),
+                args: args(&["--verbose"])
+            }
         );
     }
 
@@ -114,17 +140,26 @@ mod tests {
     // capabilities: whatever calls it can't become root through it.
     #[test]
     fn refuses_uid_0() {
-        assert_eq!(parse(args(&["0", "1001", "/plugins/register"])), Err(ParseError::Root));
+        assert_eq!(
+            parse(args(&["0", "1001", "/plugins/register"])),
+            Err(ParseError::Root)
+        );
     }
 
     #[test]
     fn refuses_gid_0() {
-        assert_eq!(parse(args(&["1001", "0", "/plugins/register"])), Err(ParseError::Root));
+        assert_eq!(
+            parse(args(&["1001", "0", "/plugins/register"])),
+            Err(ParseError::Root)
+        );
     }
 
     #[test]
     fn refuses_an_id_that_is_not_a_number() {
-        assert_eq!(parse(args(&["root", "1001", "/plugins/register"])), Err(ParseError::NotAnId("root".into())));
+        assert_eq!(
+            parse(args(&["root", "1001", "/plugins/register"])),
+            Err(ParseError::NotAnId("root".into()))
+        );
     }
 
     #[test]

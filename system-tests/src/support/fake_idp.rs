@@ -8,11 +8,11 @@
 //! caller's `redirect_uri` with a code, which is enough to drive the whole
 //! flow with a plain `reqwest` client instead of a browser.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rsa::RsaPrivateKey;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
 use serde::Serialize;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -37,7 +37,9 @@ pub async fn start(email: &str, email_verified: bool) -> anyhow::Result<FakeIdp>
     let issuer = server.uri();
 
     Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/.well-known/openid-configuration"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -73,7 +75,10 @@ pub async fn start(email: &str, email_verified: bool) -> anyhow::Result<FakeIdp>
         .mount(&server)
         .await;
 
-    Ok(FakeIdp { issuer, _server: server })
+    Ok(FakeIdp {
+        issuer,
+        _server: server,
+    })
 }
 
 /// Reads `redirect_uri`/`state`/`nonce` off the `/authorize` request and
@@ -82,10 +87,13 @@ pub async fn start(email: &str, email_verified: bool) -> anyhow::Result<FakeIdp>
 /// `/token` can echo it into the id_token without needing any state of its
 /// own between the two calls.
 fn consent_redirect(req: &Request) -> ResponseTemplate {
-    let query: std::collections::HashMap<String, String> = req.url.query_pairs().into_owned().collect();
-    let (Some(redirect_uri), Some(state), Some(nonce)) =
-        (query.get("redirect_uri"), query.get("state"), query.get("nonce"))
-    else {
+    let query: std::collections::HashMap<String, String> =
+        req.url.query_pairs().into_owned().collect();
+    let (Some(redirect_uri), Some(state), Some(nonce)) = (
+        query.get("redirect_uri"),
+        query.get("state"),
+        query.get("nonce"),
+    ) else {
         return ResponseTemplate::new(400);
     };
     let sep = if redirect_uri.contains('?') { '&' } else { '?' };
@@ -104,8 +112,9 @@ fn token_response(
     email: &str,
     email_verified: bool,
 ) -> ResponseTemplate {
-    let body: std::collections::HashMap<String, String> =
-        url::form_urlencoded::parse(&req.body).into_owned().collect();
+    let body: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&req.body)
+        .into_owned()
+        .collect();
     let Some(nonce) = body.get("code") else {
         return ResponseTemplate::new(400);
     };
@@ -135,7 +144,8 @@ fn token_response(
     };
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(signing_key.kid.clone());
-    let id_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key).expect("signing test id_token");
+    let id_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key)
+        .expect("signing test id_token");
 
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "access_token": "fake-idp-access-token",

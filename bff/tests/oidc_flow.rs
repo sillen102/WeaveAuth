@@ -157,9 +157,21 @@ async fn oidc_login_relays_the_provider_redirect_and_sets_flow_cookies() -> anyh
     assert_eq!(loc, "https://provider.test/consent?state=good-state");
 
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Path=/oidc")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Path=/oidc")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=good-state") && c.contains("Path=/oidc")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Path=/oidc"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Path=/oidc"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=good-state") && c.contains("Path=/oidc"))
+    );
     Ok(())
 }
 
@@ -200,10 +212,26 @@ async fn oidc_callback_completes_login_and_clears_flow_cookies() -> anyhow::Resu
     assert_eq!(loc, Some("http://admin.test/"));
 
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
@@ -214,15 +242,28 @@ async fn oidc_callback_without_flow_cookies_is_bad_request() -> anyhow::Result<(
 
     let resp = app
         .oneshot(with_test_peer(
-            Request::get("/oidc/google/callback?code=good-code&state=good-state").body(Body::empty())?,
+            Request::get("/oidc/google/callback?code=good-code&state=good-state")
+                .body(Body::empty())?,
         ))
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
@@ -249,7 +290,8 @@ async fn oidc_callback_bounces_to_next_when_backend_rejects_the_state() -> anyho
 }
 
 #[tokio::test]
-async fn oidc_callback_bounces_to_next_and_clears_flow_cookies_on_provider_error() -> anyhow::Result<()> {
+async fn oidc_callback_bounces_to_next_and_clears_flow_cookies_on_provider_error()
+-> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 
@@ -269,15 +311,27 @@ async fn oidc_callback_bounces_to_next_and_clears_flow_cookies_on_provider_error
     assert_eq!(loc, Some("http://login.test/?error=1"));
 
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn oidc_callback_bounces_to_next_with_consent_required_when_backend_says_a_permission_was_declined(
-) -> anyhow::Result<()> {
+async fn oidc_callback_bounces_to_next_with_consent_required_when_backend_says_a_permission_was_declined()
+-> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 
@@ -295,7 +349,12 @@ async fn oidc_callback_bounces_to_next_with_consent_required_when_backend_says_a
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/?error=consent_required"));
-    assert!(set_cookie_values(&resp).iter().any(|c| c.starts_with("wa_oidc_state=;") || c.contains("wa_oidc_state=; ")), "flow cookies cleared");
+    assert!(
+        set_cookie_values(&resp)
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=;") || c.contains("wa_oidc_state=; ")),
+        "flow cookies cleared"
+    );
     Ok(())
 }
 
@@ -317,15 +376,27 @@ async fn oidc_callback_rejects_a_state_that_does_not_match_the_flow_cookie() -> 
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmation_is_required(
-) -> anyhow::Result<()> {
+async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmation_is_required()
+-> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 
@@ -349,11 +420,20 @@ async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmat
     assert_eq!(loc, "http://login.test/?email=squatter%40example.com");
 
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
-    assert!(cookies
-        .iter()
-        .any(|c| c.starts_with("wa_oidc_pending_link_token=stub-pending-link-token") && c.contains("HttpOnly")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0"))
+    );
+    assert!(cookies.iter().any(|c| {
+        c.starts_with("wa_oidc_pending_link_token=stub-pending-link-token")
+            && c.contains("HttpOnly")
+    }));
     Ok(())
 }
 
@@ -367,7 +447,10 @@ async fn oidc_confirm_link_completes_login_with_the_correct_password() -> anyhow
             Request::post("/oidc/confirm-link")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
-                .header("cookie", "wa_oidc_pending_link_token=stub-pending-link-token")
+                .header(
+                    "cookie",
+                    "wa_oidc_pending_link_token=stub-pending-link-token",
+                )
                 .body(Body::from(
                     "password=correct-password\
                      &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
@@ -380,13 +463,22 @@ async fn oidc_confirm_link_completes_login_with_the_correct_password() -> anyhow
     assert_eq!(loc, Some("http://admin.test/"));
 
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly"))
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password() -> anyhow::Result<()> {
+async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
+-> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 
@@ -395,7 +487,10 @@ async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
             Request::post("/oidc/confirm-link")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("origin", "http://login.test")
-                .header("cookie", "wa_oidc_pending_link_token=stub-pending-link-token")
+                .header(
+                    "cookie",
+                    "wa_oidc_pending_link_token=stub-pending-link-token",
+                )
                 .body(Body::from(
                     "password=wrong-password\
                      &redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F",
@@ -407,13 +502,17 @@ async fn oidc_confirm_link_bounces_to_login_with_link_failed_on_wrong_password()
     let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert_eq!(loc, Some("http://login.test/?error=link_failed"));
     let cookies = set_cookie_values(&resp);
-    assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0"))
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn oidc_confirm_link_bounces_to_login_with_link_failed_when_the_pending_link_cookie_is_missing_or_expired(
-) -> anyhow::Result<()> {
+async fn oidc_confirm_link_bounces_to_login_with_link_failed_when_the_pending_link_cookie_is_missing_or_expired()
+-> anyhow::Result<()> {
     let (backend, _h) = stub_backend().await?;
     let app = app(test_config(backend)).unwrap();
 

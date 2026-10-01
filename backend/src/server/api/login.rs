@@ -3,13 +3,13 @@ pub(crate) use controller::login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::Json;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
@@ -117,7 +117,9 @@ mod service {
             .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.into()));
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
-            Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginServiceError::InvalidCredentials),
+            Ok(crypto::PasswordVerifyOutcome::NotVerified) => {
+                return Err(LoginServiceError::InvalidCredentials);
+            }
             Err(error) => return Err(LoginServiceError::UnexpectedError(error.to_string())),
         }
 
@@ -137,10 +139,10 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
+    use crate::storage::UserStorage;
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
     };
-    use crate::storage::UserStorage;
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
     use std::sync::Arc;
@@ -151,7 +153,10 @@ mod tests {
         state_with_user_password_opt(email, Some(password_hash)).await
     }
 
-    async fn state_with_user_password_opt(email: &str, password_hash: Option<PasswordHash>) -> AppState {
+    async fn state_with_user_password_opt(
+        email: &str,
+        password_hash: Option<PasswordHash>,
+    ) -> AppState {
         let mut users = InMemoryUserStorage::new();
         let _ = users
             .create_user(User {
@@ -166,7 +171,8 @@ mod tests {
             users,
             login_sessions: InMemoryLoginSessionStorage::new(60),
             redirect_uri_allowlist: Arc::new(vec![]),
-            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new()
+                .expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
@@ -177,7 +183,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
@@ -269,9 +276,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logging_in_with_an_imported_bcrypt_hash_unlocks_the_account_and_upgrades_it_to_argon2() {
+    async fn logging_in_with_an_imported_bcrypt_hash_unlocks_the_account_and_upgrades_it_to_argon2()
+    {
         let bcrypt_hash = bcrypt::hash("hunter2", 4).expect("hashing a test password never fails");
-        let state = state_with_user_password("alice@example.com", PasswordHash::Bcrypt(bcrypt_hash.into())).await;
+        let state = state_with_user_password(
+            "alice@example.com",
+            PasswordHash::Bcrypt(bcrypt_hash.into()),
+        )
+        .await;
         let req = LoginRequest {
             email: "alice@example.com".to_string(),
             password: "hunter2".to_string(),
@@ -280,7 +292,11 @@ mod tests {
         let Json(body) = login(State(state.clone()), Json(req)).await.unwrap();
         assert!(!body.login_session.is_empty());
 
-        let user = state.users.get_user_by_email("alice@example.com").await.expect("user exists");
+        let user = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .expect("user exists");
         assert!(
             matches!(user.password, Some(PasswordHash::Argon2(_))),
             "expected the bcrypt hash to have been upgraded to argon2, got {:?}",

@@ -6,10 +6,10 @@ mod controller {
     use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use axum::response::Redirect;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
@@ -41,8 +41,12 @@ mod controller {
     impl From<service::AuthorizeServiceError> for AuthorizeError {
         fn from(err: service::AuthorizeServiceError) -> Self {
             match err {
-                service::AuthorizeServiceError::InvalidLoginSession => AuthorizeError::InvalidLoginSession,
-                service::AuthorizeServiceError::InvalidRedirectUri => AuthorizeError::InvalidRedirectUri,
+                service::AuthorizeServiceError::InvalidLoginSession => {
+                    AuthorizeError::InvalidLoginSession
+                }
+                service::AuthorizeServiceError::InvalidRedirectUri => {
+                    AuthorizeError::InvalidRedirectUri
+                }
             }
         }
     }
@@ -75,8 +79,8 @@ mod controller {
 }
 
 mod service {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rand::RngExt;
     use thiserror::Error;
 
@@ -147,8 +151,8 @@ mod tests {
     use axum::response::{IntoResponse, Redirect};
     use std::sync::Arc;
 
-    use crate::model::pkce::CodeChallengeMethod;
     use super::controller::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
+    use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
     use crate::storage::{LoginSessionStorage, PkceStorage};
 
@@ -166,7 +170,8 @@ mod tests {
             users: crate::storage::in_memory::InMemoryUserStorage::new(),
             login_sessions,
             redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
-            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new().expect("RSA keygen for tests never fails"),
+            jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new()
+                .expect("RSA keygen for tests never fails"),
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
@@ -177,7 +182,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,

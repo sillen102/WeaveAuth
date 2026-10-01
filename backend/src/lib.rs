@@ -12,17 +12,13 @@
 )]
 #![cfg_attr(
     test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing
-    )
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
 pub mod config;
-pub mod server;
 pub(crate) mod crypto;
-pub(crate) mod plugin;
 pub(crate) mod model;
 pub(crate) mod oidc;
+pub(crate) mod plugin;
+pub mod server;
 pub(crate) mod storage;

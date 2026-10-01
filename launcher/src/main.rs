@@ -24,7 +24,10 @@ fn main() -> ExitCode {
 
     let mut children: Vec<(&str, Child)> = Vec::new();
     for service in SERVICES {
-        match Command::new(service).env("WA_LOGIN_PUBLIC_URL", &url).spawn() {
+        match Command::new(service)
+            .env("WA_LOGIN_PUBLIC_URL", &url)
+            .spawn()
+        {
             Ok(child) => children.push((service, child)),
             Err(error) => {
                 eprintln!("launcher: could not start {service}: {error}");
@@ -39,7 +42,10 @@ fn main() -> ExitCode {
         for (service, child) in &mut children {
             if let Ok(Some(status)) = child.try_wait() {
                 eprintln!("launcher: {service} exited with {status}");
-                let code = status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1);
+                let code = status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .unwrap_or(1);
                 return stop(children, code);
             }
         }
@@ -61,11 +67,17 @@ mod tests {
 
     #[test]
     fn defaults_the_login_public_url_when_unset() {
-        assert_eq!(login_public_url(None), OsString::from("http://localhost:8081"));
+        assert_eq!(
+            login_public_url(None),
+            OsString::from("http://localhost:8081")
+        );
     }
 
     #[test]
     fn keeps_a_configured_login_public_url() {
-        assert_eq!(login_public_url(Some("https://login.example".into())), OsString::from("https://login.example"));
+        assert_eq!(
+            login_public_url(Some("https://login.example".into())),
+            OsString::from("https://login.example")
+        );
     }
 }

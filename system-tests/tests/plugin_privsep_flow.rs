@@ -22,17 +22,27 @@ const BACKENDS_USER: &str = "/etc/weaveauth/same-user.yaml";
 /// Starts the image on `config`, with the probe told which uid it should find
 /// itself running as and whose environment to try (`parent` is backend),
 /// returning backend's URL.
-async fn start(config: &str, expected_uid: &str, environ_of: &str) -> (ContainerAsync<GenericImage>, String) {
+async fn start(
+    config: &str,
+    expected_uid: &str,
+    environ_of: &str,
+) -> (ContainerAsync<GenericImage>, String) {
     let container = GenericImage::new("weaveauth-plugin-test", "latest")
         .with_exposed_port(1983.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on 0.0.0.0:1983"))
         .with_env_var("WA_CONFIG_FILE", config)
-        .with_env_var("WA_PLUGIN_REGISTRATION_ENV_PLUGIN_EXPECTED_UID", expected_uid)
+        .with_env_var(
+            "WA_PLUGIN_REGISTRATION_ENV_PLUGIN_EXPECTED_UID",
+            expected_uid,
+        )
         .with_env_var("WA_PLUGIN_REGISTRATION_ENV_PLUGIN_ENVIRON_OF", environ_of)
         .start()
         .await
         .expect("the image starts, which includes backend starting its plugin");
-    let port = container.get_host_port_ipv4(1983.tcp()).await.expect("backend publishes a port");
+    let port = container
+        .get_host_port_ipv4(1983.tcp())
+        .await
+        .expect("backend publishes a port");
     let url = format!("http://127.0.0.1:{port}");
     wait_until_reachable(&url).await;
     (container, url)
@@ -43,21 +53,38 @@ async fn start(config: &str, expected_uid: &str, environ_of: &str) -> (Container
 async fn wait_until_reachable(url: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while reqwest::get(format!("{url}/health")).await.is_err() {
-        assert!(std::time::Instant::now() < deadline, "backend never became reachable at {url}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backend never became reachable at {url}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
-async fn probe(config: &str, expected_uid: &str, environ_of: &str, behaviour: &str) -> reqwest::StatusCode {
+async fn probe(
+    config: &str,
+    expected_uid: &str,
+    environ_of: &str,
+    behaviour: &str,
+) -> reqwest::StatusCode {
     let (_container, backend_url) = start(config, expected_uid, environ_of).await;
-    register(&backend_url, "alice@example.com", &registration_fields(behaviour)).await
+    register(
+        &backend_url,
+        "alice@example.com",
+        &registration_fields(behaviour),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_runs_as_its_own_user_and_cannot_read_backends_environment() {
     let status = probe(OWN_USER, "1001", "parent", "privsep").await;
 
-    assert_eq!(status, reqwest::StatusCode::CREATED, "the plugin ran as the wrong user or could read backend");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "the plugin ran as the wrong user or could read backend"
+    );
 }
 
 // Backend marks itself non-dumpable, so not even a process running as its
@@ -66,7 +93,11 @@ async fn the_plugin_runs_as_its_own_user_and_cannot_read_backends_environment() 
 async fn not_even_backends_own_user_can_read_its_environment() {
     let status = probe(BACKENDS_USER, "1000", "parent", "privsep").await;
 
-    assert_eq!(status, reqwest::StatusCode::CREATED, "backend's environment is readable by its own user");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "backend's environment is readable by its own user"
+    );
 }
 
 // Controls for the two tests above, one per check the probe makes, so they
@@ -94,7 +125,11 @@ async fn the_privsep_probe_rejects_when_it_can_read_the_environment_it_tries() {
 async fn a_plugin_cannot_run_the_setuid_helper() {
     let status = probe(OWN_USER, "1001", "parent", "helper").await;
 
-    assert_eq!(status, reqwest::StatusCode::CREATED, "a plugin could run weaveauth-plugin-exec");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "a plugin could run weaveauth-plugin-exec"
+    );
 }
 
 // Control for the test above: backend's own user can run it (that's how

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
-use secrecy::SecretString;
 #[cfg(test)]
 use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use uuid::Uuid;
 
 /// A stored password hash, tagged by scheme. Only `Argon2` is ever written; `Bcrypt` exists so an imported legacy user can unlock and get upgraded.

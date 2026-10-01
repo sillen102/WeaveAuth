@@ -24,10 +24,19 @@ async fn register(client: &reqwest::Client, bff_url: &str) -> anyhow::Result<()>
     let resp = client
         .post(format!("{bff_url}/register"))
         .header("origin", NEXT_ORIGIN)
-        .form(&[("email", EMAIL), ("password", PASSWORD), ("redirect_uri", FINAL_REDIRECT), ("next", NEXT_ORIGIN)])
+        .form(&[
+            ("email", EMAIL),
+            ("password", PASSWORD),
+            ("redirect_uri", FINAL_REDIRECT),
+            ("next", NEXT_ORIGIN),
+        ])
         .send()
         .await?;
-    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER, "setup: registration should succeed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SEE_OTHER,
+        "setup: registration should succeed"
+    );
     Ok(())
 }
 
@@ -40,26 +49,48 @@ async fn password_login_authenticates_an_existing_account() -> anyhow::Result<()
     let bff_url = format!("http://{bff_addr}");
 
     let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config()).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     register(&client, &bff_url).await?;
 
     let resp = client
         .post(format!("{bff_url}/login"))
         .header("origin", NEXT_ORIGIN)
-        .form(&[("email", EMAIL), ("password", PASSWORD), ("redirect_uri", FINAL_REDIRECT), ("next", NEXT_ORIGIN)])
+        .form(&[
+            ("email", EMAIL),
+            ("password", PASSWORD),
+            ("redirect_uri", FINAL_REDIRECT),
+            ("next", NEXT_ORIGIN),
+        ])
         .send()
         .await?;
 
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
-    let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok());
-    assert_eq!(location, Some(FINAL_REDIRECT), "should land on redirect_uri");
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        location,
+        Some(FINAL_REDIRECT),
+        "should land on redirect_uri"
+    );
 
-    let cookies: Vec<String> =
-        resp.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).map(str::to_string).collect();
+    let cookies: Vec<String> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
     assert!(
-        cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")),
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")),
         "expected a real bff session cookie, got: {cookies:?}"
     );
 
@@ -75,22 +106,36 @@ async fn password_login_with_the_wrong_password_does_not_authenticate() -> anyho
     let bff_url = format!("http://{bff_addr}");
 
     let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config()).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     register(&client, &bff_url).await?;
 
     let resp = client
         .post(format!("{bff_url}/login"))
         .header("origin", NEXT_ORIGIN)
-        .form(&[("email", EMAIL), ("password", "definitely-not-it"), ("redirect_uri", FINAL_REDIRECT), ("next", NEXT_ORIGIN)])
+        .form(&[
+            ("email", EMAIL),
+            ("password", "definitely-not-it"),
+            ("redirect_uri", FINAL_REDIRECT),
+            ("next", NEXT_ORIGIN),
+        ])
         .send()
         .await?;
 
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
-    let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok());
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
     assert_eq!(location, Some(format!("{NEXT_ORIGIN}?error=1").as_str()));
-    assert!(resp.headers().get("set-cookie").is_none(), "wrong password must not authenticate");
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "wrong password must not authenticate"
+    );
 
     Ok(())
 }
@@ -104,19 +149,30 @@ async fn password_login_for_an_unknown_email_does_not_authenticate() -> anyhow::
     let bff_url = format!("http://{bff_addr}");
 
     let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config()).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
 
     let resp = client
         .post(format!("{bff_url}/login"))
         .header("origin", NEXT_ORIGIN)
-        .form(&[("email", "nobody@example.com"), ("password", PASSWORD), ("redirect_uri", FINAL_REDIRECT), ("next", NEXT_ORIGIN)])
+        .form(&[
+            ("email", "nobody@example.com"),
+            ("password", PASSWORD),
+            ("redirect_uri", FINAL_REDIRECT),
+            ("next", NEXT_ORIGIN),
+        ])
         .send()
         .await?;
 
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
-    let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok());
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
     assert_eq!(location, Some(format!("{NEXT_ORIGIN}?error=1").as_str()));
     assert!(resp.headers().get("set-cookie").is_none());
 

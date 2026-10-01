@@ -59,7 +59,11 @@ pub(crate) fn is_safe_redirect_target(target: &str, trusted_origins: &[String]) 
         return true;
     }
     url::Url::parse(target)
-        .map(|u| trusted_origins.iter().any(|t| t == &u.origin().ascii_serialization()))
+        .map(|u| {
+            trusted_origins
+                .iter()
+                .any(|t| t == &u.origin().ascii_serialization())
+        })
         .unwrap_or(false)
 }
 

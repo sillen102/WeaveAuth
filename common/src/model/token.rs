@@ -1,6 +1,6 @@
-use std::fmt::Display;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use strum::{AsRefStr, Display as StrumDisplay};
 
 #[derive(Serialize, JsonSchema, Debug)]
@@ -18,7 +18,9 @@ impl Display for TokenType {
 /// `/oauth/token`'s `grant_type` (RFC 6749 4.1.3 / 6): which flow a token
 /// request is redeeming -- an authorization code (fresh login) or a refresh
 /// token (silently renewing an expired access token without one).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Eq, PartialEq, AsRefStr, StrumDisplay)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Eq, PartialEq, AsRefStr, StrumDisplay,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum GrantType {

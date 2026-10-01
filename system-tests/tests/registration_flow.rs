@@ -27,9 +27,12 @@ async fn registration_creates_the_account_and_logs_it_in() -> anyhow::Result<()>
     let bff_url = format!("http://{bff_addr}");
 
     let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config()).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
 
     let resp = client
         .post(format!("{bff_url}/register"))
@@ -44,13 +47,27 @@ async fn registration_creates_the_account_and_logs_it_in() -> anyhow::Result<()>
         .await?;
 
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
-    let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok());
-    assert_eq!(location, Some(FINAL_REDIRECT), "should land on redirect_uri, auto-logged-in");
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        location,
+        Some(FINAL_REDIRECT),
+        "should land on redirect_uri, auto-logged-in"
+    );
 
-    let cookies: Vec<String> =
-        resp.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).map(str::to_string).collect();
+    let cookies: Vec<String> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
     assert!(
-        cookies.iter().any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")),
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")),
         "expected a real bff session cookie, got: {cookies:?}"
     );
 
@@ -66,9 +83,12 @@ async fn registering_a_taken_email_bounces_to_next_with_an_error() -> anyhow::Re
     let bff_url = format!("http://{bff_addr}");
 
     let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config()).await?;
-    let _bff_handle = servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
 
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
 
     let register = |password: &'static str| {
         let client = client.clone();
@@ -93,9 +113,15 @@ async fn registering_a_taken_email_bounces_to_next_with_an_error() -> anyhow::Re
 
     let second = register("second-password").await?;
     assert_eq!(second.status(), reqwest::StatusCode::SEE_OTHER);
-    let location = second.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok());
+    let location = second
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
     assert_eq!(location, Some(format!("{NEXT_ORIGIN}?error=1").as_str()));
-    assert!(second.headers().get("set-cookie").is_none(), "a rejected registration must not set a session");
+    assert!(
+        second.headers().get("set-cookie").is_none(),
+        "a rejected registration must not set a session"
+    );
 
     Ok(())
 }

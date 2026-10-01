@@ -1,5 +1,5 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use weaveauth_login::{app, Config};
+use weaveauth_login::{Config, app};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,8 +12,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::load()?;
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
-        .await?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     axum::serve(listener, app(config)).await?;
     Ok(())
 }

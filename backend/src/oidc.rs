@@ -39,7 +39,9 @@ pub(crate) async fn build_providers(
             issuer,
             metadata.jwks().clone(),
         )
-        .set_client_secret(ClientSecret::new(config.client_secret.expose_secret().to_string()))
+        .set_client_secret(ClientSecret::new(
+            config.client_secret.expose_secret().to_string(),
+        ))
         .set_auth_uri(metadata.authorization_endpoint().clone())
         .set_token_uri(token_endpoint)
         .set_redirect_uri(RedirectUrl::new(config.redirect_uri.clone())?);
@@ -78,7 +80,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
             .mount(&server)
             .await;
 
@@ -97,7 +101,9 @@ mod tests {
         );
 
         let http_client = openidconnect::reqwest::Client::new();
-        let providers = build_providers(&configs, &http_client).await.expect("discovery succeeds");
+        let providers = build_providers(&configs, &http_client)
+            .await
+            .expect("discovery succeeds");
 
         assert!(providers.contains_key("test-provider"));
     }

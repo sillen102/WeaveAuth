@@ -1,16 +1,20 @@
+use crate::server::AppState;
 use crate::server::api::{
-    health::health, login::start_login, oidc::oidc_callback, oidc::oidc_confirm_link,
-    oidc::start_oidc_login, proxy::proxy_router,
+    health::health,
+    login::start_login,
+    oidc::oidc_callback,
+    oidc::oidc_confirm_link,
+    oidc::start_oidc_login,
+    proxy::proxy_router,
     register::{start_register, start_register_doc},
 };
-use crate::server::AppState;
-use aide::axum::routing::post_with;
 use aide::axum::ApiRouter;
-use axum::routing::{get, post};
+use aide::axum::routing::post_with;
 use axum::Router;
+use axum::routing::{get, post};
 use common::docs::api_docs::api_docs_router;
-use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::trace::TraceLayer;
 
 pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
@@ -51,7 +55,8 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
     // metadata, so it's built as its own `ApiRouter` and run through the same
     // `api_docs_router` helper `backend` uses, rather than living in
     // `auth_routes` above.
-    let register_routes = ApiRouter::new().api_route("/register", post_with(start_register, start_register_doc));
+    let register_routes =
+        ApiRouter::new().api_route("/register", post_with(start_register, start_register_doc));
     let (documented_register_routes, docs) = api_docs_router("WeaveAuth BFF", register_routes);
     let documented_register_routes = documented_register_routes
         .layer(GovernorLayer::new(auth_governor))

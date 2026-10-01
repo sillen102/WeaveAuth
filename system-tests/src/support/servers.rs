@@ -35,6 +35,10 @@ pub fn spawn_bff_on(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let app = weaveauth_bff::server::app(config)?;
     Ok(tokio::spawn(async move {
-        let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     }))
 }

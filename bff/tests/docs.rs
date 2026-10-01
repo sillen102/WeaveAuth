@@ -28,7 +28,8 @@ fn test_config(docs_enabled: bool) -> Config {
 
 fn get(path: &str) -> anyhow::Result<Request<Body>> {
     let mut req = Request::get(path).body(Body::empty())?;
-    req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
     Ok(req)
 }
 
@@ -39,7 +40,11 @@ async fn does_not_serve_docs_by_default() -> anyhow::Result<()> {
     for path in DOCS_PATHS {
         let app = app(test_config(false))?;
         let resp = app.oneshot(get(path)?).await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path} was served with docs disabled");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} was served with docs disabled"
+        );
     }
     Ok(())
 }
@@ -49,7 +54,11 @@ async fn serves_docs_when_enabled() -> anyhow::Result<()> {
     for path in DOCS_PATHS {
         let app = app(test_config(true))?;
         let resp = app.oneshot(get(path)?).await?;
-        assert_eq!(resp.status(), StatusCode::OK, "{path} was not served with docs enabled");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{path} was not served with docs enabled"
+        );
     }
     Ok(())
 }

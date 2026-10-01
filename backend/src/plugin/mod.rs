@@ -110,7 +110,11 @@ impl PluginProcess {
     /// Starts the plugin and waits for it to answer, so a missing or broken
     /// command fails at startup rather than at the first registration.
     pub(crate) async fn start(config: PluginConfig) -> anyhow::Result<Self> {
-        anyhow::ensure!(config.uid != 0 && config.gid != 0, "plugin {:?} is configured to run as root", config.command);
+        anyhow::ensure!(
+            config.uid != 0 && config.gid != 0,
+            "plugin {:?} is configured to run as root",
+            config.command
+        );
         if config.uid == rustix::process::geteuid().as_raw() {
             tracing::warn!(
                 command = %config.command,
@@ -140,19 +144,33 @@ impl PluginProcess {
         let timeout = config.timeout;
         let supervisor = tokio::spawn(supervise(child, config, secret, pending));
 
-        Ok(Self { client, timeout, token, supervisor })
+        Ok(Self {
+            client,
+            timeout,
+            token,
+            supervisor,
+        })
     }
 
     /// Calls the plugin's one generic rpc for `request.hook`. `Ok` accepts/
     /// succeeds the caller's flow; any status rejects/fails it. What `Ok`'s
     /// `data` means (extra claims, nothing at all, ...) is up to the hook,
     /// not this method.
-    pub(crate) async fn invoke(&self, request: PluginRequest) -> Result<PluginResponse, tonic::Status> {
+    pub(crate) async fn invoke(
+        &self,
+        request: PluginRequest,
+    ) -> Result<PluginResponse, tonic::Status> {
         let mut request = tonic::Request::new(request);
         request.set_timeout(self.timeout);
-        request.metadata_mut().insert(TOKEN_METADATA_KEY, self.token.clone());
+        request
+            .metadata_mut()
+            .insert(TOKEN_METADATA_KEY, self.token.clone());
 
-        self.client.clone().invoke(request).await.map(|response| response.into_inner())
+        self.client
+            .clone()
+            .invoke(request)
+            .await
+            .map(|response| response.into_inner())
     }
 }
 
@@ -228,8 +246,15 @@ where
 /// Encodes a JSON object as a `google.protobuf.Struct` for [`PluginRequest::data`]
 /// -- the generic contract's payload type, so every hook shares one
 /// conversion instead of each inventing its own.
-pub(crate) fn json_to_struct(map: serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
-    prost_types::Struct { fields: map.into_iter().map(|(key, value)| (key, json_value_to_prost(value))).collect() }
+pub(crate) fn json_to_struct(
+    map: serde_json::Map<String, serde_json::Value>,
+) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: map
+            .into_iter()
+            .map(|(key, value)| (key, json_value_to_prost(value)))
+            .collect(),
+    }
 }
 
 fn json_value_to_prost(value: serde_json::Value) -> prost_types::Value {
@@ -240,9 +265,9 @@ fn json_value_to_prost(value: serde_json::Value) -> prost_types::Value {
         serde_json::Value::Bool(bool) => Kind::BoolValue(bool),
         serde_json::Value::Number(number) => Kind::NumberValue(number.as_f64().unwrap_or_default()),
         serde_json::Value::String(string) => Kind::StringValue(string),
-        serde_json::Value::Array(values) => {
-            Kind::ListValue(prost_types::ListValue { values: values.into_iter().map(json_value_to_prost).collect() })
-        }
+        serde_json::Value::Array(values) => Kind::ListValue(prost_types::ListValue {
+            values: values.into_iter().map(json_value_to_prost).collect(),
+        }),
         serde_json::Value::Object(map) => Kind::StructValue(json_to_struct(map)),
     };
     prost_types::Value { kind: Some(kind) }
@@ -250,8 +275,14 @@ fn json_value_to_prost(value: serde_json::Value) -> prost_types::Value {
 
 /// The inverse of [`json_to_struct`], decoding [`PluginResponse::data`] back
 /// into ordinary JSON.
-pub(crate) fn struct_to_json(value: prost_types::Struct) -> serde_json::Map<String, serde_json::Value> {
-    value.fields.into_iter().map(|(key, value)| (key, prost_value_to_json(value))).collect()
+pub(crate) fn struct_to_json(
+    value: prost_types::Struct,
+) -> serde_json::Map<String, serde_json::Value> {
+    value
+        .fields
+        .into_iter()
+        .map(|(key, value)| (key, prost_value_to_json(value)))
+        .collect()
 }
 
 fn prost_value_to_json(value: prost_types::Value) -> serde_json::Value {
@@ -259,13 +290,15 @@ fn prost_value_to_json(value: prost_types::Value) -> serde_json::Value {
 
     match value.kind {
         None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::NumberValue(number)) => {
-            serde_json::Number::from_f64(number).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
+        Some(Kind::NumberValue(number)) => serde_json::Number::from_f64(number)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Some(Kind::StringValue(string)) => serde_json::Value::String(string),
         Some(Kind::BoolValue(bool)) => serde_json::Value::Bool(bool),
         Some(Kind::StructValue(inner)) => serde_json::Value::Object(struct_to_json(inner)),
-        Some(Kind::ListValue(list)) => serde_json::Value::Array(list.values.into_iter().map(prost_value_to_json).collect()),
+        Some(Kind::ListValue(list)) => {
+            serde_json::Value::Array(list.values.into_iter().map(prost_value_to_json).collect())
+        }
     }
 }
 
@@ -278,7 +311,11 @@ fn spawn(config: &PluginConfig, token: &str) -> std::io::Result<(Child, UnixStre
     let mut command = match &config.setuid_helper {
         Some(helper) => {
             let mut command = Command::new(helper);
-            command.arg(config.uid.to_string()).arg(config.gid.to_string()).arg(&config.command).args(&config.args);
+            command
+                .arg(config.uid.to_string())
+                .arg(config.gid.to_string())
+                .arg(&config.command)
+                .args(&config.args);
             command
         }
         None => {
@@ -311,9 +348,14 @@ async fn wait_until_serving(
     token: &MetadataValue<Ascii>,
     timeout: Duration,
 ) -> anyhow::Result<Child> {
-    let mut request = tonic::Request::new(PluginRequest { hook: STARTUP_HOOK.to_string(), ..Default::default() });
+    let mut request = tonic::Request::new(PluginRequest {
+        hook: STARTUP_HOOK.to_string(),
+        ..Default::default()
+    });
     request.set_timeout(timeout);
-    request.metadata_mut().insert(TOKEN_METADATA_KEY, token.clone());
+    request
+        .metadata_mut()
+        .insert(TOKEN_METADATA_KEY, token.clone());
 
     let mut client = client.clone();
     let answer = tokio::select! {
@@ -342,7 +384,12 @@ async fn wait_until_serving(
 /// Restarts the plugin for as long as this task lives. A plugin that dies
 /// mid-flight fails the request in progress; it must not also take every
 /// later one down with it.
-async fn supervise(mut child: Child, config: PluginConfig, token: String, pending: PendingConnection) {
+async fn supervise(
+    mut child: Child,
+    config: PluginConfig,
+    token: String,
+    pending: PendingConnection,
+) {
     loop {
         let status = child.wait().await;
         tracing::error!(?status, command = %config.command, "plugin process exited, restarting");
@@ -358,7 +405,9 @@ async fn supervise(mut child: Child, config: PluginConfig, token: String, pendin
                     *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(connection);
                     break child;
                 }
-                Err(error) => tracing::error!(%error, command = %config.command, "could not restart the plugin process"),
+                Err(error) => {
+                    tracing::error!(%error, command = %config.command, "could not restart the plugin process")
+                }
             }
         };
     }
@@ -384,20 +433,32 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_to_run_a_plugin_as_root() {
-        let error = PluginProcess::start(PluginConfig { uid: 0, ..config("/bin/sh", &["-c", "sleep 30"]) })
-            .await
-            .expect_err("must not start");
+        let error = PluginProcess::start(PluginConfig {
+            uid: 0,
+            ..config("/bin/sh", &["-c", "sleep 30"])
+        })
+        .await
+        .expect_err("must not start");
 
-        assert!(error.to_string().contains("root"), "unhelpful error: {error}");
+        assert!(
+            error.to_string().contains("root"),
+            "unhelpful error: {error}"
+        );
     }
 
     #[tokio::test]
     async fn refuses_to_run_a_plugin_in_the_root_group() {
-        let error = PluginProcess::start(PluginConfig { gid: 0, ..config("/bin/sh", &["-c", "sleep 30"]) })
-            .await
-            .expect_err("must not start");
+        let error = PluginProcess::start(PluginConfig {
+            gid: 0,
+            ..config("/bin/sh", &["-c", "sleep 30"])
+        })
+        .await
+        .expect_err("must not start");
 
-        assert!(error.to_string().contains("root"), "unhelpful error: {error}");
+        assert!(
+            error.to_string().contains("root"),
+            "unhelpful error: {error}"
+        );
     }
 
     // As root the plugin must really become 4242:4242 (it exits 7 only
@@ -408,15 +469,31 @@ mod tests {
     async fn runs_the_plugin_as_the_configured_user() {
         let root = rustix::process::geteuid().is_root();
         let check = r#"[ "$(id -u)" = 4242 ] && [ "$(id -g)" = 4242 ] && exit 7; exit 9"#;
-        let gid = if root { 4242 } else { rustix::process::getegid().as_raw() };
-        let config = PluginConfig { uid: 4242, gid, ..config("/bin/sh", &["-c", check]) };
+        let gid = if root {
+            4242
+        } else {
+            rustix::process::getegid().as_raw()
+        };
+        let config = PluginConfig {
+            uid: 4242,
+            gid,
+            ..config("/bin/sh", &["-c", check])
+        };
 
-        let error = PluginProcess::start(config).await.expect_err("the check exits either way");
+        let error = PluginProcess::start(config)
+            .await
+            .expect_err("the check exits either way");
 
         if root {
-            assert!(error.to_string().contains("exit status: 7"), "did not run as 4242:4242: {error}");
+            assert!(
+                error.to_string().contains("exit status: 7"),
+                "did not run as 4242:4242: {error}"
+            );
         } else {
-            assert!(error.to_string().contains("CAP_SETUID"), "switched user without privileges: {error}");
+            assert!(
+                error.to_string().contains("CAP_SETUID"),
+                "switched user without privileges: {error}"
+            );
         }
     }
 
@@ -439,39 +516,63 @@ mod tests {
         use tokio_stream::StreamExt;
 
         let (ours, theirs) = UnixStream::pair().expect("socket pair");
-        let incoming = tokio_stream::once(Ok::<_, std::io::Error>(theirs)).chain(tokio_stream::pending());
+        let incoming =
+            tokio_stream::once(Ok::<_, std::io::Error>(theirs)).chain(tokio_stream::pending());
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(weaveauth_plugin_sdk::plugin_server::PluginServer::new(Refusing))
+                .add_service(weaveauth_plugin_sdk::plugin_server::PluginServer::new(
+                    Refusing,
+                ))
                 .serve_with_incoming(incoming),
         );
         let mut client = PluginClient::new(channel(Arc::new(Mutex::new(Some(ours)))));
 
-        let status = client.invoke(PluginRequest::default()).await.expect_err("the plugin refuses");
+        let status = client
+            .invoke(PluginRequest::default())
+            .await
+            .expect_err("the plugin refuses");
 
         assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert!(status.source().is_none(), "a status the plugin sent carries a source: {status:?}");
+        assert!(
+            status.source().is_none(),
+            "a status the plugin sent carries a source: {status:?}"
+        );
     }
 
     #[tokio::test]
     async fn a_status_from_this_side_has_a_source() {
         let mut client = PluginClient::new(channel(Arc::new(Mutex::new(None))));
 
-        let status = client.invoke(PluginRequest::default()).await.expect_err("there is no connection");
+        let status = client
+            .invoke(PluginRequest::default())
+            .await
+            .expect_err("there is no connection");
 
-        assert!(status.source().is_some(), "a transport failure carries no source: {status:?}");
+        assert!(
+            status.source().is_some(),
+            "a transport failure carries no source: {status:?}"
+        );
     }
 
     #[tokio::test]
     async fn fails_to_start_when_the_command_does_not_exist() {
-        assert!(PluginProcess::start(config("/nonexistent/weaveauth-plugin", &[])).await.is_err());
+        assert!(
+            PluginProcess::start(config("/nonexistent/weaveauth-plugin", &[]))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn fails_to_start_when_the_plugin_exits_immediately() {
-        let error = PluginProcess::start(config("/bin/sh", &["-c", "exit 3"])).await.expect_err("must not start");
+        let error = PluginProcess::start(config("/bin/sh", &["-c", "exit 3"]))
+            .await
+            .expect_err("must not start");
 
-        assert!(error.to_string().contains("exited during startup"), "unhelpful error: {error}");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "unhelpful error: {error}"
+        );
     }
 
     // A plugin that runs but never serves is the case the startup call
@@ -479,9 +580,14 @@ mod tests {
     // registration much later.
     #[tokio::test]
     async fn fails_to_start_when_the_plugin_never_answers() {
-        let error = PluginProcess::start(config("/bin/sh", &["-c", "sleep 30"])).await.expect_err("must not start");
+        let error = PluginProcess::start(config("/bin/sh", &["-c", "sleep 30"]))
+            .await
+            .expect_err("must not start");
 
-        assert!(error.to_string().contains("did not answer"), "unhelpful error: {error}");
+        assert!(
+            error.to_string().contains("did not answer"),
+            "unhelpful error: {error}"
+        );
     }
 
     /// What [`TOKEN_BYTES`] encodes to: unpadded base64 spends 4 characters
@@ -495,22 +601,44 @@ mod tests {
     fn generates_an_unpredictable_token_every_time() {
         let first = generate_token();
 
-        assert_ne!(first, generate_token(), "the token is the same every time, so it is not a secret");
-        assert_eq!(first.len(), TOKEN_LEN, "the token is not the size it claims to be: {first:?}");
+        assert_ne!(
+            first,
+            generate_token(),
+            "the token is the same every time, so it is not a secret"
+        );
+        assert_eq!(
+            first.len(),
+            TOKEN_LEN,
+            "the token is not the size it claims to be: {first:?}"
+        );
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-        pairs.iter().map(|(key, value)| (OsString::from(key), OsString::from(value))).collect()
+        pairs
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect()
     }
 
     #[test]
     fn forwards_prefixed_variables_with_the_prefix_stripped() {
-        let forwarded =
-            forwarded_env(vars(&[("WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL", "postgres://db/appdata")]), "REGISTRATION");
+        let forwarded = forwarded_env(
+            vars(&[(
+                "WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL",
+                "postgres://db/appdata",
+            )]),
+            "REGISTRATION",
+        );
 
         // Stripped, because a plugin's libraries look for the name they
         // always look for, not a WeaveAuth-flavoured one.
-        assert_eq!(forwarded, vec![("DATABASE_URL".to_string(), OsString::from("postgres://db/appdata"))]);
+        assert_eq!(
+            forwarded,
+            vec![(
+                "DATABASE_URL".to_string(),
+                OsString::from("postgres://db/appdata")
+            )]
+        );
     }
 
     // The reason the plugin name is in the prefix: each surface gets its own
@@ -521,12 +649,21 @@ mod tests {
         let forwarded = forwarded_env(
             vars(&[
                 ("WA_PLUGIN_CLAIMS_ENV_DATABASE_URL", "postgres://db/claims"),
-                ("WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL", "postgres://db/appdata"),
+                (
+                    "WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL",
+                    "postgres://db/appdata",
+                ),
             ]),
             "REGISTRATION",
         );
 
-        assert_eq!(forwarded, vec![("DATABASE_URL".to_string(), OsString::from("postgres://db/appdata"))]);
+        assert_eq!(
+            forwarded,
+            vec![(
+                "DATABASE_URL".to_string(),
+                OsString::from("postgres://db/appdata")
+            )]
+        );
     }
 
     // The whole point of `env_clear`: WeaveAuth's own configuration and
@@ -535,29 +672,44 @@ mod tests {
     fn does_not_forward_weaveauths_own_variables() {
         let forwarded = forwarded_env(
             vars(&[
-            ("WA_MAX_BCRYPT_COST", "12"),
-            ("WA_OIDC_GOOGLE_CLIENT_SECRET", "hunter2"),
-            ("WA_PLUGIN_ENV_DATABASE_URL", "postgres://db/unscoped"),
-            ("PATH", "/usr/bin"),
-            ("DATABASE_URL", "postgres://weaveauth/users"),
-        ]),
-        "REGISTRATION",
-    );
+                ("WA_MAX_BCRYPT_COST", "12"),
+                ("WA_OIDC_GOOGLE_CLIENT_SECRET", "hunter2"),
+                ("WA_PLUGIN_ENV_DATABASE_URL", "postgres://db/unscoped"),
+                ("PATH", "/usr/bin"),
+                ("DATABASE_URL", "postgres://weaveauth/users"),
+            ]),
+            "REGISTRATION",
+        );
 
-        assert!(forwarded.is_empty(), "a variable WeaveAuth never marked for the plugin was forwarded: {forwarded:?}");
+        assert!(
+            forwarded.is_empty(),
+            "a variable WeaveAuth never marked for the plugin was forwarded: {forwarded:?}"
+        );
     }
 
     #[test]
     fn drops_a_variable_that_is_only_the_prefix() {
-        assert!(forwarded_env(vars(&[("WA_PLUGIN_REGISTRATION_ENV_", "orphan")]), "REGISTRATION").is_empty());
+        assert!(
+            forwarded_env(
+                vars(&[("WA_PLUGIN_REGISTRATION_ENV_", "orphan")]),
+                "REGISTRATION"
+            )
+            .is_empty()
+        );
     }
 
     fn string_value(value: &str) -> prost_types::Value {
-        prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(value.to_string())) }
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
+        }
     }
 
     fn list_value(values: Vec<prost_types::Value>) -> prost_types::Value {
-        prost_types::Value { kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue { values })) }
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue { values },
+            )),
+        }
     }
 
     // The motivating shape: role -> list of ids, nested inside a struct
@@ -565,17 +717,27 @@ mod tests {
     #[test]
     fn struct_to_json_converts_a_nested_struct_with_a_list_of_strings() {
         let mut roles = std::collections::BTreeMap::new();
-        roles.insert("admin".to_string(), list_value(vec![string_value("user-1"), string_value("user-2")]));
+        roles.insert(
+            "admin".to_string(),
+            list_value(vec![string_value("user-1"), string_value("user-2")]),
+        );
         let data = prost_types::Struct {
             fields: std::collections::BTreeMap::from([(
                 "roles".to_string(),
-                prost_types::Value { kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct { fields: roles })) },
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                        fields: roles,
+                    })),
+                },
             )]),
         };
 
         let map = struct_to_json(data);
 
-        assert_eq!(map.get("roles").and_then(|v| v.get("admin")), Some(&serde_json::json!(["user-1", "user-2"])));
+        assert_eq!(
+            map.get("roles").and_then(|v| v.get("admin")),
+            Some(&serde_json::json!(["user-1", "user-2"]))
+        );
     }
 
     #[test]
@@ -583,8 +745,18 @@ mod tests {
         let data = prost_types::Struct {
             fields: std::collections::BTreeMap::from([
                 ("name".to_string(), string_value("alice")),
-                ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
-                ("level".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(3.0)) }),
+                (
+                    "active".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::BoolValue(true)),
+                    },
+                ),
+                (
+                    "level".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::NumberValue(3.0)),
+                    },
+                ),
                 ("nothing".to_string(), prost_types::Value { kind: None }),
             ]),
         };

@@ -93,10 +93,14 @@ async fn stub_backend_with_expiry(
     access_expires_at: chrono::DateTime<chrono::Utc>,
     refresh_expires_at: chrono::DateTime<chrono::Utc>,
     refresh_failure: Option<StatusCode>,
-) -> anyhow::Result<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+)> {
     use axum::response::IntoResponse;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -165,15 +169,17 @@ async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)
     let addr = listener.local_addr()?;
     let router = Router::new().route(
         "/whoami/{id}",
-        get(|Path(id): Path<String>, headers: axum::http::HeaderMap| async move {
-            let auth = headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let has_cookie = headers.contains_key("cookie");
-            format!("id={id} auth={auth} cookie={has_cookie}")
-        }),
+        get(
+            |Path(id): Path<String>, headers: axum::http::HeaderMap| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let has_cookie = headers.contains_key("cookie");
+                format!("id={id} auth={auth} cookie={has_cookie}")
+            },
+        ),
     );
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -199,7 +205,10 @@ async fn proxies_authenticated_request_swapping_cookie_for_bearer_token() -> any
     }];
     let app = app(test_config(backend, routes)).unwrap();
 
-    let login_resp = app.clone().oneshot(login_request("http://admin.test/")?).await?;
+    let login_resp = app
+        .clone()
+        .oneshot(login_request("http://admin.test/")?)
+        .await?;
     let set_cookie = login_resp
         .headers()
         .get("set-cookie")
@@ -408,9 +417,7 @@ async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
     for _ in 0..5 {
         let resp = app
             .clone()
-            .oneshot(with_test_peer(
-                Request::get("/health").body(Body::empty())?,
-            ))
+            .oneshot(with_test_peer(Request::get("/health").body(Body::empty())?))
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -478,7 +485,10 @@ async fn access_token_within_the_refresh_leeway_is_refreshed_even_though_not_yet
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     let body = String::from_utf8(body.to_vec())?;
-    assert_eq!(body, "id=42 auth=Bearer refreshed-access-token cookie=false");
+    assert_eq!(
+        body,
+        "id=42 auth=Bearer refreshed-access-token cookie=false"
+    );
     Ok(())
 }
 
@@ -508,7 +518,10 @@ async fn expired_access_token_is_transparently_refreshed() -> anyhow::Result<()>
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     let body = String::from_utf8(body.to_vec())?;
     // Not the token from login (already expired) -- the refreshed one.
-    assert_eq!(body, "id=42 auth=Bearer refreshed-access-token cookie=false");
+    assert_eq!(
+        body,
+        "id=42 auth=Bearer refreshed-access-token cookie=false"
+    );
     Ok(())
 }
 

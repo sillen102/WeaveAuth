@@ -7,14 +7,14 @@ pub(crate) use controller::oidc_login_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
+    use axum::Json;
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::response::Redirect;
-    use axum::Json;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
@@ -59,10 +59,16 @@ mod controller {
         )]
         EmailNotVerified,
         #[error("downstream extra-data handler rejected the new user")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "downstream extra-data handler rejected the new user")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "downstream extra-data handler rejected the new user"
+        )]
         DownstreamServiceFailed,
         #[error("oidc provider profile api call failed")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "oidc provider profile api call failed")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "oidc provider profile api call failed"
+        )]
         ProfileApiFailed,
         #[error("a permission this deployment requires was not granted at the oidc provider")]
         #[error_response(
@@ -89,7 +95,9 @@ mod controller {
                 service::OidcServiceError::InvalidState => OidcError::InvalidState,
                 service::OidcServiceError::ExchangeFailed(_) => OidcError::ExchangeFailed,
                 service::OidcServiceError::EmailNotVerified => OidcError::EmailNotVerified,
-                service::OidcServiceError::DownstreamServiceFailed(_) => OidcError::DownstreamServiceFailed,
+                service::OidcServiceError::DownstreamServiceFailed(_) => {
+                    OidcError::DownstreamServiceFailed
+                }
                 service::OidcServiceError::ProfileApiFailed(_) => OidcError::ProfileApiFailed,
                 service::OidcServiceError::ConsentRequired(_) => OidcError::ConsentRequired,
             }
@@ -99,7 +107,10 @@ mod controller {
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum ConfirmLinkError {
         #[error("invalid or expired pending oidc link")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired pending oidc link")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "invalid or expired pending oidc link"
+        )]
         InvalidPendingLink,
         #[error("incorrect password")]
         #[error_response(StatusCode::UNAUTHORIZED, details = "incorrect password")]
@@ -109,8 +120,12 @@ mod controller {
     impl From<service::ConfirmLinkServiceError> for ConfirmLinkError {
         fn from(err: service::ConfirmLinkServiceError) -> Self {
             match err {
-                service::ConfirmLinkServiceError::InvalidPendingLink => ConfirmLinkError::InvalidPendingLink,
-                service::ConfirmLinkServiceError::PasswordConfirmationFailed => ConfirmLinkError::PasswordConfirmationFailed,
+                service::ConfirmLinkServiceError::InvalidPendingLink => {
+                    ConfirmLinkError::InvalidPendingLink
+                }
+                service::ConfirmLinkServiceError::PasswordConfirmationFailed => {
+                    ConfirmLinkError::PasswordConfirmationFailed
+                }
             }
         }
     }
@@ -165,7 +180,8 @@ mod controller {
         Path(provider): Path<String>,
         Query(query): Query<OidcCallbackQuery>,
     ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
-        let response = service::oidc_callback(&mut state, provider, query.code, query.state).await?;
+        let response =
+            service::oidc_callback(&mut state, provider, query.code, query.state).await?;
         Ok(Json(response))
     }
 
@@ -177,7 +193,8 @@ mod controller {
         Json(req): Json<OidcConfirmLinkRequest>,
     ) -> Result<Json<OidcConfirmLinkResponse>, ConfirmLinkError> {
         let login_session =
-            service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into()).await?;
+            service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into())
+                .await?;
         Ok(Json(OidcConfirmLinkResponse { login_session }))
     }
 }
@@ -187,8 +204,8 @@ mod service {
 
     use openidconnect::core::{CoreAuthenticationFlow, CoreIdToken};
     use openidconnect::{
-        AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, Scope,
-        TokenResponse,
+        AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+        PkceCodeVerifier, Scope, TokenResponse,
     };
     use schemars::JsonSchema;
     use secrecy::{ExposeSecret, SecretString};
@@ -199,7 +216,8 @@ mod service {
     use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{
-        LoginSessionStorage, OidcLinkOutcome, OidcStateStorage, PendingOidcLinkStorage, UserStorage, VerifiedEmail,
+        LoginSessionStorage, OidcLinkOutcome, OidcStateStorage, PendingOidcLinkStorage,
+        UserStorage, VerifiedEmail,
     };
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -246,19 +264,31 @@ mod service {
         /// password to `/oauth/oidc/confirm-link` along with
         /// `pending_link_token` to finish linking; the OIDC login isn't
         /// authenticated yet.
-        PasswordConfirmationRequired { pending_link_token: String, email: String },
+        PasswordConfirmationRequired {
+            pending_link_token: String,
+            email: String,
+        },
     }
 
     /// Starts a third-party OIDC login for `provider`, returning the
     /// provider's consent-screen URL to redirect the caller to.
-    pub(crate) async fn oidc_login(state: &mut AppState, provider: String) -> Result<String, OidcServiceError> {
+    pub(crate) async fn oidc_login(
+        state: &mut AppState,
+        provider: String,
+    ) -> Result<String, OidcServiceError> {
         let client = state
             .oidc_providers
             .get(&provider)
             .ok_or(OidcServiceError::UnknownProvider)?;
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-        let scopes = state.oidc_scopes.get(&provider).into_iter().flatten().cloned().map(Scope::new);
+        let scopes = state
+            .oidc_scopes
+            .get(&provider)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .map(Scope::new);
         let (auth_url, csrf_token, nonce) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
@@ -303,7 +333,9 @@ mod service {
 
         let token_response = client
             .exchange_code(AuthorizationCode::new(code))
-            .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.expose_secret().to_string()))
+            .set_pkce_verifier(PkceCodeVerifier::new(
+                login_state.pkce_verifier.expose_secret().to_string(),
+            ))
             .request_async(&*state.oidc_http_client)
             .await
             .map_err(|error| {
@@ -313,9 +345,11 @@ mod service {
                 ))
             })?;
 
-        let id_token = token_response
-            .id_token()
-            .ok_or_else(|| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' returned no id_token")))?;
+        let id_token = token_response.id_token().ok_or_else(|| {
+            OidcServiceError::ExchangeFailed(format!(
+                "provider '{stored_provider}' returned no id_token"
+            ))
+        })?;
         let verifier = client.id_token_verifier();
         let claims = id_token
             .claims(
@@ -338,38 +372,64 @@ mod service {
         // `resolve_oidc_login` require a `VerifiedEmail` in its signature --
         // this is the only place in the codebase allowed to construct one
         // from an OIDC claim.
-        let email = claims.email().ok_or(OidcServiceError::EmailNotVerified)?.as_str().to_string();
+        let email = claims
+            .email()
+            .ok_or(OidcServiceError::EmailNotVerified)?
+            .as_str()
+            .to_string();
         let verified_email =
-            VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true)).ok_or(OidcServiceError::EmailNotVerified)?;
+            VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true))
+                .ok_or(OidcServiceError::EmailNotVerified)?;
         let subject = claims.subject().as_str();
         let is_new_user = state.users.get_user_by_email(&email).await.is_none();
         let mut profile = profile_fields(id_token, state.oidc_extra_claims.get(&stored_provider));
 
         if is_new_user {
             let access_token = token_response.access_token().secret();
-            let all_apis = state.oidc_profile_apis.get(&stored_provider).map(Vec::as_slice).unwrap_or_default();
+            let all_apis = state
+                .oidc_profile_apis
+                .get(&stored_provider)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             // Decided before any call goes out, so a required entry whose scope
             // was declined fails without calling anything.
             let mut apis = Vec::new();
             for api in all_apis {
-                match api.scope.as_deref().filter(|scope| !scope_granted(&token_response, scope)) {
-                    Some(scope) if api.required => return Err(OidcServiceError::ConsentRequired(scope.to_string())),
-                    Some(scope) => tracing::info!(%scope, provider = %stored_provider, "user declined scope, skipping profile api"),
+                match api
+                    .scope
+                    .as_deref()
+                    .filter(|scope| !scope_granted(&token_response, scope))
+                {
+                    Some(scope) if api.required => {
+                        return Err(OidcServiceError::ConsentRequired(scope.to_string()));
+                    }
+                    Some(scope) => {
+                        tracing::info!(%scope, provider = %stored_provider, "user declined scope, skipping profile api")
+                    }
                     None => apis.push(api),
                 }
             }
-            let results =
-                futures_util::future::join_all(apis.iter().map(|api| fetch_profile_api(&state.oidc_http_client, api, access_token)))
-                    .await;
+            let results = futures_util::future::join_all(
+                apis.iter()
+                    .map(|api| fetch_profile_api(&state.oidc_http_client, api, access_token)),
+            )
+            .await;
             // Results come back in list order, so a later entry still wins a field-name clash.
             for (api, result) in apis.iter().zip(results) {
                 match result {
-                    Ok(ProfileApiFields { missing: Some(cause), .. }) if api.required => {
+                    Ok(ProfileApiFields {
+                        missing: Some(cause),
+                        ..
+                    }) if api.required => {
                         return Err(OidcServiceError::ProfileApiFailed(cause));
                     }
                     Ok(ProfileApiFields { found, .. }) => profile.extend(found),
-                    Err(cause) if api.required => return Err(OidcServiceError::ProfileApiFailed(cause)),
-                    Err(cause) => tracing::warn!(%cause, provider = %stored_provider, "optional oidc profile api call failed"),
+                    Err(cause) if api.required => {
+                        return Err(OidcServiceError::ProfileApiFailed(cause));
+                    }
+                    Err(cause) => {
+                        tracing::warn!(%cause, provider = %stored_provider, "optional oidc profile api call failed")
+                    }
                 }
             }
         }
@@ -381,7 +441,11 @@ mod service {
             forward_profile(state, new_user_id, &email, &profile).await?;
         }
 
-        let response = match state.users.resolve_oidc_login(&stored_provider, subject, &verified_email, new_user_id).await {
+        let response = match state
+            .users
+            .resolve_oidc_login(&stored_provider, subject, &verified_email, new_user_id)
+            .await
+        {
             OidcLinkOutcome::Resolved(user) => {
                 let login_session = state.login_sessions.create_session(user.id).await;
                 OidcCallbackResponse::Authenticated { login_session }
@@ -391,7 +455,10 @@ mod service {
                     .pending_oidc_links
                     .save_pending_link(stored_provider, subject.to_string(), existing_user_id)
                     .await;
-                OidcCallbackResponse::PasswordConfirmationRequired { pending_link_token, email }
+                OidcCallbackResponse::PasswordConfirmationRequired {
+                    pending_link_token,
+                    email,
+                }
             }
         };
 
@@ -402,18 +469,29 @@ mod service {
     /// (`OidcProviderConfig::extra_claims`). Only called with a token whose
     /// signature `IdToken::claims` has already verified; scalar claims are
     /// stringified, anything else is skipped.
-    fn profile_fields(id_token: &CoreIdToken, mapping: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    fn profile_fields(
+        id_token: &CoreIdToken,
+        mapping: Option<&HashMap<String, String>>,
+    ) -> HashMap<String, String> {
         use base64::Engine;
         let payload = id_token
             .to_string()
             .split('.')
             .nth(1)
-            .and_then(|segment| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).ok())
+            .and_then(|segment| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(segment)
+                    .ok()
+            })
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        let (Some(payload), Some(mapping)) = (payload, mapping) else { return HashMap::new() };
+        let (Some(payload), Some(mapping)) = (payload, mapping) else {
+            return HashMap::new();
+        };
         mapping
             .iter()
-            .filter_map(|(field, claim)| Some((field.clone(), scalar_to_string(payload.get(claim)?)?)))
+            .filter_map(|(field, claim)| {
+                Some((field.clone(), scalar_to_string(payload.get(claim)?)?))
+            })
             .collect()
     }
 
@@ -428,7 +506,9 @@ mod service {
     /// A token response without a `scope` field means the provider granted
     /// what was asked for (RFC 6749 section 5.1).
     fn scope_granted(token_response: &impl OAuth2TokenResponse, scope: &str) -> bool {
-        token_response.scopes().is_none_or(|granted| granted.iter().any(|s| s.as_str() == scope))
+        token_response
+            .scopes()
+            .is_none_or(|granted| granted.iter().any(|s| s.as_str() == scope))
     }
 
     /// What a profile API call that succeeded found.
@@ -483,7 +563,9 @@ mod service {
         }
         let missing = (!missing_pointers.is_empty()).then(|| {
             // Key names only: enough to see what the API sent, no personal data.
-            let keys = json.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "));
+            let keys = json
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "));
             format!(
                 "{url} has no value at {} (response keys: {})",
                 missing_pointers.join(", "),
@@ -499,8 +581,13 @@ mod service {
         email: &str,
         profile: &HashMap<String, String>,
     ) -> Result<(), OidcServiceError> {
-        let Some(handler) = state.extra_data_handler.as_ref() else { return Ok(()) };
-        handler.handle(user_id, email, profile).await.map_err(|error| OidcServiceError::DownstreamServiceFailed(error.0))
+        let Some(handler) = state.extra_data_handler.as_ref() else {
+            return Ok(());
+        };
+        handler
+            .handle(user_id, email, profile)
+            .await
+            .map_err(|error| OidcServiceError::DownstreamServiceFailed(error.0))
     }
 
     /// Finishes linking an OIDC identity that `oidc_callback` flagged as
@@ -522,7 +609,9 @@ mod service {
             .get_user_by_id(pending_link.existing_user_id)
             .await
             .ok_or(ConfirmLinkServiceError::InvalidPendingLink)?;
-        let hash = user.password.ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
+        let hash = user
+            .password
+            .ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
         let is_legacy_bcrypt = matches!(hash, PasswordHash::Bcrypt(_));
 
         // No dummy-hash timing guard needed: pending_link_token already reveals the account exists.
@@ -543,7 +632,11 @@ mod service {
 
         let user = state
             .users
-            .link_verified_oidc_identity(pending_link.existing_user_id, &pending_link.provider, &pending_link.subject)
+            .link_verified_oidc_identity(
+                pending_link.existing_user_id,
+                &pending_link.provider,
+                &pending_link.subject,
+            )
             .await
             .ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
         let login_session = state.login_sessions.create_session(user.id).await;
@@ -555,8 +648,8 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::extract::{Path, Query, State};
     use axum::Json;
+    use axum::extract::{Path, Query, State};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -582,7 +675,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
@@ -657,13 +751,23 @@ mod tests {
         // First call consumes the state; provider is unknown here (no real
         // client configured in this test), so it fails past the state check
         // -- what matters is the state entry is gone afterwards.
-        let _ = oidc_callback(State(state.clone()), Path("google".to_string()), Query(query)).await;
+        let _ = oidc_callback(
+            State(state.clone()),
+            Path("google".to_string()),
+            Query(query),
+        )
+        .await;
 
         let replay_query = OidcCallbackQuery {
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
-        let result = oidc_callback(State(state), Path("google".to_string()), Query(replay_query)).await;
+        let result = oidc_callback(
+            State(state),
+            Path("google".to_string()),
+            Query(replay_query),
+        )
+        .await;
 
         assert_eq!(result.err(), Some(OidcError::InvalidState));
     }
@@ -676,7 +780,11 @@ mod tests {
         email: &str,
         email_verified: bool,
         nonce: &str,
-    ) -> (String, std::sync::Arc<HashMap<String, crate::oidc::OidcClient>>, String) {
+    ) -> (
+        String,
+        std::sync::Arc<HashMap<String, crate::oidc::OidcClient>>,
+        String,
+    ) {
         provider_and_id_token_granting(email, email_verified, nonce, None).await
     }
 
@@ -686,7 +794,11 @@ mod tests {
         email_verified: bool,
         nonce: &str,
         granted_scope: Option<&str>,
-    ) -> (String, std::sync::Arc<HashMap<String, crate::oidc::OidcClient>>, String) {
+    ) -> (
+        String,
+        std::sync::Arc<HashMap<String, crate::oidc::OidcClient>>,
+        String,
+    ) {
         use serde::Serialize;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -708,7 +820,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let signing_key = crate::crypto::JwtKeys::generate().expect("RSA keygen for tests never fails");
+        let signing_key =
+            crate::crypto::JwtKeys::generate().expect("RSA keygen for tests never fails");
 
         Mock::given(method("GET"))
             .and(path("/jwks"))
@@ -745,7 +858,8 @@ mod tests {
         };
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         header.kid = Some(signing_key.kid.clone());
-        let id_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key).expect("signing");
+        let id_token =
+            jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key).expect("signing");
 
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -790,7 +904,8 @@ mod tests {
 
     #[tokio::test]
     async fn callback_resolves_to_authenticated_when_the_provider_confirms_the_email() {
-        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", true, "test-nonce").await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state
@@ -802,11 +917,20 @@ mod tests {
                 "test-nonce".to_string(),
             )
             .await;
-        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: "csrf-token".to_string() };
+        let query = OidcCallbackQuery {
+            code: "irrelevant".to_string(),
+            state: "csrf-token".to_string(),
+        };
 
-        let result = oidc_callback(State(state), Path("test-provider".to_string()), Query(query)).await;
+        let result = oidc_callback(
+            State(state),
+            Path("test-provider".to_string()),
+            Query(query),
+        )
+        .await;
 
-        let Json(super::service::OidcCallbackResponse::Authenticated { .. }) = result.expect("callback succeeds")
+        let Json(super::service::OidcCallbackResponse::Authenticated { .. }) =
+            result.expect("callback succeeds")
         else {
             unreachable!("expected Authenticated");
         };
@@ -826,7 +950,13 @@ mod tests {
             fields: &HashMap<String, String>,
         ) -> Result<(), crate::server::api::register::ExtraDataError> {
             self.calls.lock().unwrap().push((user_id, fields.clone()));
-            if self.fail { Err(crate::server::api::register::ExtraDataError("stub rejected".to_string())) } else { Ok(()) }
+            if self.fail {
+                Err(crate::server::api::register::ExtraDataError(
+                    "stub rejected".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -834,15 +964,30 @@ mod tests {
         state
             .oidc_state
             .clone()
-            .save_state(csrf.to_string(), "test-provider".to_string(), "verifier".to_string(), "test-nonce".to_string())
+            .save_state(
+                csrf.to_string(),
+                "test-provider".to_string(),
+                "verifier".to_string(),
+                "test-nonce".to_string(),
+            )
             .await;
-        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: csrf.to_string() };
-        oidc_callback(State(state.clone()), Path("test-provider".to_string()), Query(query)).await.map(|_| ())
+        let query = OidcCallbackQuery {
+            code: "irrelevant".to_string(),
+            state: csrf.to_string(),
+        };
+        oidc_callback(
+            State(state.clone()),
+            Path("test-provider".to_string()),
+            Query(query),
+        )
+        .await
+        .map(|_| ())
     }
 
     #[tokio::test]
     async fn login_requests_the_providers_configured_scopes() {
-        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", true, "test-nonce").await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state.oidc_scopes = Arc::new(HashMap::from([(
@@ -850,16 +995,24 @@ mod tests {
             vec!["email".to_string(), "https://example.com/phone".to_string()],
         )]));
 
-        let auth_url = super::service::oidc_login(&mut state, "test-provider".to_string()).await.expect("login starts");
+        let auth_url = super::service::oidc_login(&mut state, "test-provider".to_string())
+            .await
+            .expect("login starts");
 
         let url = url::Url::parse(&auth_url).expect("valid url");
-        let scope = url.query_pairs().find(|(key, _)| key == "scope").expect("scope param").1.into_owned();
+        let scope = url
+            .query_pairs()
+            .find(|(key, _)| key == "scope")
+            .expect("scope param")
+            .1
+            .into_owned();
         assert_eq!(scope, "openid email https://example.com/phone");
     }
 
     #[tokio::test]
     async fn first_oidc_login_forwards_profile_claims_to_the_extra_data_handler_once() {
-        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", true, "test-nonce").await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state.oidc_extra_claims = Arc::new(HashMap::from([(
@@ -869,38 +1022,75 @@ mod tests {
                 ("surname".to_string(), "family_name".to_string()),
             ]),
         )]));
-        let handler = Arc::new(RecordingHandler { calls: Default::default(), fail: false });
+        let handler = Arc::new(RecordingHandler {
+            calls: Default::default(),
+            fail: false,
+        });
         state.extra_data_handler = Some(handler.clone());
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
-        run_callback(&state, "csrf-2").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
+        run_callback(&state, "csrf-2")
+            .await
+            .expect("callback succeeds");
 
-        let created = state.users.get_user_by_email("alice@example.com").await.expect("user created");
+        let created = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .expect("user created");
         let calls = handler.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "only the login that creates the user forwards claims");
-        assert_eq!(calls[0].0, created.id, "handler is told the id the user is created with");
-        assert_eq!(calls[0].1.get("first_name").map(String::as_str), Some("Alice"));
-        assert_eq!(calls[0].1.get("surname").map(String::as_str), Some("Liddell"));
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the login that creates the user forwards claims"
+        );
+        assert_eq!(
+            calls[0].0, created.id,
+            "handler is told the id the user is created with"
+        );
+        assert_eq!(
+            calls[0].1.get("first_name").map(String::as_str),
+            Some("Alice")
+        );
+        assert_eq!(
+            calls[0].1.get("surname").map(String::as_str),
+            Some("Liddell")
+        );
     }
 
     #[tokio::test]
     async fn failing_extra_data_handler_fails_the_login_and_creates_no_user() {
-        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", true, "test-nonce").await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state.oidc_extra_claims = Arc::new(HashMap::from([(
             "test-provider".to_string(),
             HashMap::from([("first_name".to_string(), "given_name".to_string())]),
         )]));
-        state.extra_data_handler = Some(Arc::new(RecordingHandler { calls: Default::default(), fail: true }));
+        state.extra_data_handler = Some(Arc::new(RecordingHandler {
+            calls: Default::default(),
+            fail: true,
+        }));
 
         let result = run_callback(&state, "csrf-1").await;
 
         assert_eq!(result, Err(OidcError::DownstreamServiceFailed));
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_none());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_none()
+        );
     }
 
-    async fn profile_api_server(response: wiremock::ResponseTemplate, expected_calls: u64) -> wiremock::MockServer {
+    async fn profile_api_server(
+        response: wiremock::ResponseTemplate,
+        expected_calls: u64,
+    ) -> wiremock::MockServer {
         use wiremock::matchers::{header, method, path};
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(method("GET"))
@@ -913,10 +1103,17 @@ mod tests {
         server
     }
 
-    fn profile_api(server: &wiremock::MockServer, claims: &[(&str, &str)], required: bool) -> crate::config::ProfileApiConfig {
+    fn profile_api(
+        server: &wiremock::MockServer,
+        claims: &[(&str, &str)],
+        required: bool,
+    ) -> crate::config::ProfileApiConfig {
         crate::config::ProfileApiConfig {
             url: format!("{}/me", server.uri()),
-            claims: claims.iter().map(|(field, pointer)| (field.to_string(), pointer.to_string())).collect(),
+            claims: claims
+                .iter()
+                .map(|(field, pointer)| (field.to_string(), pointer.to_string()))
+                .collect(),
             required,
             scope: None,
         }
@@ -925,7 +1122,9 @@ mod tests {
     /// A state whose provider calls `apis` on first login and whose handler
     /// also gets `first_name` from the id_token, so it is invoked even when
     /// every profile API contributes nothing.
-    async fn state_with_profile_apis(apis: Vec<crate::config::ProfileApiConfig>) -> (AppState, Arc<RecordingHandler>) {
+    async fn state_with_profile_apis(
+        apis: Vec<crate::config::ProfileApiConfig>,
+    ) -> (AppState, Arc<RecordingHandler>) {
         state_with_profile_apis_granting(apis, None).await
     }
 
@@ -934,7 +1133,8 @@ mod tests {
         granted_scope: Option<&str>,
     ) -> (AppState, Arc<RecordingHandler>) {
         let (_issuer, providers, _id_token) =
-            provider_and_id_token_granting("alice@example.com", true, "test-nonce", granted_scope).await;
+            provider_and_id_token_granting("alice@example.com", true, "test-nonce", granted_scope)
+                .await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state.oidc_extra_claims = Arc::new(HashMap::from([(
@@ -942,13 +1142,17 @@ mod tests {
             HashMap::from([("first_name".to_string(), "given_name".to_string())]),
         )]));
         state.oidc_profile_apis = Arc::new(HashMap::from([("test-provider".to_string(), apis)]));
-        let handler = Arc::new(RecordingHandler { calls: Default::default(), fail: false });
+        let handler = Arc::new(RecordingHandler {
+            calls: Default::default(),
+            fail: false,
+        });
         state.extra_data_handler = Some(handler.clone());
         (state, handler)
     }
 
     fn phone_response() -> wiremock::ResponseTemplate {
-        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "phoneNumbers": [{ "value": "+46701234567" }] }))
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "phoneNumbers": [{ "value": "+46701234567" }] }))
     }
 
     #[tokio::test]
@@ -958,13 +1162,24 @@ mod tests {
         let api = profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], false);
         let (state, handler) = state_with_profile_apis(vec![api]).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
-        run_callback(&state, "csrf-2").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
+        run_callback(&state, "csrf-2")
+            .await
+            .expect("callback succeeds");
 
         let calls = handler.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1.get("phone_number").map(String::as_str), Some("+46701234567"));
-        assert_eq!(calls[0].1.get("first_name").map(String::as_str), Some("Alice"), "id_token claims still forwarded");
+        assert_eq!(
+            calls[0].1.get("phone_number").map(String::as_str),
+            Some("+46701234567")
+        );
+        assert_eq!(
+            calls[0].1.get("first_name").map(String::as_str),
+            Some("Alice"),
+            "id_token claims still forwarded"
+        );
     }
 
     #[tokio::test]
@@ -976,7 +1191,13 @@ mod tests {
         let result = run_callback(&state, "csrf-1").await;
 
         assert_eq!(result, Err(OidcError::ProfileApiFailed));
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_none());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_none()
+        );
         assert!(handler.calls.lock().unwrap().is_empty());
     }
 
@@ -986,9 +1207,17 @@ mod tests {
         let api = profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], false);
         let (state, handler) = state_with_profile_apis(vec![api]).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
 
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_some());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_some()
+        );
         let calls = handler.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].1.contains_key("phone_number"));
@@ -996,13 +1225,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_value_is_a_failure_only_when_the_call_is_required() {
-        let server = profile_api_server(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})), 2).await;
+        let server = profile_api_server(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+            2,
+        )
+        .await;
         let claims = [("phone_number", "/phoneNumbers/0/value")];
 
-        let (state, _handler) = state_with_profile_apis(vec![profile_api(&server, &claims, true)]).await;
-        assert_eq!(run_callback(&state, "csrf-1").await, Err(OidcError::ProfileApiFailed));
+        let (state, _handler) =
+            state_with_profile_apis(vec![profile_api(&server, &claims, true)]).await;
+        assert_eq!(
+            run_callback(&state, "csrf-1").await,
+            Err(OidcError::ProfileApiFailed)
+        );
 
-        let (state, _handler) = state_with_profile_apis(vec![profile_api(&server, &claims, false)]).await;
+        let (state, _handler) =
+            state_with_profile_apis(vec![profile_api(&server, &claims, false)]).await;
         assert!(run_callback(&state, "csrf-1").await.is_ok());
     }
 
@@ -1011,7 +1249,8 @@ mod tests {
         let phone = profile_api_server(phone_response(), 1).await;
         let broken = profile_api_server(wiremock::ResponseTemplate::new(500), 1).await;
         let nickname = profile_api_server(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "nick": "ally" })),
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "nick": "ally" })),
             1,
         )
         .await;
@@ -1022,10 +1261,15 @@ mod tests {
         ];
         let (state, handler) = state_with_profile_apis(apis).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
 
         let calls = handler.calls.lock().unwrap();
-        assert_eq!(calls[0].1.get("phone_number").map(String::as_str), Some("+46701234567"));
+        assert_eq!(
+            calls[0].1.get("phone_number").map(String::as_str),
+            Some("+46701234567")
+        );
         assert_eq!(calls[0].1.get("nickname").map(String::as_str), Some("ally"));
         assert!(!calls[0].1.contains_key("birthday"));
     }
@@ -1035,24 +1279,35 @@ mod tests {
         let delay = std::time::Duration::from_millis(500);
         let slow_phone = profile_api_server(phone_response().set_delay(delay), 1).await;
         let slow_nickname = profile_api_server(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "nick": "ally" })).set_delay(delay),
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "nick": "ally" }))
+                .set_delay(delay),
             1,
         )
         .await;
         let apis = vec![
-            profile_api(&slow_phone, &[("phone_number", "/phoneNumbers/0/value")], false),
+            profile_api(
+                &slow_phone,
+                &[("phone_number", "/phoneNumbers/0/value")],
+                false,
+            ),
             profile_api(&slow_nickname, &[("nickname", "/nick")], false),
         ];
         let (state, handler) = state_with_profile_apis(apis).await;
 
         let started = std::time::Instant::now();
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
         let elapsed = started.elapsed();
 
         // One after the other would take at least twice the delay.
         assert!(elapsed < delay * 2, "calls ran sequentially: {elapsed:?}");
         let calls = handler.calls.lock().unwrap();
-        assert_eq!(calls[0].1.get("phone_number").map(String::as_str), Some("+46701234567"));
+        assert_eq!(
+            calls[0].1.get("phone_number").map(String::as_str),
+            Some("+46701234567")
+        );
         assert_eq!(calls[0].1.get("nickname").map(String::as_str), Some("ally"));
     }
 
@@ -1066,39 +1321,76 @@ mod tests {
     #[tokio::test]
     async fn a_declined_scope_skips_an_optional_call_without_calling_it() {
         let server = profile_api_server(phone_response(), 0).await;
-        let api = scoped(profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], false));
-        let (state, handler) = state_with_profile_apis_granting(vec![api], Some("openid email")).await;
+        let api = scoped(profile_api(
+            &server,
+            &[("phone_number", "/phoneNumbers/0/value")],
+            false,
+        ));
+        let (state, handler) =
+            state_with_profile_apis_granting(vec![api], Some("openid email")).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
 
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_some());
-        assert!(!handler.calls.lock().unwrap()[0].1.contains_key("phone_number"));
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_some()
+        );
+        assert!(
+            !handler.calls.lock().unwrap()[0]
+                .1
+                .contains_key("phone_number")
+        );
     }
 
     #[tokio::test]
     async fn a_declined_scope_fails_a_required_call_without_calling_it() {
         let server = profile_api_server(phone_response(), 0).await;
-        let api = scoped(profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], true));
-        let (state, handler) = state_with_profile_apis_granting(vec![api], Some("openid email")).await;
+        let api = scoped(profile_api(
+            &server,
+            &[("phone_number", "/phoneNumbers/0/value")],
+            true,
+        ));
+        let (state, handler) =
+            state_with_profile_apis_granting(vec![api], Some("openid email")).await;
 
         let result = run_callback(&state, "csrf-1").await;
 
         assert_eq!(result, Err(OidcError::ConsentRequired));
-        assert!(state.users.get_user_by_email("alice@example.com").await.is_none());
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_none()
+        );
         assert!(handler.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn a_granted_scope_lets_the_call_through() {
         let server = profile_api_server(phone_response(), 1).await;
-        let api = scoped(profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], true));
+        let api = scoped(profile_api(
+            &server,
+            &[("phone_number", "/phoneNumbers/0/value")],
+            true,
+        ));
         let granted = format!("openid email {PHONE_SCOPE}");
         let (state, handler) = state_with_profile_apis_granting(vec![api], Some(&granted)).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
 
         assert_eq!(
-            handler.calls.lock().unwrap()[0].1.get("phone_number").map(String::as_str),
+            handler.calls.lock().unwrap()[0]
+                .1
+                .get("phone_number")
+                .map(String::as_str),
             Some("+46701234567")
         );
     }
@@ -1106,7 +1398,11 @@ mod tests {
     #[tokio::test]
     async fn a_token_response_without_a_scope_field_counts_as_granting_what_was_asked() {
         let server = profile_api_server(phone_response(), 1).await;
-        let api = scoped(profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], true));
+        let api = scoped(profile_api(
+            &server,
+            &[("phone_number", "/phoneNumbers/0/value")],
+            true,
+        ));
         let (state, _handler) = state_with_profile_apis_granting(vec![api], None).await;
 
         assert!(run_callback(&state, "csrf-1").await.is_ok());
@@ -1115,31 +1411,51 @@ mod tests {
     #[tokio::test]
     async fn an_optional_call_keeps_the_fields_it_found_when_another_is_missing() {
         let server = profile_api_server(phone_response(), 1).await;
-        let claims = [("phone_number", "/phoneNumbers/0/value"), ("birthday", "/birthdays/0/date")];
-        let (state, handler) = state_with_profile_apis(vec![profile_api(&server, &claims, false)]).await;
+        let claims = [
+            ("phone_number", "/phoneNumbers/0/value"),
+            ("birthday", "/birthdays/0/date"),
+        ];
+        let (state, handler) =
+            state_with_profile_apis(vec![profile_api(&server, &claims, false)]).await;
 
-        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-1")
+            .await
+            .expect("callback succeeds");
 
         let calls = handler.calls.lock().unwrap();
-        assert_eq!(calls[0].1.get("phone_number").map(String::as_str), Some("+46701234567"));
+        assert_eq!(
+            calls[0].1.get("phone_number").map(String::as_str),
+            Some("+46701234567")
+        );
         assert!(!calls[0].1.contains_key("birthday"));
     }
 
     #[tokio::test]
     async fn a_missing_value_error_names_the_response_keys_but_not_their_values() {
         let body = serde_json::json!({ "resourceName": "people/secret-id", "etag": "abc" });
-        let server = profile_api_server(wiremock::ResponseTemplate::new(200).set_body_json(body), 1).await;
+        let server =
+            profile_api_server(wiremock::ResponseTemplate::new(200).set_body_json(body), 1).await;
         let api = profile_api(&server, &[("phone_number", "/phoneNumbers/0/value")], false);
 
-        let result = super::service::fetch_profile_api(&openidconnect::reqwest::Client::new(), &api, "opaque-access-token")
-            .await
-            .expect("a response without the value is not a failed call");
+        let result = super::service::fetch_profile_api(
+            &openidconnect::reqwest::Client::new(),
+            &api,
+            "opaque-access-token",
+        )
+        .await
+        .expect("a response without the value is not a failed call");
 
         assert!(result.found.is_empty());
         let error = result.missing.expect("reports what was missing");
         assert!(error.contains("/phoneNumbers/0/value"), "{error}");
-        assert!(error.contains("resourceName") && error.contains("etag"), "{error}");
-        assert!(!error.contains("secret-id"), "values must not be logged: {error}");
+        assert!(
+            error.contains("resourceName") && error.contains("etag"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("secret-id"),
+            "values must not be logged: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1150,7 +1466,8 @@ mod tests {
         // able to put an arbitrary "email" in an id_token could attach
         // themselves to any victim's account (see the comment at the call
         // site in `service::oidc_callback`).
-        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", false, "test-nonce").await;
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", false, "test-nonce").await;
         let mut state = state_with_no_providers().await;
         state.oidc_providers = providers;
         state
@@ -1162,9 +1479,17 @@ mod tests {
                 "test-nonce".to_string(),
             )
             .await;
-        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: "csrf-token".to_string() };
+        let query = OidcCallbackQuery {
+            code: "irrelevant".to_string(),
+            state: "csrf-token".to_string(),
+        };
 
-        let result = oidc_callback(State(state), Path("test-provider".to_string()), Query(query)).await;
+        let result = oidc_callback(
+            State(state),
+            Path("test-provider".to_string()),
+            Query(query),
+        )
+        .await;
 
         assert_eq!(result.err(), Some(OidcError::EmailNotVerified));
     }
@@ -1184,8 +1509,8 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_link_rejects_wrong_password() {
-        use argon2::PasswordHasher;
         use crate::crypto::ARGON2;
+        use argon2::PasswordHasher;
 
         let mut state = state_with_no_providers().await;
         let hash = ARGON2
@@ -1211,16 +1536,23 @@ mod tests {
         };
         let result = oidc_confirm_link(State(state.clone()), Json(req)).await;
 
-        assert_eq!(result.err(), Some(ConfirmLinkError::PasswordConfirmationFailed));
+        assert_eq!(
+            result.err(),
+            Some(ConfirmLinkError::PasswordConfirmationFailed)
+        );
         // Untouched: still unverified, no identity linked.
-        let still_unverified = state.users.get_user_by_email("squatter@example.com").await.unwrap();
+        let still_unverified = state
+            .users
+            .get_user_by_email("squatter@example.com")
+            .await
+            .unwrap();
         assert!(!still_unverified.email_verified);
     }
 
     #[tokio::test]
     async fn confirm_link_succeeds_with_correct_password_and_is_single_use() {
-        use argon2::PasswordHasher;
         use crate::crypto::ARGON2;
+        use argon2::PasswordHasher;
 
         let mut state = state_with_no_providers().await;
         let hash = ARGON2
@@ -1244,10 +1576,16 @@ mod tests {
             pending_link_token: token.clone(),
             password: "correct-password".to_string(),
         };
-        let Json(body) = oidc_confirm_link(State(state.clone()), Json(req)).await.unwrap();
+        let Json(body) = oidc_confirm_link(State(state.clone()), Json(req))
+            .await
+            .unwrap();
         assert!(!body.login_session.is_empty());
 
-        let now_verified = state.users.get_user_by_email("alice@example.com").await.unwrap();
+        let now_verified = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .unwrap();
         assert!(now_verified.email_verified);
 
         // Single-use: the same token can't be redeemed twice.

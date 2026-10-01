@@ -3,18 +3,18 @@ pub(crate) use controller::start_register_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::extract::State;
-    use axum::http::{header, HeaderMap, StatusCode};
-    use axum::response::{IntoResponse, Response};
     use axum::Form;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
-    use crate::server::origin_check::require_trusted_origin;
     use crate::server::AppState;
+    use crate::server::origin_check::require_trusted_origin;
 
     use super::service::{self, RegisterOutcome, RegisterServiceError};
 
@@ -38,10 +38,16 @@ mod controller {
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum RegisterError {
         #[error("request did not come from a trusted origin")]
-        #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
+        #[error_response(
+            StatusCode::FORBIDDEN,
+            details = "request did not come from a trusted origin"
+        )]
         UntrustedOrigin,
         #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
         BackendUnavailable,
     }
 
@@ -95,11 +101,22 @@ mod controller {
                 Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
             }
             RegisterOutcome::Created => {
-                let response = match service::auto_login(&mut state, &req.email, &req.password, &req.redirect_uri).await {
-                    Some(cookie) => {
-                        (StatusCode::SEE_OTHER, [(header::LOCATION, req.redirect_uri), (header::SET_COOKIE, cookie)])
-                            .into_response()
-                    }
+                let response = match service::auto_login(
+                    &mut state,
+                    &req.email,
+                    &req.password,
+                    &req.redirect_uri,
+                )
+                .await
+                {
+                    Some(cookie) => (
+                        StatusCode::SEE_OTHER,
+                        [
+                            (header::LOCATION, req.redirect_uri),
+                            (header::SET_COOKIE, cookie),
+                        ],
+                    )
+                        .into_response(),
                     None => (StatusCode::SEE_OTHER, [(header::LOCATION, req.next)]).into_response(),
                 };
                 Ok(response)
@@ -113,8 +130,8 @@ mod service {
     use std::collections::HashMap;
     use thiserror::Error;
 
-    use crate::server::api::complete_login::complete_login;
     use crate::server::AppState;
+    use crate::server::api::complete_login::complete_login;
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum RegisterServiceError {
@@ -155,7 +172,11 @@ mod service {
         let resp = state
             .http_client
             .post(format!("{}/register", state.config.backend_url))
-            .json(&BackendCredentials { email, password, extra })
+            .json(&BackendCredentials {
+                email,
+                password,
+                extra,
+            })
             .send()
             .await
             .map_err(|error| {
@@ -183,7 +204,12 @@ mod service {
     /// `None` on any failure (logged here, since it isn't returned) -- the
     /// caller falls back to sending the user to the login page instead.
     /// Returns the `Set-Cookie` header value for the new session.
-    pub(crate) async fn auto_login(state: &mut AppState, email: &str, password: &str, redirect_uri: &str) -> Option<String> {
+    pub(crate) async fn auto_login(
+        state: &mut AppState,
+        email: &str,
+        password: &str,
+        redirect_uri: &str,
+    ) -> Option<String> {
         let result = try_auto_login(state, email, password, redirect_uri).await;
         if let Err(cause) = &result {
             tracing::warn!(%cause, "auto-login after registration failed");
@@ -200,7 +226,11 @@ mod service {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
-            .json(&BackendCredentials { email, password, extra: HashMap::new() })
+            .json(&BackendCredentials {
+                email,
+                password,
+                extra: HashMap::new(),
+            })
             .send()
             .await
             .map_err(|error| {
@@ -232,9 +262,9 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
+    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
-    use axum::Form;
     use std::collections::HashMap;
 
     use crate::config::Config;
@@ -289,7 +319,10 @@ mod tests {
         assert_eq!(req.next, "http://y");
         assert_eq!(
             req.extra,
-            HashMap::from([("company".to_string(), "Acme".to_string()), ("plan".to_string(), "pro".to_string())])
+            HashMap::from([
+                ("company".to_string(), "Acme".to_string()),
+                ("plan".to_string(), "pro".to_string())
+            ])
         );
     }
 

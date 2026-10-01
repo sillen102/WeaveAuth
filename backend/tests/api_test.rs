@@ -55,8 +55,7 @@ async fn login_session(app: axum::Router, email: &str, password: &str) -> String
             Request::post("/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"email": email, "password": password})
-                        .to_string(),
+                    serde_json::json!({"email": email, "password": password}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -68,8 +67,7 @@ async fn login_session(app: axum::Router, email: &str, password: &str) -> String
             Request::post("/oauth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"email": email, "password": password})
-                        .to_string(),
+                    serde_json::json!({"email": email, "password": password}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -105,8 +103,8 @@ async fn issue_code(app: axum::Router, code_challenge: &str) -> String {
 }
 
 fn challenge_for(verifier: &str) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sha2::{Digest, Sha256};
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }

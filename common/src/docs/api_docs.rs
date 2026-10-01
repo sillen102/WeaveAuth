@@ -1,8 +1,8 @@
 use aide::axum::ApiRouter;
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
 use scalar_api_reference::{get_asset_with_mime, scalar_html};
 
 const DOCS_PATH: &str = "/docs";

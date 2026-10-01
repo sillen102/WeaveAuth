@@ -8,15 +8,15 @@ mod controller {
     use axum::extract::{Form, State};
     use axum::http::StatusCode;
     use common::model::token::GrantType;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
-    use super::service::{self, AuthorizationCodeGrant, TokenServiceError};
     pub(crate) use super::service::TokenResponse;
+    use super::service::{self, AuthorizationCodeGrant, TokenServiceError};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct TokenRequest {
@@ -54,7 +54,10 @@ mod controller {
         #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired refresh token")]
         InvalidRefreshToken,
         #[error("downstream login-claims handler failed")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "downstream login-claims handler failed")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "downstream login-claims handler failed"
+        )]
         DownstreamServiceFailed,
         #[error("downstream login-claims handler returned a reserved claim name")]
         #[error_response(
@@ -85,8 +88,12 @@ mod controller {
                 TokenServiceError::InvalidCodeVerifier => TokenError::InvalidCodeVerifier,
                 TokenServiceError::MissingParameters => TokenError::MissingParameters,
                 TokenServiceError::InvalidRefreshToken => TokenError::InvalidRefreshToken,
-                TokenServiceError::DownstreamServiceFailed(_) => TokenError::DownstreamServiceFailed,
-                TokenServiceError::ReservedClaimOverridden(_) => TokenError::ReservedClaimOverridden,
+                TokenServiceError::DownstreamServiceFailed(_) => {
+                    TokenError::DownstreamServiceFailed
+                }
+                TokenServiceError::ReservedClaimOverridden(_) => {
+                    TokenError::ReservedClaimOverridden
+                }
                 TokenServiceError::UnexpectedError(_) => TokenError::UnexpectedError,
             }
         }
@@ -111,7 +118,11 @@ mod controller {
             GrantType::AuthorizationCode => {
                 let grant = match (req.code, req.code_verifier, req.redirect_uri) {
                     (Some(code), Some(code_verifier), Some(redirect_uri)) => {
-                        Some(AuthorizationCodeGrant { code, code_verifier, redirect_uri })
+                        Some(AuthorizationCodeGrant {
+                            code,
+                            code_verifier,
+                            redirect_uri,
+                        })
                     }
                     _ => None,
                 };
@@ -139,7 +150,9 @@ mod service {
     use uuid::Uuid;
 
     use crate::server::AppState;
-    use crate::storage::{JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage};
+    use crate::storage::{
+        JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage,
+    };
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum TokenServiceError {
@@ -207,8 +220,11 @@ mod service {
         state: &mut AppState,
         grant: Option<AuthorizationCodeGrant>,
     ) -> Result<TokenResponse, TokenServiceError> {
-        let AuthorizationCodeGrant { code, code_verifier, redirect_uri } =
-            grant.ok_or(TokenServiceError::MissingParameters)?;
+        let AuthorizationCodeGrant {
+            code,
+            code_verifier,
+            redirect_uri,
+        } = grant.ok_or(TokenServiceError::MissingParameters)?;
 
         let (challenge, _method, issued_redirect_uri, user_id) = state
             .pkce
@@ -237,13 +253,21 @@ mod service {
     ) -> Result<TokenResponse, TokenServiceError> {
         let refresh_token = refresh_token.ok_or(TokenServiceError::MissingParameters)?;
 
-        match state.refresh_tokens.take_refresh_token(&refresh_token).await {
-            RefreshTokenOutcome::Valid { user_id, family_id } => issue_tokens(state, user_id, family_id).await,
+        match state
+            .refresh_tokens
+            .take_refresh_token(&refresh_token)
+            .await
+        {
+            RefreshTokenOutcome::Valid { user_id, family_id } => {
+                issue_tokens(state, user_id, family_id).await
+            }
             // Already-used token: the storage layer has revoked the
             // whole family as a side effect. Wrong/unknown token: same
             // client-facing error either way, so the response doesn't
             // leak which case it was.
-            RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => Err(TokenServiceError::InvalidRefreshToken),
+            RefreshTokenOutcome::Reused | RefreshTokenOutcome::NotFound => {
+                Err(TokenServiceError::InvalidRefreshToken)
+            }
         }
     }
 
@@ -261,8 +285,14 @@ mod service {
 
         let extra = match &state.login_claims_handler {
             Some(handler) => {
-                let claims = handler.fetch(user_id, &user.email).await.map_err(|error| TokenServiceError::DownstreamServiceFailed(error.0))?;
-                if let Some(reserved) = claims.keys().find(|key| RESERVED_CLAIM_NAMES.contains(&key.as_str())) {
+                let claims = handler
+                    .fetch(user_id, &user.email)
+                    .await
+                    .map_err(|error| TokenServiceError::DownstreamServiceFailed(error.0))?;
+                if let Some(reserved) = claims
+                    .keys()
+                    .find(|key| RESERVED_CLAIM_NAMES.contains(&key.as_str()))
+                {
                     return Err(TokenServiceError::ReservedClaimOverridden(reserved.clone()));
                 }
                 claims.into_iter().collect()
@@ -345,7 +375,11 @@ mod login_claims {
     /// is issued.
     #[async_trait::async_trait]
     pub(crate) trait LoginClaimsHandler: Send + Sync {
-        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError>;
+        async fn fetch(
+            &self,
+            user_id: Uuid,
+            email: &str,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError>;
     }
 
     /// Asks a deployer-supplied plugin process for extra JWT claims via the
@@ -365,15 +399,30 @@ mod login_claims {
 
     #[async_trait::async_trait]
     impl LoginClaimsHandler for ProcessHandler {
-        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
-            let request =
-                PluginRequest { hook: HOOK.to_string(), user_id: user_id.to_string(), email: email.to_string(), data: None };
+        async fn fetch(
+            &self,
+            user_id: Uuid,
+            email: &str,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+            let request = PluginRequest {
+                hook: HOOK.to_string(),
+                user_id: user_id.to_string(),
+                email: email.to_string(),
+                data: None,
+            };
 
             let response = self.plugin.invoke(request).await.map_err(|status| {
-                LoginClaimsError(format!("plugin rejected the login-claims request: {:?}: {}", status.code(), status.message()))
+                LoginClaimsError(format!(
+                    "plugin rejected the login-claims request: {:?}: {}",
+                    status.code(),
+                    status.message()
+                ))
             })?;
 
-            Ok(response.data.map(plugin::struct_to_json).unwrap_or_default())
+            Ok(response
+                .data
+                .map(plugin::struct_to_json)
+                .unwrap_or_default())
         }
     }
 
@@ -411,7 +460,11 @@ mod login_claims {
 
     #[async_trait::async_trait]
     impl LoginClaimsHandler for WebhookHandler {
-        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+        async fn fetch(
+            &self,
+            user_id: Uuid,
+            email: &str,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
             let payload = LoginClaimsPayload { user_id, email };
             let response = self
                 .client
@@ -427,15 +480,21 @@ mod login_claims {
                 })?;
 
             if !response.status().is_success() {
-                return Err(LoginClaimsError(format!("login-claims webhook returned {}", response.status())));
+                return Err(LoginClaimsError(format!(
+                    "login-claims webhook returned {}",
+                    response.status()
+                )));
             }
 
             match response.json::<serde_json::Value>().await {
                 Ok(serde_json::Value::Object(claims)) => Ok(claims),
-                Ok(_) => Err(LoginClaimsError("login-claims webhook did not return a JSON object".to_string())),
-                Err(error) => {
-                    Err(LoginClaimsError(format!("login-claims webhook response was not valid JSON: {}", common::error::cause_chain(&error.without_url()))))
-                }
+                Ok(_) => Err(LoginClaimsError(
+                    "login-claims webhook did not return a JSON object".to_string(),
+                )),
+                Err(error) => Err(LoginClaimsError(format!(
+                    "login-claims webhook response was not valid JSON: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))),
             }
         }
     }
@@ -453,12 +512,19 @@ mod login_claims {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/hook"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"roles": ["admin"]})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"roles": ["admin"]})),
+                )
                 .mount(&server)
                 .await;
-            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT)
+                .expect("valid client");
 
-            let claims = handler.fetch(Uuid::new_v4(), "alice@example.com").await.expect("claims returned");
+            let claims = handler
+                .fetch(Uuid::new_v4(), "alice@example.com")
+                .await
+                .expect("claims returned");
 
             assert_eq!(claims.get("roles"), Some(&serde_json::json!(["admin"])));
         }
@@ -471,7 +537,8 @@ mod login_claims {
                 .respond_with(ResponseTemplate::new(500))
                 .mount(&server)
                 .await;
-            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT)
+                .expect("valid client");
 
             let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
 
@@ -483,10 +550,14 @@ mod login_claims {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/hook"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["not", "an", "object"])))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!(["not", "an", "object"])),
+                )
                 .mount(&server)
                 .await;
-            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT)
+                .expect("valid client");
 
             let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
 
@@ -495,7 +566,8 @@ mod login_claims {
 
         #[tokio::test]
         async fn fails_when_the_endpoint_is_unreachable() {
-            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT).expect("valid client");
+            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT)
+                .expect("valid client");
 
             let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
 
@@ -515,8 +587,8 @@ mod tests {
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::User;
     use crate::server::AppState;
-    use crate::storage::{PkceStorage, UserStorage};
     use crate::storage::in_memory::InMemoryPkceStorage;
+    use crate::storage::{PkceStorage, UserStorage};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sha2::{Digest, Sha256};
@@ -529,7 +601,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LoginClaimsHandler for FixedClaimsHandler {
-        async fn fetch(&self, _user_id: Uuid, _email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+        async fn fetch(
+            &self,
+            _user_id: Uuid,
+            _email: &str,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
             Ok(self.0.clone())
         }
     }
@@ -540,7 +616,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LoginClaimsHandler for FailingClaimsHandler {
-        async fn fetch(&self, _user_id: Uuid, _email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+        async fn fetch(
+            &self,
+            _user_id: Uuid,
+            _email: &str,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
             Err(LoginClaimsError("stub failed".to_string()))
         }
     }
@@ -563,7 +643,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
@@ -756,16 +837,24 @@ mod tests {
             .await;
         let before = chrono::Utc::now();
 
-        let Json(body) = issue_token(State(state), Form(code_req("code1", verifier, "http://redirect.test")))
-            .await
-            .unwrap();
+        let Json(body) = issue_token(
+            State(state),
+            Form(code_req("code1", verifier, "http://redirect.test")),
+        )
+        .await
+        .unwrap();
 
         // Access-token expiry is a JWT claim, not a response field -- decode
         // the JWT's own payload (no signature check needed) to pin down that
         // `expires_at = issued_at + ttl`, not `- ttl`.
-        let payload = body.access_token.split('.').nth(1).expect("JWT has a payload segment");
+        let payload = body
+            .access_token
+            .split('.')
+            .nth(1)
+            .expect("JWT has a payload segment");
         let claims: serde_json::Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64")).expect("valid JSON");
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64"))
+                .expect("valid JSON");
         let exp = claims["exp"].as_i64().expect("exp claim");
         let iat = claims["iat"].as_i64().expect("iat claim");
         assert!(exp > iat, "access token must expire after it was issued");
@@ -813,10 +902,9 @@ mod tests {
         .await
         .unwrap();
 
-        let Json(second) =
-            issue_token(State(state), Form(refresh_req(&first.refresh_token)))
-                .await
-                .unwrap();
+        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token)))
+            .await
+            .unwrap();
 
         assert_eq!(second.user_id, first.user_id);
         // The refresh token always rotates. The access token is a JWT over
@@ -863,8 +951,11 @@ mod tests {
         .unwrap();
 
         // The original token gets replayed -- reuse detected.
-        let replay = issue_token(State(state.clone()), Form(refresh_req(&first.refresh_token)))
-            .await;
+        let replay = issue_token(
+            State(state.clone()),
+            Form(refresh_req(&first.refresh_token)),
+        )
+        .await;
         assert_eq!(replay.err(), Some(TokenError::InvalidRefreshToken));
 
         // The still-unused sibling from the same family is dead too.
@@ -873,14 +964,21 @@ mod tests {
     }
 
     fn decode_claims(access_token: &str) -> serde_json::Value {
-        let payload = access_token.split('.').nth(1).expect("JWT has a payload segment");
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64")).expect("valid JSON")
+        let payload = access_token
+            .split('.')
+            .nth(1)
+            .expect("JWT has a payload segment");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64"))
+            .expect("valid JSON")
     }
 
     #[tokio::test]
     async fn merges_login_claims_handler_output_into_the_access_token() {
         let (mut state, user_id) = state_with_user().await;
-        let claims = serde_json::Map::from_iter([("roles".to_string(), serde_json::json!({"admin": ["user-1"]}))]);
+        let claims = serde_json::Map::from_iter([(
+            "roles".to_string(),
+            serde_json::json!({"admin": ["user-1"]}),
+        )]);
         state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
         state
             .pkce
@@ -921,7 +1019,12 @@ mod tests {
 
         let decoded = decode_claims(&body.access_token);
         assert_eq!(
-            decoded.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::HashSet<_>>(),
+            decoded
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>(),
             std::collections::HashSet::from(["sub", "email", "email_verified", "iat", "exp"])
         );
     }
@@ -956,7 +1059,10 @@ mod tests {
     #[tokio::test]
     async fn a_reserved_claim_name_from_the_handler_fails_the_token_request() {
         let (mut state, user_id) = state_with_user().await;
-        let claims = serde_json::Map::from_iter([("sub".to_string(), serde_json::json!("attacker-controlled"))]);
+        let claims = serde_json::Map::from_iter([(
+            "sub".to_string(),
+            serde_json::json!("attacker-controlled"),
+        )]);
         state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
         state
             .pkce
@@ -981,7 +1087,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_grant_also_merges_login_claims_handler_output() {
         let (mut state, user_id) = state_with_user().await;
-        let claims = serde_json::Map::from_iter([("roles".to_string(), serde_json::json!(["admin"]))]);
+        let claims =
+            serde_json::Map::from_iter([("roles".to_string(), serde_json::json!(["admin"]))]);
         state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
         state
             .pkce
@@ -995,12 +1102,18 @@ mod tests {
             .await;
         let Json(first) = issue_token(
             State(state.clone()),
-            Form(code_req("code1", "correct-verifier", "http://redirect.test")),
+            Form(code_req(
+                "code1",
+                "correct-verifier",
+                "http://redirect.test",
+            )),
         )
         .await
         .unwrap();
 
-        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token))).await.unwrap();
+        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token)))
+            .await
+            .unwrap();
 
         let decoded = decode_claims(&second.access_token);
         assert_eq!(decoded["roles"], serde_json::json!(["admin"]));

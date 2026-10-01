@@ -91,8 +91,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                         return Err(StatusCode::UNAUTHORIZED);
                     }
                     let redirect_uri = q.get("redirect_uri").cloned().unwrap_or_default();
-                    if redirect_uri != "http://admin.test" && redirect_uri != "http://admin.test/"
-                    {
+                    if redirect_uri != "http://admin.test" && redirect_uri != "http://admin.test/" {
                         return Err(StatusCode::BAD_REQUEST);
                     }
                     Ok(axum::response::Redirect::to(&format!(
@@ -160,10 +159,7 @@ async fn login_rejects_wrong_credentials_before_touching_authorize() -> anyhow::
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let router = Router::new()
-        .route(
-            "/oauth/login",
-            post(|| async { StatusCode::UNAUTHORIZED }),
-        )
+        .route("/oauth/login", post(|| async { StatusCode::UNAUTHORIZED }))
         .route(
             "/oauth/authorize",
             get(|| async { StatusCode::IM_A_TEAPOT }),
@@ -300,10 +296,7 @@ async fn login_returns_bad_request_when_backend_token_exchange_fails() -> anyhow
                 },
             ),
         )
-        .route(
-            "/oauth/token",
-            post(|| async { StatusCode::BAD_REQUEST }),
-        );
+        .route("/oauth/token", post(|| async { StatusCode::BAD_REQUEST }));
     let _h = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

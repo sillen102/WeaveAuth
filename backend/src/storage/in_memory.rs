@@ -7,8 +7,8 @@ use crate::storage::{
     PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, RevokeOutcome,
     SetPasswordOutcome, UserStorage, VerifiedEmail,
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
@@ -74,7 +74,13 @@ impl UserStorage for InMemoryUserStorage {
     }
 
     async fn get_user_by_email(&self, email: &str) -> Option<User> {
-        self.inner.lock().await.users.values().find(|u| u.email == email).cloned()
+        self.inner
+            .lock()
+            .await
+            .users
+            .values()
+            .find(|u| u.email == email)
+            .cloned()
     }
 
     async fn get_user_by_id(&self, id: Uuid) -> Option<User> {
@@ -106,7 +112,9 @@ impl UserStorage for InMemoryUserStorage {
         let existing = inner.users.values().find(|u| u.email == email).cloned();
         let user = match existing {
             Some(existing) if !existing.email_verified => {
-                return OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id: existing.id };
+                return OidcLinkOutcome::RequiresPasswordConfirmation {
+                    existing_user_id: existing.id,
+                };
             }
             Some(existing) => existing,
             None => {
@@ -128,18 +136,29 @@ impl UserStorage for InMemoryUserStorage {
         OidcLinkOutcome::Resolved(user)
     }
 
-    async fn link_verified_oidc_identity(&mut self, user_id: Uuid, provider: &str, subject: &str) -> Option<User> {
+    async fn link_verified_oidc_identity(
+        &mut self,
+        user_id: Uuid,
+        provider: &str,
+        subject: &str,
+    ) -> Option<User> {
         let mut inner = self.inner.lock().await;
 
         let user = inner.users.get_mut(&user_id)?;
         user.email_verified = true;
         let user = user.clone();
 
-        inner.oidc_identities.insert((provider.to_string(), subject.to_string()), user_id);
+        inner
+            .oidc_identities
+            .insert((provider.to_string(), subject.to_string()), user_id);
         Some(user)
     }
 
-    async fn set_password(&mut self, user_id: Uuid, password_hash: PasswordHash) -> SetPasswordOutcome {
+    async fn set_password(
+        &mut self,
+        user_id: Uuid,
+        password_hash: PasswordHash,
+    ) -> SetPasswordOutcome {
         let mut inner = self.inner.lock().await;
         let Some(user) = inner.users.get_mut(&user_id) else {
             return SetPasswordOutcome::UserNotFound;
@@ -168,23 +187,33 @@ impl InMemoryPendingOidcLinkStorage {
 }
 
 impl PendingOidcLinkStorage for InMemoryPendingOidcLinkStorage {
-    async fn save_pending_link(&mut self, provider: String, subject: String, existing_user_id: Uuid) -> String {
+    async fn save_pending_link(
+        &mut self,
+        provider: String,
+        subject: String,
+        existing_user_id: Uuid,
+    ) -> String {
         let mut token_bytes = [0u8; 32];
         rand::rng().fill(&mut token_bytes);
         let token = URL_SAFE_NO_PAD.encode(token_bytes);
-        self.entries
-            .lock()
-            .await
-            .insert(token.clone(), (provider, subject, existing_user_id, Utc::now()));
+        self.entries.lock().await.insert(
+            token.clone(),
+            (provider, subject, existing_user_id, Utc::now()),
+        );
         token
     }
 
     async fn take_pending_link(&mut self, token: &str) -> Option<PendingOidcLink> {
-        let (provider, subject, existing_user_id, issued_at) = self.entries.lock().await.remove(token)?;
+        let (provider, subject, existing_user_id, issued_at) =
+            self.entries.lock().await.remove(token)?;
         if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
             return None;
         }
-        Some(PendingOidcLink { provider, subject, existing_user_id })
+        Some(PendingOidcLink {
+            provider,
+            subject,
+            existing_user_id,
+        })
     }
 }
 
@@ -326,7 +355,13 @@ impl InMemoryOidcStateStorage {
 }
 
 impl OidcStateStorage for InMemoryOidcStateStorage {
-    async fn save_state(&mut self, csrf_state: String, provider: String, pkce_verifier: String, nonce: String) {
+    async fn save_state(
+        &mut self,
+        csrf_state: String,
+        provider: String,
+        pkce_verifier: String,
+        nonce: String,
+    ) {
         self.entries
             .lock()
             .await
@@ -334,11 +369,16 @@ impl OidcStateStorage for InMemoryOidcStateStorage {
     }
 
     async fn take_state(&mut self, csrf_state: &str) -> Option<OidcLoginState> {
-        let (provider, pkce_verifier, nonce, issued_at) = self.entries.lock().await.remove(csrf_state)?;
+        let (provider, pkce_verifier, nonce, issued_at) =
+            self.entries.lock().await.remove(csrf_state)?;
         if (Utc::now() - issued_at).num_seconds() > self.ttl_secs {
             return None;
         }
-        Some(OidcLoginState { provider, pkce_verifier: pkce_verifier.into(), nonce: nonce.into() })
+        Some(OidcLoginState {
+            provider,
+            pkce_verifier: pkce_verifier.into(),
+            nonce: nonce.into(),
+        })
     }
 }
 
@@ -453,7 +493,10 @@ impl LoginSessionStorage for InMemoryLoginSessionStorage {
     }
 
     async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome {
-        self.sessions.lock().await.retain(|_, (uid, _)| *uid != user_id);
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, (uid, _)| *uid != user_id);
         RevokeOutcome::Ok
     }
 }
@@ -529,7 +572,10 @@ impl RefreshTokenStorage for InMemoryRefreshTokenStorage {
     }
 
     async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome {
-        self.tokens.lock().await.retain(|_, record| record.user_id != user_id);
+        self.tokens
+            .lock()
+            .await
+            .retain(|_, record| record.user_id != user_id);
         RevokeOutcome::Ok
     }
 }
@@ -547,19 +593,20 @@ impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
-    use secrecy::ExposeSecret;
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::{PasswordHash, User};
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
-        InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
+        InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
+        InMemoryUserStorage,
     };
     use crate::storage::{
-        CreateUserOutcome, ExpiryMaintenance, LoginSessionStorage, OidcLinkOutcome, OidcStateStorage,
-        PasswordResetTokenStorage, PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage,
-        SetPasswordOutcome, UserStorage, VerifiedEmail,
+        CreateUserOutcome, ExpiryMaintenance, LoginSessionStorage, OidcLinkOutcome,
+        OidcStateStorage, PasswordResetTokenStorage, PendingOidcLinkStorage, PkceStorage,
+        RefreshTokenOutcome, RefreshTokenStorage, SetPasswordOutcome, UserStorage, VerifiedEmail,
     };
+    use secrecy::ExposeSecret;
+    use uuid::Uuid;
 
     fn verified(email: &str) -> VerifiedEmail {
         VerifiedEmail::new(email.to_string(), true).expect("true always verifies")
@@ -586,7 +633,10 @@ mod tests {
 
         let mut second = User::default();
         second.email = "carol".to_string();
-        assert_eq!(storage.create_user(second).await, CreateUserOutcome::EmailTaken);
+        assert_eq!(
+            storage.create_user(second).await,
+            CreateUserOutcome::EmailTaken
+        );
 
         // The original registration is untouched -- no shadowing, no overwrite.
         let retrieved = storage.get_user_by_email("carol").await;
@@ -608,7 +658,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_oidc_login_creates_on_first_login() {
         let mut storage = InMemoryUserStorage::new();
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
+        let outcome = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await;
 
         let OidcLinkOutcome::Resolved(user) = outcome else {
             unreachable!("expected Resolved, got {outcome:?}");
@@ -621,13 +678,25 @@ mod tests {
     #[tokio::test]
     async fn resolve_oidc_login_returns_the_same_user_on_repeat_login() {
         let mut storage = InMemoryUserStorage::new();
-        let OidcLinkOutcome::Resolved(first) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(first) = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
-        let OidcLinkOutcome::Resolved(second) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(second) = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
@@ -646,7 +715,14 @@ mod tests {
         };
         let _ = storage.create_user(local_user.clone()).await;
 
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
+        let outcome = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await;
 
         let OidcLinkOutcome::Resolved(oidc_user) = outcome else {
             unreachable!("expected Resolved, got {outcome:?}");
@@ -659,14 +735,26 @@ mod tests {
     #[tokio::test]
     async fn resolve_oidc_login_links_a_second_provider_to_the_same_account() {
         let mut storage = InMemoryUserStorage::new();
-        let OidcLinkOutcome::Resolved(google_user) =
-            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(google_user) = storage
+            .resolve_oidc_login(
+                "google",
+                "google-sub",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
 
-        let OidcLinkOutcome::Resolved(linkedin_user) =
-            storage.resolve_oidc_login("linkedin", "linkedin-sub", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(linkedin_user) = storage
+            .resolve_oidc_login(
+                "linkedin",
+                "linkedin-sub",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
@@ -674,8 +762,14 @@ mod tests {
         assert_eq!(google_user.id, linkedin_user.id);
 
         // Both identities now resolve to the same account.
-        let OidcLinkOutcome::Resolved(via_google) =
-            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(via_google) = storage
+            .resolve_oidc_login(
+                "google",
+                "google-sub",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
@@ -697,14 +791,24 @@ mod tests {
         };
         let _ = storage.create_user(squatter.clone()).await;
 
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
+        let outcome = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await;
 
         assert!(matches!(
             outcome,
             OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } if existing_user_id == squatter.id
         ));
         // Nothing was mutated -- still unverified, no identity linked yet.
-        let still_unverified = storage.get_user_by_email("alice@example.com").await.unwrap();
+        let still_unverified = storage
+            .get_user_by_email("alice@example.com")
+            .await
+            .unwrap();
         assert!(!still_unverified.email_verified);
     }
 
@@ -728,8 +832,14 @@ mod tests {
         assert!(linked.email_verified);
 
         // The newly linked identity now resolves straight to this account.
-        let OidcLinkOutcome::Resolved(via_google) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
+        let OidcLinkOutcome::Resolved(via_google) = storage
+            .resolve_oidc_login(
+                "google",
+                "sub-123",
+                &verified("alice@example.com"),
+                Uuid::new_v4(),
+            )
+            .await
         else {
             unreachable!("expected Resolved");
         };
@@ -740,7 +850,9 @@ mod tests {
     async fn link_verified_oidc_identity_returns_none_for_an_unknown_user() {
         let mut storage = InMemoryUserStorage::new();
 
-        let result = storage.link_verified_oidc_identity(Uuid::new_v4(), "google", "sub-123").await;
+        let result = storage
+            .link_verified_oidc_identity(Uuid::new_v4(), "google", "sub-123")
+            .await;
 
         assert!(result.is_none());
     }
@@ -756,7 +868,9 @@ mod tests {
         let _ = storage.create_user(user).await;
 
         assert_eq!(
-            storage.set_password(user_id, PasswordHash::Argon2("new-hash".into())).await,
+            storage
+                .set_password(user_id, PasswordHash::Argon2("new-hash".into()))
+                .await,
             SetPasswordOutcome::Ok
         );
 
@@ -769,7 +883,9 @@ mod tests {
     async fn set_password_returns_user_not_found_for_an_unknown_user() {
         let mut storage = InMemoryUserStorage::new();
         assert_eq!(
-            storage.set_password(Uuid::new_v4(), PasswordHash::Argon2("new-hash".into())).await,
+            storage
+                .set_password(Uuid::new_v4(), PasswordHash::Argon2("new-hash".into()))
+                .await,
             SetPasswordOutcome::UserNotFound
         );
     }
@@ -778,9 +894,18 @@ mod tests {
     async fn pending_oidc_link_round_trips() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(60);
         let existing_user_id = Uuid::new_v4();
-        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), existing_user_id).await;
+        let token = storage
+            .save_pending_link(
+                "google".to_string(),
+                "sub-123".to_string(),
+                existing_user_id,
+            )
+            .await;
 
-        let link = storage.take_pending_link(&token).await.expect("link was saved");
+        let link = storage
+            .take_pending_link(&token)
+            .await
+            .expect("link was saved");
         assert_eq!(link.provider, "google");
         assert_eq!(link.subject, "sub-123");
         assert_eq!(link.existing_user_id, existing_user_id);
@@ -789,7 +914,9 @@ mod tests {
     #[tokio::test]
     async fn pending_oidc_link_is_single_use() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(60);
-        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        let token = storage
+            .save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4())
+            .await;
         storage.take_pending_link(&token).await;
 
         assert!(storage.take_pending_link(&token).await.is_none());
@@ -798,7 +925,9 @@ mod tests {
     #[tokio::test]
     async fn pending_oidc_link_rejects_expired_entries() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(-1);
-        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        let token = storage
+            .save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4())
+            .await;
 
         assert!(storage.take_pending_link(&token).await.is_none());
     }
@@ -806,7 +935,9 @@ mod tests {
     #[tokio::test]
     async fn pending_oidc_link_is_not_yet_expired_exactly_at_the_ttl_boundary() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(0);
-        let token = storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        let token = storage
+            .save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4())
+            .await;
 
         assert!(storage.take_pending_link(&token).await.is_some());
     }
@@ -814,7 +945,9 @@ mod tests {
     #[tokio::test]
     async fn pending_oidc_link_sweep_expired_removes_expired_entries() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(-1);
-        storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        storage
+            .save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4())
+            .await;
 
         storage.sweep_expired().await;
 
@@ -824,7 +957,9 @@ mod tests {
     #[tokio::test]
     async fn pending_oidc_link_sweep_expired_keeps_entries_at_the_ttl_boundary() {
         let mut storage = InMemoryPendingOidcLinkStorage::new(0);
-        storage.save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4()).await;
+        storage
+            .save_pending_link("google".to_string(), "sub-123".to_string(), Uuid::new_v4())
+            .await;
 
         storage.sweep_expired().await;
 
@@ -907,7 +1042,10 @@ mod tests {
         assert_eq!(storage.take_reset_token(&stale_token).await, None);
         assert_eq!(storage.take_reset_token(&fresh_token).await, Some(user_id));
         // A different user's outstanding token is untouched.
-        assert_eq!(storage.take_reset_token(&other_users_token).await, Some(other_user_id));
+        assert_eq!(
+            storage.take_reset_token(&other_users_token).await,
+            Some(other_user_id)
+        );
     }
 
     #[tokio::test]
@@ -922,7 +1060,10 @@ mod tests {
             )
             .await;
 
-        let state = storage.take_state("csrf-token").await.expect("state was saved");
+        let state = storage
+            .take_state("csrf-token")
+            .await
+            .expect("state was saved");
         assert_eq!(state.provider, "google");
         assert_eq!(state.pkce_verifier.expose_secret(), "verifier");
         assert_eq!(state.nonce.expose_secret(), "nonce");
@@ -963,7 +1104,12 @@ mod tests {
     async fn oidc_state_sweep_expired_removes_expired_entries() {
         let mut storage = InMemoryOidcStateStorage::new(-1);
         storage
-            .save_state("csrf-token".to_string(), "google".to_string(), "verifier".to_string(), "nonce".to_string())
+            .save_state(
+                "csrf-token".to_string(),
+                "google".to_string(),
+                "verifier".to_string(),
+                "nonce".to_string(),
+            )
             .await;
 
         storage.sweep_expired().await;
@@ -975,7 +1121,12 @@ mod tests {
     async fn oidc_state_sweep_expired_keeps_entries_at_the_ttl_boundary() {
         let mut storage = InMemoryOidcStateStorage::new(0);
         storage
-            .save_state("csrf-token".to_string(), "google".to_string(), "verifier".to_string(), "nonce".to_string())
+            .save_state(
+                "csrf-token".to_string(),
+                "google".to_string(),
+                "verifier".to_string(),
+                "nonce".to_string(),
+            )
             .await;
 
         storage.sweep_expired().await;
@@ -1189,7 +1340,10 @@ mod tests {
         let _ = storage.revoke_all_for_user(user_id).await;
 
         assert_eq!(storage.take_session(&token).await, None);
-        assert_eq!(storage.take_session(&other_token).await, Some(other_user_id));
+        assert_eq!(
+            storage.take_session(&other_token).await,
+            Some(other_user_id)
+        );
     }
 
     #[tokio::test]
@@ -1243,7 +1397,9 @@ mod tests {
         let mut storage = InMemoryRefreshTokenStorage::new(0);
         let user_id = Uuid::new_v4();
         let family_id = Uuid::new_v4();
-        storage.save_refresh_token("token1".to_string(), user_id, family_id).await;
+        storage
+            .save_refresh_token("token1".to_string(), user_id, family_id)
+            .await;
 
         assert_eq!(
             storage.take_refresh_token("token1").await,
@@ -1254,7 +1410,9 @@ mod tests {
     #[tokio::test]
     async fn refresh_token_sweep_expired_removes_expired_entries() {
         let mut storage = InMemoryRefreshTokenStorage::new(-1);
-        storage.save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4()).await;
+        storage
+            .save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4())
+            .await;
 
         storage.sweep_expired().await;
 
@@ -1264,7 +1422,9 @@ mod tests {
     #[tokio::test]
     async fn refresh_token_sweep_expired_keeps_entries_at_the_ttl_boundary() {
         let mut storage = InMemoryRefreshTokenStorage::new(0);
-        storage.save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4()).await;
+        storage
+            .save_refresh_token("token1".to_string(), Uuid::new_v4(), Uuid::new_v4())
+            .await;
 
         storage.sweep_expired().await;
 
@@ -1310,8 +1470,14 @@ mod tests {
 
         let _ = storage.revoke_all_for_user(user_id).await;
 
-        assert_eq!(storage.take_refresh_token("token1").await, RefreshTokenOutcome::NotFound);
-        assert_eq!(storage.take_refresh_token("token2").await, RefreshTokenOutcome::NotFound);
+        assert_eq!(
+            storage.take_refresh_token("token1").await,
+            RefreshTokenOutcome::NotFound
+        );
+        assert_eq!(
+            storage.take_refresh_token("token2").await,
+            RefreshTokenOutcome::NotFound
+        );
         assert!(matches!(
             storage.take_refresh_token("other-token").await,
             RefreshTokenOutcome::Valid { .. }

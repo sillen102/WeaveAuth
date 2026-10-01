@@ -84,7 +84,9 @@ impl std::fmt::Debug for ServeError {
 
 #[derive(thiserror::Error)]
 pub enum ServeError {
-    #[error("stdin is not a unix socket -- a plugin is spawned by WeaveAuth, which connects it there")]
+    #[error(
+        "stdin is not a unix socket -- a plugin is spawned by WeaveAuth, which connects it there"
+    )]
     NotSpawnedByWeaveAuth(#[source] std::io::Error),
     #[error("could not read the token from the connection: {0}")]
     ReadToken(#[source] std::io::Error),
@@ -115,7 +117,10 @@ pub async fn serve<P: Plugin>(plugin: P) -> Result<(), ServeError> {
 
 /// [`serve`] on an already-taken connection, so it can run without a process
 /// whose stdin is a socket.
-async fn serve_on<P: Plugin>(mut stream: std::os::unix::net::UnixStream, plugin: P) -> Result<(), ServeError> {
+async fn serve_on<P: Plugin>(
+    mut stream: std::os::unix::net::UnixStream,
+    plugin: P,
+) -> Result<(), ServeError> {
     // A missing *or empty* token is a refusal to start, not a call that skips
     // the check -- an empty one would authenticate every caller that sends an
     // empty header.
@@ -123,15 +128,21 @@ async fn serve_on<P: Plugin>(mut stream: std::os::unix::net::UnixStream, plugin:
     if token.is_empty() {
         return Err(ServeError::NoToken);
     }
-    stream.set_nonblocking(true).map_err(ServeError::NotSpawnedByWeaveAuth)?;
-    let (watched, closed) = Watched::new(UnixStream::from_std(stream).map_err(ServeError::NotSpawnedByWeaveAuth)?);
+    stream
+        .set_nonblocking(true)
+        .map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let (watched, closed) =
+        Watched::new(UnixStream::from_std(stream).map_err(ServeError::NotSpawnedByWeaveAuth)?);
     tracing::info!("plugin serving on stdin");
 
     // The one connection is all there is: once it has been handed over, the
     // server waits for `closed` instead of shutting down for want of another.
-    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(watched)).chain(tokio_stream::pending());
+    let incoming =
+        tokio_stream::once(Ok::<_, std::io::Error>(watched)).chain(tokio_stream::pending());
     tonic::transport::Server::builder()
-        .add_service(PluginServer::with_interceptor(plugin, move |request| authenticate(request, &token)))
+        .add_service(PluginServer::with_interceptor(plugin, move |request| {
+            authenticate(request, &token)
+        }))
         .serve_with_incoming_shutdown(incoming, async {
             let _ = closed.await;
         })
@@ -151,18 +162,32 @@ struct Watched {
 impl Watched {
     fn new(stream: UnixStream) -> (Self, oneshot::Receiver<()>) {
         let (sender, closed) = oneshot::channel();
-        (Self { stream, _closed: sender }, closed)
+        (
+            Self {
+                stream,
+                _closed: sender,
+            },
+            closed,
+        )
     }
 }
 
 impl AsyncRead for Watched {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Watched {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
@@ -182,7 +207,8 @@ impl tonic::transport::server::Connected for Watched {
 }
 
 fn socket_on_stdin() -> std::io::Result<std::os::unix::net::UnixStream> {
-    let stream = std::os::unix::net::UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let stream =
+        std::os::unix::net::UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     // Fails with ENOTSOCK on a terminal, a pipe or /dev/null.
     stream.local_addr()?;
     Ok(stream)
@@ -206,12 +232,17 @@ fn read_token(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
 }
 
 fn authenticate(request: Request<()>, expected: &[u8]) -> Result<Request<()>, Status> {
-    let presented = request.metadata().get(TOKEN_METADATA_KEY).map(MetadataValue::as_encoded_bytes);
+    let presented = request
+        .metadata()
+        .get(TOKEN_METADATA_KEY)
+        .map(MetadataValue::as_encoded_bytes);
     match presented {
         Some(presented) if constant_time_eq(presented, expected) => Ok(request),
         // Deliberately the same answer either way: a caller learns whether it
         // holds the secret, not whether it got the length right.
-        _ => Err(Status::unauthenticated("caller did not present WeaveAuth's plugin token")),
+        _ => Err(Status::unauthenticated(
+            "caller did not present WeaveAuth's plugin token",
+        )),
     }
 }
 
@@ -219,7 +250,11 @@ fn authenticate(request: Request<()>, expected: &[u8]) -> Result<Request<()>, St
 /// can't recover the token a byte at a time. The lengths are not secret --
 /// WeaveAuth always generates the same size.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |differing, (x, y)| differing | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .fold(0u8, |differing, (x, y)| differing | (x ^ y))
+            == 0
 }
 
 #[cfg(test)]
@@ -229,7 +264,9 @@ mod tests {
     fn request_with(token: Option<&str>) -> Request<()> {
         let mut request = Request::new(());
         if let Some(token) = token {
-            request.metadata_mut().insert(TOKEN_METADATA_KEY, token.parse().expect("ascii"));
+            request
+                .metadata_mut()
+                .insert(TOKEN_METADATA_KEY, token.parse().expect("ascii"));
         }
         request
     }
@@ -284,7 +321,10 @@ mod tests {
 
         let error = read_token(&mut stream).expect_err("an endless line is not a token");
 
-        assert!(error.to_string().contains("longer than"), "unhelpful error: {error}");
+        assert!(
+            error.to_string().contains("longer than"),
+            "unhelpful error: {error}"
+        );
     }
 
     // The differences have to accumulate, not cancel. Folding them with `^`
@@ -300,36 +340,52 @@ mod tests {
 
     #[async_trait]
     impl Plugin for Unimplemented {
-        async fn invoke(&self, _: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+        async fn invoke(
+            &self,
+            _: Request<PluginRequest>,
+        ) -> Result<Response<PluginResponse>, Status> {
             Err(Status::unimplemented("test plugin"))
         }
     }
 
     async fn serve_after_writing(first_bytes: &[u8]) -> Result<(), ServeError> {
         use std::io::Write;
-        let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let (server_end, mut client_end) =
+            std::os::unix::net::UnixStream::pair().expect("socket pair");
         client_end.write_all(first_bytes).expect("writes");
         drop(client_end);
-        tokio::time::timeout(std::time::Duration::from_secs(5), serve_on(server_end, Unimplemented))
-            .await
-            .expect("serve_on returns once the connection is closed")
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_on(server_end, Unimplemented),
+        )
+        .await
+        .expect("serve_on returns once the connection is closed")
     }
 
     // An empty token would authenticate every caller that sends an empty header.
     #[tokio::test]
     async fn refuses_to_start_on_an_empty_token() {
-        assert!(matches!(serve_after_writing(b"\n").await, Err(ServeError::NoToken)));
+        assert!(matches!(
+            serve_after_writing(b"\n").await,
+            Err(ServeError::NoToken)
+        ));
     }
 
     #[tokio::test]
     async fn refuses_to_start_when_the_connection_closes_before_a_token() {
-        assert!(matches!(serve_after_writing(b"").await, Err(ServeError::NoToken)));
+        assert!(matches!(
+            serve_after_writing(b"").await,
+            Err(ServeError::NoToken)
+        ));
     }
 
     #[tokio::test]
     async fn refuses_to_start_on_a_token_line_that_never_ends() {
         let endless = vec![b'a'; MAX_TOKEN_LINE + 1];
-        assert!(matches!(serve_after_writing(&endless).await, Err(ServeError::ReadToken(_))));
+        assert!(matches!(
+            serve_after_writing(&endless).await,
+            Err(ServeError::ReadToken(_))
+        ));
     }
 
     // Companion to the refusals above: a valid token must start the server,

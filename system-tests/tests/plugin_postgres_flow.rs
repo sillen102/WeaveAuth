@@ -43,26 +43,41 @@ impl Database {
         // Postgres authentication.
         let container = GenericImage::new("postgres", "17-alpine")
             .with_exposed_port(5432.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("database system is ready to accept connections"))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
             .with_env_var("POSTGRES_USER", DB_USER)
             .with_env_var("POSTGRES_DB", DB_NAME)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .start()
             .await
             .expect("postgres starts");
-        let port = container.get_host_port_ipv4(5432.tcp()).await.expect("postgres publishes a port");
+        let port = container
+            .get_host_port_ipv4(5432.tcp())
+            .await
+            .expect("postgres publishes a port");
 
         let client = connect(port).await;
         client
-            .batch_execute("create table profile (user_id text primary key, email text, company text)")
+            .batch_execute(
+                "create table profile (user_id text primary key, email text, company text)",
+            )
             .await
             .expect("the profile table is created");
 
-        Self { _container: container, port, client }
+        Self {
+            _container: container,
+            port,
+            client,
+        }
     }
 
     async fn profiles(&self) -> i64 {
-        self.client.query_one("select count(*) from profile", &[]).await.expect("counts profiles").get(0)
+        self.client
+            .query_one("select count(*) from profile", &[])
+            .await
+            .expect("counts profiles")
+            .get(0)
     }
 
     /// Connections Postgres currently has open other than this test's own --
@@ -113,7 +128,12 @@ async fn a_plugin_writes_to_a_real_postgres() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
 
-    let status = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
+    let status = register(
+        &backend_url,
+        "alice@example.com",
+        &registration_fields("insert"),
+    )
+    .await;
 
     assert_eq!(status, reqwest::StatusCode::CREATED);
     assert_eq!(database.profiles().await, 1);
@@ -133,7 +153,11 @@ async fn a_second_registration_reuses_the_plugins_pooled_session() {
     }
 
     assert_eq!(database.profiles().await, 2);
-    assert_eq!(database.plugin_backends().await, 1, "the pool holds more than the one reused session");
+    assert_eq!(
+        database.plugin_backends().await,
+        1,
+        "the pool holds more than the one reused session"
+    );
 }
 
 // A rejection from Postgres itself, rather than a transport failure.
@@ -141,9 +165,18 @@ async fn a_second_registration_reuses_the_plugins_pooled_session() {
 async fn a_statement_postgres_rejects_fails_the_registration() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
-    database.client.batch_execute("drop table profile").await.expect("drops the table");
+    database
+        .client
+        .batch_execute("drop table profile")
+        .await
+        .expect("drops the table");
 
-    let status = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
+    let status = register(
+        &backend_url,
+        "alice@example.com",
+        &registration_fields("insert"),
+    )
+    .await;
 
     assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
 }
@@ -155,13 +188,35 @@ async fn a_plugin_recovers_from_a_terminated_postgres_backend() {
     let database = Database::start().await;
     let (backend_url, _handle) = database.backend_url().await;
 
-    let first = register(&backend_url, "alice@example.com", &registration_fields("insert")).await;
+    let first = register(
+        &backend_url,
+        "alice@example.com",
+        &registration_fields("insert"),
+    )
+    .await;
     assert_eq!(first, reqwest::StatusCode::CREATED);
     assert_eq!(database.plugin_backends().await, 1);
-    database.client.batch_execute(TERMINATE_OTHERS).await.expect("terminates the pooled backend");
+    database
+        .client
+        .batch_execute(TERMINATE_OTHERS)
+        .await
+        .expect("terminates the pooled backend");
 
-    let second = register(&backend_url, "bob@example.com", &registration_fields("insert")).await;
+    let second = register(
+        &backend_url,
+        "bob@example.com",
+        &registration_fields("insert"),
+    )
+    .await;
 
-    assert_eq!(second, reqwest::StatusCode::CREATED, "the pool handed out a dead session");
-    assert_eq!(database.profiles().await, 2, "the retry lost the row it was supposed to write");
+    assert_eq!(
+        second,
+        reqwest::StatusCode::CREATED,
+        "the pool handed out a dead session"
+    );
+    assert_eq!(
+        database.profiles().await,
+        2,
+        "the retry lost the row it was supposed to write"
+    );
 }

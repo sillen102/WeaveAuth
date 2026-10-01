@@ -5,13 +5,13 @@ pub(crate) use controller::request_password_reset_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::Json;
+    use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
-    use common_macros::ErrorResponses;
 
     use crate::server::AppState;
 
@@ -32,7 +32,10 @@ mod controller {
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum PasswordResetConfirmError {
         #[error("invalid or expired password reset token")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired password reset token")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "invalid or expired password reset token"
+        )]
         InvalidOrExpiredToken,
         #[error("internal error")]
         #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
@@ -160,18 +163,24 @@ mod service {
         // whole flow exists to not paper over with a 200.
         revoke_everything_for(state, user_id).await?;
 
-        let password_hash = crypto::hash_password(new_password)
-            .await
-            .map_err(|error| PasswordResetConfirmServiceError::UnexpectedError(error.to_string()))?;
+        let password_hash = crypto::hash_password(new_password).await.map_err(|error| {
+            PasswordResetConfirmServiceError::UnexpectedError(error.to_string())
+        })?;
 
-        match state.users.set_password(user_id, PasswordHash::Argon2(password_hash.into())).await {
+        match state
+            .users
+            .set_password(user_id, PasswordHash::Argon2(password_hash.into()))
+            .await
+        {
             SetPasswordOutcome::Ok => {}
             // The token was valid a moment ago but the account is gone now --
             // vanishingly unlikely (nothing in this codebase deletes users),
             // but report it as the same not-found-shaped error rather than a
             // 500, since from the caller's perspective the token just doesn't
             // resolve to anything anymore.
-            SetPasswordOutcome::UserNotFound => return Err(PasswordResetConfirmServiceError::InvalidOrExpiredToken),
+            SetPasswordOutcome::UserNotFound => {
+                return Err(PasswordResetConfirmServiceError::InvalidOrExpiredToken);
+            }
         }
 
         revoke_everything_for(state, user_id).await?;
@@ -179,7 +188,10 @@ mod service {
         Ok(())
     }
 
-    async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmServiceError> {
+    async fn revoke_everything_for(
+        state: &mut AppState,
+        user_id: uuid::Uuid,
+    ) -> Result<(), PasswordResetConfirmServiceError> {
         if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
             return Err(PasswordResetConfirmServiceError::UnexpectedError(
                 "revoking refresh tokens failed".to_string(),
@@ -199,7 +211,9 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
-    use crate::storage::{LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage};
+    use crate::storage::{
+        LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage,
+    };
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
     use std::sync::Arc;
@@ -223,7 +237,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
-            password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+            password_reset_tokens:
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
@@ -290,7 +305,10 @@ mod tests {
             new_password: "another-password".to_string(),
         };
         let replay_result = confirm_password_reset(State(state), Json(replay)).await;
-        assert_eq!(replay_result, Err(PasswordResetConfirmError::InvalidOrExpiredToken));
+        assert_eq!(
+            replay_result,
+            Err(PasswordResetConfirmError::InvalidOrExpiredToken)
+        );
     }
 
     #[tokio::test]
@@ -322,10 +340,16 @@ mod tests {
         assert_eq!(result, Ok(StatusCode::OK));
 
         assert_eq!(
-            state.refresh_tokens.take_refresh_token("refresh-token").await,
+            state
+                .refresh_tokens
+                .take_refresh_token("refresh-token")
+                .await,
             crate::storage::RefreshTokenOutcome::NotFound
         );
-        assert_eq!(state.login_sessions.take_session(&login_session).await, None);
+        assert_eq!(
+            state.login_sessions.take_session(&login_session).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -353,7 +377,13 @@ mod tests {
         };
         request_password_reset(State(state.clone()), Json(req)).await;
 
-        assert_eq!(state.password_reset_tokens.take_reset_token(&stale_token).await, None);
+        assert_eq!(
+            state
+                .password_reset_tokens
+                .take_reset_token(&stale_token)
+                .await,
+            None
+        );
         assert_eq!(state.password_reset_tokens.token_count().await, 1);
     }
 
@@ -367,6 +397,9 @@ mod tests {
 
         let result = confirm_password_reset(State(state), Json(req)).await;
 
-        assert_eq!(result.err(), Some(PasswordResetConfirmError::InvalidOrExpiredToken));
+        assert_eq!(
+            result.err(),
+            Some(PasswordResetConfirmError::InvalidOrExpiredToken)
+        );
     }
 }

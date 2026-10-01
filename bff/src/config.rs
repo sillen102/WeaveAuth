@@ -1,7 +1,7 @@
 use std::env;
 
-use figment::providers::{Env, Format, Serialized, Yaml};
 use figment::Figment;
+use figment::providers::{Env, Format, Serialized, Yaml};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,9 +152,13 @@ mod tests {
             jail.create_file("config.yaml", "port: 1984\n")?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
 
-            let error = Config::load().expect_err("an unreadable config must not fall back to defaults");
+            let error =
+                Config::load().expect_err("an unreadable config must not fall back to defaults");
 
-            assert!(error.to_string().contains("config.yaml/nested.yaml"), "unhelpful error: {error}");
+            assert!(
+                error.to_string().contains("config.yaml/nested.yaml"),
+                "unhelpful error: {error}"
+            );
             Ok(())
         });
     }
@@ -170,10 +174,16 @@ mod tests {
             assert_eq!(config.backend_url, "http://localhost:1983");
             assert_eq!(config.session_cookie_name, "wa_session");
             assert!(config.routes.is_empty());
-            assert_eq!(config.trusted_origins, vec!["http://localhost:8081".to_string()]);
+            assert_eq!(
+                config.trusted_origins,
+                vec!["http://localhost:8081".to_string()]
+            );
             assert_eq!(config.rate_limit_max_attempts, 10);
             assert_eq!(config.rate_limit_window_secs, 60);
-            assert!(!config.docs_enabled, "docs must stay off unless explicitly enabled");
+            assert!(
+                !config.docs_enabled,
+                "docs must stay off unless explicitly enabled"
+            );
             Ok(())
         });
     }
@@ -303,7 +313,10 @@ trusted_origins:
             jail.set_env("WA_TRUSTED_ORIGINS", "https://other.test");
 
             let config = Config::load().unwrap();
-            assert_eq!(config.trusted_origins, vec!["https://other.test".to_string()]);
+            assert_eq!(
+                config.trusted_origins,
+                vec!["https://other.test".to_string()]
+            );
             Ok(())
         });
     }
