@@ -5,11 +5,6 @@ use std::collections::HashMap;
 
 use weaveauth::config::{ExtraDataHandlerConfig, LoginClaimsHandlerConfig};
 
-/// The probe plugin, built as a bin target of this package -- so it is
-/// already compiled by the time a test runs, and always from this source
-/// tree rather than a stale artifact.
-pub const PROBE: &str = env!("CARGO_BIN_EXE_probe-plugin");
-
 /// A backend `extra_data_handler` running `command`.
 pub fn plugin_handler(command: &str, env: HashMap<String, String>, timeout_secs: u64) -> ExtraDataHandlerConfig {
     ExtraDataHandlerConfig::Process {
@@ -18,6 +13,8 @@ pub fn plugin_handler(command: &str, env: HashMap<String, String>, timeout_secs:
         env,
         timeout_secs,
         startup_timeout_secs: 10,
+        uid: current_id("-u"),
+        gid: current_id("-g"),
     }
 }
 
@@ -29,7 +26,17 @@ pub fn login_claims_handler(command: &str, timeout_secs: u64) -> LoginClaimsHand
         env: HashMap::new(),
         timeout_secs,
         startup_timeout_secs: 10,
+        uid: current_id("-u"),
+        gid: current_id("-g"),
     }
+}
+
+/// This process's own uid (`-u`) or gid (`-g`): a plugin is always spawned
+/// as some user, and switching to anyone else needs privileges a test run
+/// doesn't have.
+pub fn current_id(flag: &str) -> u32 {
+    let output = std::process::Command::new("id").arg(flag).output().expect("id runs");
+    String::from_utf8_lossy(&output.stdout).trim().parse().expect("id prints a number")
 }
 
 pub fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {

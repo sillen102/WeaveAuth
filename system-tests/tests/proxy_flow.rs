@@ -6,8 +6,7 @@
 //! missing there, and what this file adds, is the same flow against a real
 //! backend actually issuing and rotating real tokens.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use support::config::{FINAL_REDIRECT, NEXT_ORIGIN};
 use support::{servers, upstream};

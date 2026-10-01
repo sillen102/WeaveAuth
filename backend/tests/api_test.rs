@@ -27,6 +27,7 @@ fn test_config() -> Config {
         max_bcrypt_cost: 12,
         extra_data_handler: None,
         login_claims_handler: None,
+        setuid_helper: None,
     }
 }
 

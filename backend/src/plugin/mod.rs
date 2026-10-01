@@ -2,7 +2,7 @@
 //! as a child process and calls it over gRPC at a point in a flow.
 //!
 //! This module owns the process -- spawning it, restarting it when it dies,
-//! and the unix socket the two talk over. The contract itself lives in
+//! and the connection the two talk over. The contract itself lives in
 //! `plugin-sdk/proto`, so a new flow is a new `hook` value on its one
 //! generic rpc rather than a new runtime. Registration
 //! (`crate::server::api::register`) and login claims
@@ -11,38 +11,46 @@
 //! A plugin is a native binary, so it keeps its own async runtime and its
 //! own long-lived resources: a `deadpool`/`sqlx` connection pool, an AMQP
 //! channel, a vendor SDK client. WeaveAuth holds none of that on its behalf.
-//! The price is that **a plugin is not sandboxed** -- it runs with this
-//! process's privileges, and mounting one is equivalent to shipping
-//! application code. Isolation, if wanted, is the deployer's (containers,
-//! users, seccomp), and the environment is the one thing enforced here:
-//! a plugin is given exactly the variables it was configured with.
+//! The price is that **a plugin is not sandboxed** -- mounting one is
+//! equivalent to shipping application code. What is enforced here: it runs
+//! as its own user, it is given exactly the variables it was configured
+//! with, and the only connection to it is one WeaveAuth created.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::OsString;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngExt;
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint, Uri};
 use weaveauth_plugin_sdk::plugin_client::PluginClient;
-use weaveauth_plugin_sdk::{PluginRequest, PluginResponse, SOCKET_ENV, TOKEN_ENV, TOKEN_METADATA_KEY};
+use weaveauth_plugin_sdk::{PluginRequest, PluginResponse, TOKEN_METADATA_KEY};
 
 /// How long to wait after the plugin process dies before starting it again.
 /// A plugin that fails on startup would otherwise be respawned as fast as
 /// the OS can fork.
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 
-/// How often to poll for the plugin's socket while it starts up.
-const READINESS_POLL: Duration = Duration::from_millis(25);
+/// How long a plugin that failed to answer at startup gets to be reaped, so
+/// the error can say it exited rather than that it went quiet.
+const EXIT_GRACE: Duration = Duration::from_millis(200);
 
-/// The channel dials a unix socket through a connector, so the URI is never
-/// resolved -- but `Endpoint` still requires a syntactically valid one.
+/// The hook WeaveAuth calls once at startup to learn the plugin is serving.
+/// Whatever the plugin answers, even a refusal, counts.
+pub(crate) const STARTUP_HOOK: &str = "weaveauth.startup";
+
+/// The channel dials through a connector, so the URI is never resolved --
+/// but `Endpoint` still requires a syntactically valid one.
 const UNUSED_AUTHORITY: &str = "http://plugin.invalid";
 
 /// Variables in WeaveAuth's own environment named
@@ -66,47 +74,73 @@ pub(crate) struct PluginConfig {
     pub(crate) env: HashMap<String, String>,
     /// Deadline on a single rpc.
     pub(crate) timeout: Duration,
-    /// How long the plugin has to start listening before startup fails.
+    /// How long the plugin has to answer its first call before startup fails.
     pub(crate) startup_timeout: Duration,
+    /// Who the plugin runs as. Never 0: a root plugin could read everything
+    /// this process holds.
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// `weaveauth-plugin-exec`, which switches to `uid`/`gid` and execs the
+    /// plugin; see `Config::setuid_helper`.
+    pub(crate) setuid_helper: Option<PathBuf>,
 }
+
+/// WeaveAuth's end of the connection to the current plugin process, waiting
+/// for the channel to take it. Empty once taken, until a restart refills it.
+type PendingConnection = Arc<Mutex<Option<UnixStream>>>;
 
 /// A running plugin process and the typed client that talks to it.
 ///
-/// The socket path is fixed for the lifetime of this value, so the channel
-/// survives a restart: it reconnects to the same path once the replacement
-/// process binds it. Calls made in between fail with `UNAVAILABLE`, which is
-/// the same thing a flow does with any other plugin failure.
+/// The plugin's stdin is one end of a socket pair and WeaveAuth holds the
+/// other, so there is no address for any other process to reach. The channel
+/// survives a restart: it reconnects through the end the supervisor hands
+/// it for the replacement process. Calls made in between fail with
+/// `UNAVAILABLE`, which is the same thing a flow does with any other plugin
+/// failure.
 #[derive(Debug)]
 pub(crate) struct PluginProcess {
     client: PluginClient<Channel>,
     timeout: Duration,
     /// Presented on every call; the plugin refuses anything without it.
     token: MetadataValue<Ascii>,
-    /// Private directory holding the socket, removed on drop.
-    dir: PathBuf,
     supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl PluginProcess {
-    /// Starts the plugin and waits for it to listen, so a missing or broken
+    /// Starts the plugin and waits for it to answer, so a missing or broken
     /// command fails at startup rather than at the first registration.
     pub(crate) async fn start(config: PluginConfig) -> anyhow::Result<Self> {
-        let dir = socket_dir()?;
-        let socket = dir.join("s");
+        anyhow::ensure!(config.uid != 0 && config.gid != 0, "plugin {:?} is configured to run as root", config.command);
+        if config.uid == rustix::process::geteuid().as_raw() {
+            tracing::warn!(
+                command = %config.command,
+                uid = config.uid,
+                "plugin runs as WeaveAuth's own user, so it can read the environment of other processes running \
+                 as that user (bff, login) and run weaveauth-plugin-exec -- fine for local development, not for a \
+                 deployment"
+            );
+        }
+
         let secret = generate_token();
         let token = MetadataValue::try_from(&secret)?;
 
-        let child = spawn(&config, &socket, &secret)
-            .map_err(|error| anyhow::anyhow!("could not start plugin {:?}: {error}", config.command))?;
-        let child = wait_until_listening(child, &socket, config.startup_timeout).await.inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&dir);
+        let (child, connection) = spawn(&config, &secret).map_err(|error| {
+            anyhow::anyhow!(
+                "could not start plugin {:?} as uid {}/gid {}: {error} (running it as another user needs \
+                 CAP_SETUID/CAP_SETGID; for a local run, set uid/gid to your own)",
+                config.command,
+                config.uid,
+                config.gid
+            )
         })?;
+        let pending = Arc::new(Mutex::new(Some(connection)));
+        let client = PluginClient::new(channel(pending.clone()));
+        let child = wait_until_serving(child, &client, &token, config.startup_timeout).await?;
 
         let timeout = config.timeout;
-        let client = PluginClient::new(channel(socket.clone()));
-        let supervisor = tokio::spawn(supervise(child, config, socket, secret));
+        let supervisor = tokio::spawn(supervise(child, config, secret, pending));
 
-        Ok(Self { client, timeout, token, dir, supervisor })
+        Ok(Self { client, timeout, token, supervisor })
     }
 
     /// Calls the plugin's one generic rpc for `request.hook`. `Ok` accepts/
@@ -124,32 +158,24 @@ impl PluginProcess {
 
 impl Drop for PluginProcess {
     fn drop(&mut self) {
-        // Aborting drops the `Child`, which is `kill_on_drop`.
+        // Dropping the channel and the supervisor's pending end closes the
+        // connection, and the SDK stops the plugin when it sees that; the
+        // `Child`'s `kill_on_drop` only reaches a plugin running as this
+        // process's own user.
         self.supervisor.abort();
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// A directory only this user can enter, since anyone who can reach the
-/// socket inside it can drive the plugin -- and the plugin holds the
-/// credentials the deployer gave it.
-///
-/// The name is kept short on purpose: a unix socket path is capped at ~104
-/// bytes, and macOS already spends half of that on `$TMPDIR`.
-fn socket_dir() -> anyhow::Result<PathBuf> {
-    let unique = &uuid::Uuid::new_v4().simple().to_string()[..12];
-    let dir = std::env::temp_dir().join(format!("wa-{unique}"));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir)
-}
-
-fn channel(socket: PathBuf) -> Channel {
-    // Lazy: the endpoint is already known to be listening, and connecting
-    // lazily is also what lets the channel recover on its own after a
-    // restart.
+fn channel(pending: PendingConnection) -> Channel {
+    // Lazy, so the first call (the startup check) is what connects, and so
+    // the channel reconnects on its own after a restart.
     Endpoint::from_static(UNUSED_AUTHORITY).connect_with_connector_lazy(tower::service_fn(move |_: Uri| {
-        let socket = socket.clone();
-        async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(socket).await?)) }
+        let connection = pending.lock().ok().and_then(|mut slot| slot.take());
+        async move {
+            let stream = connection
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "the plugin is restarting"))?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }
     }))
 }
 
@@ -157,9 +183,10 @@ fn channel(socket: PathBuf) -> Channel {
 /// token.
 const TOKEN_BYTES: usize = 32;
 
-/// A secret the plugin proves it holds on every call. Generated per
-/// `PluginProcess` rather than configured, so there is nothing to rotate and
-/// nothing to leave in a config file.
+/// A secret the plugin proves it was given on every call: a second layer
+/// behind the socket pair, in case the connection ever reaches a process it
+/// shouldn't. Generated per `PluginProcess` rather than configured, so there
+/// is nothing to rotate and nothing to leave in a config file.
 fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
     rand::rng().fill(&mut bytes);
@@ -232,50 +259,80 @@ fn prost_value_to_json(value: prost_types::Value) -> serde_json::Value {
     }
 }
 
-fn spawn(config: &PluginConfig, socket: &Path, token: &str) -> std::io::Result<Child> {
-    Command::new(&config.command)
-        .args(&config.args)
+/// Spawns the plugin with one end of a fresh socket pair as its stdin and
+/// `token` as the first line on it, returning WeaveAuth's end.
+fn spawn(config: &PluginConfig, token: &str) -> std::io::Result<(Child, UnixStream)> {
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    // Never waits on the plugin: the line is far below the socket buffer.
+    ours.write_all(format!("{token}\n").as_bytes())?;
+    let mut command = match &config.setuid_helper {
+        Some(helper) => {
+            let mut command = Command::new(helper);
+            command.arg(config.uid.to_string()).arg(config.gid.to_string()).arg(&config.command).args(&config.args);
+            command
+        }
+        None => {
+            let mut command = Command::new(&config.command);
+            command.args(&config.args).uid(config.uid).gid(config.gid);
+            command
+        }
+    };
+    let child = command
         // The plugin inherits nothing: this process's environment holds
         // WeaveAuth's own secrets (signing keys, OIDC client secrets,
         // database credentials), and a plugin has no business reading them.
         // Only what the deployer named for the plugin gets through.
         .env_clear()
         .envs(&config.env)
-        .env(SOCKET_ENV, socket)
-        .env(TOKEN_ENV, token)
-        // The plugin's own logs are its operator's, so they go where every
-        // other log from this container goes.
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
         .kill_on_drop(true)
-        .spawn()
+        .spawn()?;
+
+    ours.set_nonblocking(true)?;
+    Ok((child, UnixStream::from_std(ours)?))
 }
 
-/// Polls until the plugin accepts a connection, or gives up. Returns the
-/// child so a caller can't accidentally drop (and kill) it while waiting.
-async fn wait_until_listening(mut child: Child, socket: &Path, timeout: Duration) -> anyhow::Result<Child> {
-    let deadline = tokio::time::Instant::now() + timeout;
+/// Calls [`STARTUP_HOOK`] and waits for the plugin to answer, or for it to
+/// exit, whichever comes first. Returns the child so a caller can't
+/// accidentally drop (and kill) it while waiting.
+async fn wait_until_serving(
+    mut child: Child,
+    client: &PluginClient<Channel>,
+    token: &MetadataValue<Ascii>,
+    timeout: Duration,
+) -> anyhow::Result<Child> {
+    let mut request = tonic::Request::new(PluginRequest { hook: STARTUP_HOOK.to_string(), ..Default::default() });
+    request.set_timeout(timeout);
+    request.metadata_mut().insert(TOKEN_METADATA_KEY, token.clone());
 
-    loop {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
-            return Ok(child);
+    let mut client = client.clone();
+    let answer = tokio::select! {
+        status = child.wait() => anyhow::bail!("plugin process exited during startup with {}", status?),
+        answer = client.invoke(request) => answer,
+    };
+    match answer {
+        Ok(_) => Ok(child),
+        // A status the plugin sent itself has no source; one with a source
+        // came from this side (transport error, deadline). That is how tonic
+        // 0.14 builds them, not a documented guarantee, so the tests
+        // `a_status_the_plugin_sent_has_no_source` and
+        // `a_status_from_this_side_has_a_source` pin it.
+        Err(status) if status.source().is_none() => Ok(child),
+        Err(status) => {
+            // A plugin that died takes the connection with it, so the call
+            // can fail a moment before the exit is reaped.
+            if let Ok(exit) = tokio::time::timeout(EXIT_GRACE, child.wait()).await {
+                anyhow::bail!("plugin process exited during startup with {}", exit?);
+            }
+            anyhow::bail!("plugin did not answer within {timeout:?}: {status}")
         }
-        // Distinguishes "still starting" from "already gave up", which is
-        // the difference between waiting out the timeout and reporting what
-        // actually happened.
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("plugin process exited during startup with {status}");
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("plugin did not listen on {} within {timeout:?}", socket.display());
-        }
-        tokio::time::sleep(READINESS_POLL).await;
     }
 }
 
 /// Restarts the plugin for as long as this task lives. A plugin that dies
 /// mid-flight fails the request in progress; it must not also take every
 /// later one down with it.
-async fn supervise(mut child: Child, config: PluginConfig, socket: PathBuf, token: String) {
+async fn supervise(mut child: Child, config: PluginConfig, token: String, pending: PendingConnection) {
     loop {
         let status = child.wait().await;
         tracing::error!(?status, command = %config.command, "plugin process exited, restarting");
@@ -284,8 +341,15 @@ async fn supervise(mut child: Child, config: PluginConfig, socket: PathBuf, toke
             tokio::time::sleep(RESTART_DELAY).await;
             // The same token: the host holds it, so a replacement plugin is
             // handed what its predecessor had and the client needs no update.
-            match spawn(&config, &socket, &token) {
-                Ok(child) => break child,
+            match spawn(&config, &token) {
+                Ok((child, connection)) => {
+                    // Replaces an end the channel never took, which led to the
+                    // process that just died.
+                    if let Ok(mut slot) = pending.lock() {
+                        *slot = Some(connection);
+                    }
+                    break child;
+                }
                 Err(error) => tracing::error!(%error, command = %config.command, "could not restart the plugin process"),
             }
         };
@@ -303,7 +367,91 @@ mod tests {
             env: HashMap::new(),
             timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_millis(500),
+            // The one user a plugin can be spawned as without privileges.
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+            setuid_helper: None,
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_run_a_plugin_as_root() {
+        let error = PluginProcess::start(PluginConfig { uid: 0, ..config("/bin/sh", &["-c", "sleep 30"]) })
+            .await
+            .expect_err("must not start");
+
+        assert!(error.to_string().contains("root"), "unhelpful error: {error}");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_run_a_plugin_in_the_root_group() {
+        let error = PluginProcess::start(PluginConfig { gid: 0, ..config("/bin/sh", &["-c", "sleep 30"]) })
+            .await
+            .expect_err("must not start");
+
+        assert!(error.to_string().contains("root"), "unhelpful error: {error}");
+    }
+
+    // As root the plugin must really become 4242:4242 (it exits 7 only
+    // then). Unprivileged, it keeps its own group so that only the uid switch
+    // can fail -- and must. Either way a plugin that silently kept this
+    // process's user fails the test.
+    #[tokio::test]
+    async fn runs_the_plugin_as_the_configured_user() {
+        let root = rustix::process::geteuid().is_root();
+        let check = r#"[ "$(id -u)" = 4242 ] && [ "$(id -g)" = 4242 ] && exit 7; exit 9"#;
+        let gid = if root { 4242 } else { rustix::process::getegid().as_raw() };
+        let config = PluginConfig { uid: 4242, gid, ..config("/bin/sh", &["-c", check]) };
+
+        let error = PluginProcess::start(config).await.expect_err("the check exits either way");
+
+        if root {
+            assert!(error.to_string().contains("exit status: 7"), "did not run as 4242:4242: {error}");
+        } else {
+            assert!(error.to_string().contains("CAP_SETUID"), "switched user without privileges: {error}");
+        }
+    }
+
+    struct Refusing;
+
+    #[weaveauth_plugin_sdk::async_trait]
+    impl weaveauth_plugin_sdk::Plugin for Refusing {
+        async fn invoke(
+            &self,
+            _: tonic::Request<PluginRequest>,
+        ) -> Result<tonic::Response<PluginResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("no such hook"))
+        }
+    }
+
+    // `wait_until_serving` counts a status without a source as the plugin's
+    // own answer. These two pin that tonic behaviour.
+    #[tokio::test]
+    async fn a_status_the_plugin_sent_has_no_source() {
+        use tokio_stream::StreamExt;
+
+        let (ours, theirs) = UnixStream::pair().expect("socket pair");
+        let incoming = tokio_stream::once(Ok::<_, std::io::Error>(theirs)).chain(tokio_stream::pending());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(weaveauth_plugin_sdk::plugin_server::PluginServer::new(Refusing))
+                .serve_with_incoming(incoming),
+        );
+        let mut client = PluginClient::new(channel(Arc::new(Mutex::new(Some(ours)))));
+
+        let status = client.invoke(PluginRequest::default()).await.expect_err("the plugin refuses");
+
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(status.source().is_none(), "a status the plugin sent carries a source: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_status_from_this_side_has_a_source() {
+        let mut client = PluginClient::new(channel(Arc::new(Mutex::new(None))));
+
+        let status = client.invoke(PluginRequest::default()).await.expect_err("there is no connection");
+
+        assert!(status.source().is_some(), "a transport failure carries no source: {status:?}");
     }
 
     #[tokio::test]
@@ -318,14 +466,14 @@ mod tests {
         assert!(error.to_string().contains("exited during startup"), "unhelpful error: {error}");
     }
 
-    // A plugin that runs but never binds the socket is the case the
-    // readiness poll exists for -- without it the failure would surface as a
-    // rejected registration much later.
+    // A plugin that runs but never serves is the case the startup call
+    // exists for -- without it the failure would surface as a rejected
+    // registration much later.
     #[tokio::test]
-    async fn fails_to_start_when_the_plugin_never_listens() {
+    async fn fails_to_start_when_the_plugin_never_answers() {
         let error = PluginProcess::start(config("/bin/sh", &["-c", "sleep 30"])).await.expect_err("must not start");
 
-        assert!(error.to_string().contains("did not listen"), "unhelpful error: {error}");
+        assert!(error.to_string().contains("did not answer"), "unhelpful error: {error}");
     }
 
     /// What [`TOKEN_BYTES`] encodes to: unpadded base64 spends 4 characters
@@ -381,8 +529,6 @@ mod tests {
             vars(&[
             ("WA_MAX_BCRYPT_COST", "12"),
             ("WA_OIDC_GOOGLE_CLIENT_SECRET", "hunter2"),
-            ("WA_PLUGIN_SOCKET", "/tmp/somewhere/s"),
-            ("WA_PLUGIN_TOKEN", "a-real-secret"),
             ("WA_PLUGIN_ENV_DATABASE_URL", "postgres://db/unscoped"),
             ("PATH", "/usr/bin"),
             ("DATABASE_URL", "postgres://weaveauth/users"),
@@ -462,18 +608,5 @@ mod tests {
         let round_tripped = struct_to_json(json_to_struct(map));
 
         assert_eq!(serde_json::Value::Object(round_tripped), original);
-    }
-
-    #[test]
-    fn gives_the_plugin_a_private_socket_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = socket_dir().expect("creates a directory");
-        let mode = std::fs::metadata(&dir).expect("readable").permissions().mode();
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // Anyone who can open the socket can drive the plugin, and through
-        // it whatever credentials the deployer gave it.
-        assert_eq!(mode & 0o777, 0o700, "the socket directory is reachable by other users");
     }
 }

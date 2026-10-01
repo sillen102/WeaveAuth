@@ -9,15 +9,20 @@
 //! A system test sees only HTTP status codes, so each behaviour is selected
 //! by a `probe` field the plugin reads off the registration.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use support::config::FINAL_REDIRECT;
-use support::plugin::{PROBE, env, plugin_handler, register, registration_fields};
+use support::plugin::{env, plugin_handler, register, registration_fields};
 use support::servers::spawn_backend;
+
+/// The probe plugin, built as a bin target of this package -- so it is
+/// already compiled by the time a test runs, and always from this source
+/// tree rather than a stale artifact. Only a test target sees this variable,
+/// which is why it isn't in the library.
+const PROBE: &str = env!("CARGO_BIN_EXE_probe-plugin");
 
 fn backend_config(timeout_secs: u64, env: HashMap<String, String>) -> weaveauth::config::Config {
     weaveauth::config::Config {
@@ -121,6 +126,15 @@ async fn a_plugin_is_given_only_the_environment_it_was_configured_with() {
     let status = register(&backend_url, "alice@example.com", &registration_fields("env")).await;
 
     assert_eq!(status, reqwest::StatusCode::CREATED, "the plugin inherited WeaveAuth's environment");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugins_stdin_no_longer_reaches_its_connection() {
+    let (backend_url, _handle) = spawn_backend(&backend_config(10, HashMap::new())).await.expect("backend starts");
+
+    let status = register(&backend_url, "alice@example.com", &registration_fields("stdin")).await;
+
+    assert_eq!(status, reqwest::StatusCode::CREATED, "a subprocess of the plugin could inherit its connection");
 }
 
 // Positive control for the test above: the same probe rejects when the

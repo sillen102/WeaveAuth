@@ -68,12 +68,21 @@ impl Config {
     }
 
     /// Loads config, layering (highest precedence last): built-in defaults,
-    /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`, missing
-    /// file is not an error), then `WA_*` env vars.
+    /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`; a
+    /// missing file is not an error, one that exists but can't be read is),
+    /// then `WA_*` env vars.
     pub fn load() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
 
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
+        // Figment treats a file it can't open like a missing one. Missing is
+        // fine (no overlay); present but unreadable is a deployment mistake
+        // that would otherwise run on defaults, dropping every setting in it.
+        if let Err(error) = std::fs::File::open(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            anyhow::bail!("could not read config file {path:?}: {error}");
+        }
 
         // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
         // `login::Config::own_origin`) -- when the two run side by side, it's
@@ -127,6 +136,23 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    // A file that exists but can't be read is a deployment mistake, and
+    // running on defaults instead would quietly drop every setting in it. A
+    // path through a regular file can't be opened even by root, unlike a
+    // `chmod 000` file.
+    #[test]
+    fn refuses_a_config_file_it_cannot_read() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "port: 1984\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
+
+            let error = Config::load().expect_err("an unreadable config must not fall back to defaults");
+
+            assert!(error.to_string().contains("config.yaml/nested.yaml"), "unhelpful error: {error}");
+            Ok(())
+        });
+    }
 
     #[test]
     fn defaults_when_no_env_and_no_file() {

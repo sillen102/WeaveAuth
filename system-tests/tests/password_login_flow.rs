@@ -4,8 +4,7 @@
 //! OIDC callback) that converges on the same server-to-server PKCE exchange
 //! in `bff/src/server/api/complete_login.rs`.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use support::config::{FINAL_REDIRECT, NEXT_ORIGIN};
 use support::servers;

@@ -116,11 +116,16 @@ its one generic `Invoke` rpc with `hook: "registration"` over gRPC.
   doesn't block the next. A plugin that dies is restarted; the call in flight fails.
 - **The plugin inherits no environment** -- `env_clear()` plus only what the deployer
   named for it: the config's `env`, any `WA_PLUGIN_REGISTRATION_ENV_<NAME>` from
-  backend's own environment (forwarded as `<NAME>`), and the socket/token variables. This process's
+  backend's own environment (forwarded as `<NAME>`). This process's
   environment holds the signing keys and OIDC client secrets.
-- **Every call carries a startup-generated token** the plugin's SDK checks before the
-  call reaches plugin code, so a local process that finds the socket can't drive it.
-- **The plugin is not sandboxed.** It runs with backend's privileges, and there are no
+- **Only backend can reach the plugin.** The connection is a socket pair whose other end
+  is the plugin's stdin. There is no socket file or port for any other process to find.
+- **Every call also carries a startup-generated token**, which the plugin's SDK checks
+  before the call reaches plugin code. Backend writes it as the first line on the
+  connection, never in the plugin's environment.
+- **The plugin runs as its own `uid`/`gid`** (default `1001`, never `0`; the login-claims
+  plugin defaults to `1002`), so it can't read backend's memory or environment, or the
+  other plugin's. It is still not sandboxed: there are no
   allowlists because nothing here could enforce one -- see **[Plugins](../plugins.md)**
   for what that means before mounting one.
 - The runtime under this handler is flow-agnostic: other flows add other rpcs to the

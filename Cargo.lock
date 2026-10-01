@@ -4849,6 +4849,7 @@ dependencies = [
  "rand 0.10.3",
  "reqwest 0.13.5",
  "rsa",
+ "rustix",
  "schemars 1.2.2",
  "secrecy",
  "serde",
@@ -4856,6 +4857,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "tower-http 0.7.1",
@@ -4901,6 +4903,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaveauth-launcher"
+version = "0.1.0"
+
+[[package]]
 name = "weaveauth-login"
 version = "0.1.0"
 dependencies = [
@@ -4922,6 +4928,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rustix",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",

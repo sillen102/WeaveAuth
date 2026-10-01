@@ -9,8 +9,7 @@
 //! behaviour is selected by the email's local part (see
 //! `fixtures/plugins/probe.rs::handle_login_claims`).
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::time::{Duration, Instant};
 
@@ -18,8 +17,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use support::config::FINAL_REDIRECT;
-use support::plugin::{PROBE, login_claims_handler};
+use support::plugin::login_claims_handler;
 use support::servers::spawn_backend;
+
+/// The probe plugin, built as a bin target of this package -- so it is
+/// already compiled by the time a test runs, and always from this source
+/// tree rather than a stale artifact. Only a test target sees this variable,
+/// which is why it isn't in the library.
+const PROBE: &str = env!("CARGO_BIN_EXE_probe-plugin");
 
 const PASSWORD: &str = "hunter2-hunter2";
 

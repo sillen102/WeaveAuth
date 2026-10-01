@@ -30,8 +30,6 @@ prost-types = { workspace = true }
 testcontainers = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
-
-[dev-dependencies]
 weaveauth = { path = "../backend" }
 weaveauth-bff = { path = "../bff" }
 axum = { workspace = true }

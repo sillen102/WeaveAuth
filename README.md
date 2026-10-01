@@ -186,7 +186,8 @@ Open http://localhost:8081 for the optional standalone login page.
 
 Each of `backend` and `bff` reads an optional YAML file first (bare `config.yaml`,
 relative to the process's working directory — override the path with
-`WA_CONFIG_FILE`; a missing file is not an error, defaults apply), then lets the
+`WA_CONFIG_FILE`; a missing file is not an error, defaults apply, but one that exists and
+can't be read — wrong permissions, say — stops the service from starting), then lets the
 `WA_*` env vars below override individual scalar fields on top of it. `login` is
 env-only (nothing structured to configure). A route list (`routes:` on bff) only
 exists in the YAML file — there's no sane env-var shape for it.
@@ -223,7 +224,8 @@ backend's `extra_data_handler` is YAML-only too. It decides what happens to fiel
 register request carries beyond `email`/`password`: `kind: webhook` POSTs them to a URL,
 `kind: process` runs an executable the deployer mounts and calls it over gRPC. A plugin
 is an ordinary binary, so it uses ordinary libraries and keeps its own connection pools
-— and it is **not sandboxed**: mounting one is equivalent to shipping application code.
+— and it is **not sandboxed**: each plugin runs as its own user (`uid`/`gid`, defaults
+1001 and 1002), but mounting one is still equivalent to shipping application code.
 See **[docs/plugins.md](docs/plugins.md)**.
 
 ```yaml
@@ -363,7 +365,7 @@ exercising bff's proxy):
 | `WA_BFF_PORT`                | bff                 | `8080`                                                  | bff listen port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `WA_BACKEND_URL`             | bff                 | `http://localhost:1983`                                 | Backend base URL the bff exchanges codes against                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `WA_BFF_URL`                 | bff, login          | `http://localhost:8080`                                 | Public base URL of the bff, used by login to redirect into it                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `WA_LOGIN_PUBLIC_URL`        | login, bff, backend | `http://localhost:8081`                                 | Login page's own public origin. login uses it as the `redirect_uri` fallback and to build `own_url`/`next` — pinned in config rather than trusted from `Host`/`X-Forwarded-Proto`. bff defaults `WA_TRUSTED_ORIGINS` from it, and backend defaults `WA_REDIRECT_URI_ALLOWLIST` from it (with a trailing `/` appended) — both only when that var isn't set explicitly. When all three run in the same container (`entrypoint.sh`), setting just this one is enough. Not bff's or backend's own URL. |
+| `WA_LOGIN_PUBLIC_URL`        | login, bff, backend | `http://localhost:8081`                                 | Login page's own public origin. login uses it as the `redirect_uri` fallback and to build `own_url`/`next` — pinned in config rather than trusted from `Host`/`X-Forwarded-Proto`. bff defaults `WA_TRUSTED_ORIGINS` from it, and backend defaults `WA_REDIRECT_URI_ALLOWLIST` from it (with a trailing `/` appended) — both only when that var isn't set explicitly. When all three run in the same container (`weaveauth-launcher`), setting just this one is enough. Not bff's or backend's own URL. |
 | `WA_REDIRECT_URI_ALLOWLIST`  | backend             | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/` | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`. Exact string match, hence the trailing slash — matches login's own default `redirect_uri`                                                                                                                                                                                                                                                                 |
 | `WA_TRUSTED_ORIGINS`         | bff                 | `WA_LOGIN_PUBLIC_URL`, else `http://localhost:8081`     | Comma-separated origins allowed to POST to `/login`/`/register` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF")                                                                                                                                                                                                                                                     |
 | `WA_SESSION_COOKIE_NAME`     | bff                 | `wa_session`                                            | Name of the HttpOnly session cookie set after login                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -373,7 +375,8 @@ exercising bff's proxy):
 | `WA_RATE_LIMIT_WINDOW_SECS`  | bff                 | `60`                                                    | Approximate window the burst size applies over; replenishes at `max_attempts / window_secs` per second                                                                                                                                                                                                                                                                                                                                                                                             |
 | `WA_DOCS_ENABLED`            | bff                 | `false`                                                 | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off by default — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                              |
 | `WA_MAX_BCRYPT_COST`         | backend             | `12`                                                    | Highest bcrypt cost factor accepted when verifying an imported legacy-user password hash — caps how long a single login can tie up a blocking-pool thread                                                                                                                                                                                                                                                                                                                                        |
-| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else. `WA_PLUGIN_SOCKET`/`WA_PLUGIN_TOKEN` are set by backend and reserved |
+| `WA_SETUID_HELPER`           | backend             | *(unset; the image sets it)*                            | `weaveauth-plugin-exec`, the binary plugins are started through. It alone holds `CAP_SETUID`/`CAP_SETGID` and switches to each plugin's `uid`/`gid`, refusing 0. Unset, backend switches users itself, which needs `CAP_SETUID`/`CAP_SETGID` (or root), unless `uid`/`gid` are its own (local runs) |
+| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else |
 
 ## Testing
 
@@ -405,11 +408,18 @@ members):
 
 ## Docker
 
-Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim` builder compiles all
-three binaries (`--release -p weaveauth -p weaveauth-bff -p weaveauth-login`); the
-`debian:bookworm-slim` runtime copies the three binaries plus `/app/login/static`,
-`/app/login/templates`, and
-`entrypoint.sh`, which launches all three processes.
+Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim-trixie` builder compiles
+the three services plus `weaveauth-launcher` and `weaveauth-plugin-exec`. The `gcr.io/distroless/cc-debian13`
+runtime (no shell) copies them plus `/app/login/static` and `/app/login/templates`, and
+runs `weaveauth-launcher`, which starts all three and exits when any one of them does.
+Everything runs as `weaveauth` (1000) with no capabilities. The exception is
+`weaveauth-plugin-exec` (`WA_SETUID_HELPER`), which has `CAP_SETUID`/`CAP_SETGID` as file
+capabilities, so plugins can run as their own users (`wa-registration` 1001,
+`wa-login-claims` 1002). A deployment without plugins needs no capabilities. With
+plugins, `capabilities.drop: [ALL]` (the Kubernetes restricted Pod Security Standard),
+`--cap-drop SETUID`/`SETGID` or `no-new-privileges` stop them from starting, and backend
+then refuses to boot; see [docs/plugins.md](docs/plugins.md#deploying). The launcher
+doesn't forward `SIGTERM`, so use `docker run --init` for a prompt `docker stop`.
 
 ```bash
 docker build -t weaveauth .

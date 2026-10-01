@@ -72,8 +72,12 @@ depends = [
 ]
 
 [tasks.test-docker]
-description = "Run the system tests that need a Docker daemon (real Postgres via testcontainers)"
-run = "cargo test -p weaveauth-system-tests --features docker"
+description = "Run the system tests that need a Docker daemon (real Postgres, the shipped image's plugin privilege separation)"
+run = [
+    "docker build -t weaveauth .",
+    "docker build -f system-tests/docker/Dockerfile.plugin-test -t weaveauth-plugin-test .",
+    "cargo test -p weaveauth-system-tests --features docker",
+]
 
 [tasks.mutants]
 description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth)"

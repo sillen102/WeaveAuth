@@ -4,8 +4,7 @@
 //! this is the seam that flow shares with `oidc_full_flow.rs`, exercised
 //! here from its own entry point (`/register`) instead.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use support::config::{FINAL_REDIRECT, NEXT_ORIGIN};
 use support::servers;
