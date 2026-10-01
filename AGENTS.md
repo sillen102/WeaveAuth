@@ -63,6 +63,16 @@ module outside the Cargo workspace, built by its own mise tasks.
     it; the top level (the controller, or `From<XyzServiceError> for XyzError`) logs it just
     before handing over the response. Code that swallows an error instead of returning it logs
     it at that spot.
+  - **Detailed logs, opaque responses.** What the caller sees is fixed and generic: the
+    `#[error_response(...)]` status and its static `details` text (or none), never an upstream
+    message, status code, URL, hostname, file path, plugin output, or anything derived from a
+    cause. The cause lives only in the log, where it should be as detailed as it can be: say
+    what failed and against what, and keep the whole chain (`common::error::cause_chain`),
+    because `Display` on reqwest/hyper errors drops the source ("error sending request" without
+    "connection refused"). Never put secrets, tokens, passwords, codes or personal data in a
+    log line either; strip URLs that carry them (`reqwest::Error::without_url`). A service error
+    may carry the cause as a `String`, but its controller counterpart must not, and must not
+    format it into the response.
 - Never use ignore in documentation tests.
 - Keep changes minimal and localized; prefer the shortest working change.
 

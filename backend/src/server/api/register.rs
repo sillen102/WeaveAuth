@@ -57,8 +57,12 @@ mod controller {
     impl From<RegisterServiceError> for RegisterError {
         fn from(err: RegisterServiceError) -> Self {
             match &err {
-                RegisterServiceError::DownstreamServiceFailed(_) => tracing::warn!(%err, "registration failed"),
-                RegisterServiceError::UnexpectedError(_) => tracing::error!(%err, "registration failed"),
+                RegisterServiceError::DownstreamServiceFailed(_) => {
+                    tracing::warn!(%err, "registration failed")
+                }
+                RegisterServiceError::UnexpectedError(_) => {
+                    tracing::error!(%err, "registration failed")
+                }
                 _ => {}
             }
             match err {
@@ -149,7 +153,9 @@ mod service {
             return Err(RegisterServiceError::InvalidEmail);
         }
 
-        let password_hash = crypto::hash_password(password).await.map_err(|error| RegisterServiceError::UnexpectedError(error.to_string()))?;
+        let password_hash = crypto::hash_password(password)
+            .await
+            .map_err(|error| RegisterServiceError::UnexpectedError(error.to_string()))?;
 
         // Generated up front (rather than left to storage) so it can be
         // handed to the extra-data handler before the user is created --
@@ -304,16 +310,34 @@ mod extra_data {
 
     #[async_trait::async_trait]
     impl ExtraDataHandler for WebhookHandler {
-        async fn handle(&self, user_id: Uuid, email: &str, fields: &HashMap<String, String>) -> Result<(), ExtraDataError> {
-            let payload = ExtraDataPayload { user_id, email, fields };
-            let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
-                ExtraDataError(format!("extra-data webhook request to {} failed: {error}", self.url))
-            })?;
+        async fn handle(
+            &self,
+            user_id: Uuid,
+            email: &str,
+            fields: &HashMap<String, String>,
+        ) -> Result<(), ExtraDataError> {
+            let payload = ExtraDataPayload {
+                user_id,
+                email,
+                fields,
+            };
+            let response = self
+                .client
+                .post(&self.url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|error| {
+                    ExtraDataError(format!(
+                        "extra-data webhook request failed: {}",
+                        common::error::cause_chain(&error.without_url())
+                    ))
+                })?;
 
             if response.status().is_success() {
                 Ok(())
             } else {
-                Err(ExtraDataError(format!("extra-data webhook {} returned {}", self.url, response.status())))
+                Err(ExtraDataError(format!("extra-data webhook returned {}", response.status())))
             }
         }
     }

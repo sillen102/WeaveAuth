@@ -94,6 +94,8 @@ confirm-link form's submit target.
 - Wrong password or dead (already single-used) token -> bounce to
   `next?error=link_failed`; the pending-link cookie gets cleared either
   way, since it's single-use regardless of outcome.
+- `redirect_uri` not allowlisted on backend -> `400`, not a bounce: it is
+  the caller's bad input, not a backend fault (same as `/login`).
 - Success -> `complete_login`, `wa_session` set, pending-link cookie
   cleared, browser lands on `redirect_uri`.
 

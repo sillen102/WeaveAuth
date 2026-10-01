@@ -45,8 +45,12 @@ mod controller {
                 tracing::error!(%err, "password reset failed");
             }
             match err {
-                PasswordResetConfirmServiceError::InvalidOrExpiredToken => PasswordResetConfirmError::InvalidOrExpiredToken,
-                PasswordResetConfirmServiceError::UnexpectedError(_) => PasswordResetConfirmError::UnexpectedError,
+                PasswordResetConfirmServiceError::InvalidOrExpiredToken => {
+                    PasswordResetConfirmError::InvalidOrExpiredToken
+                }
+                PasswordResetConfirmServiceError::UnexpectedError(_) => {
+                    PasswordResetConfirmError::UnexpectedError
+                }
             }
         }
     }
@@ -177,10 +181,14 @@ mod service {
 
     async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmServiceError> {
         if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError("revoking refresh tokens failed".to_string()));
+            return Err(PasswordResetConfirmServiceError::UnexpectedError(
+                "revoking refresh tokens failed".to_string(),
+            ));
         }
         if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError("revoking login sessions failed".to_string()));
+            return Err(PasswordResetConfirmServiceError::UnexpectedError(
+                "revoking login sessions failed".to_string(),
+            ));
         }
         Ok(())
     }

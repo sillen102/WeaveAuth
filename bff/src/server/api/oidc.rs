@@ -12,7 +12,6 @@ mod controller {
     use serde::Deserialize;
     use thiserror::Error;
 
-    use crate::server::api::complete_login::CompleteLoginError;
     use crate::server::cookie::{build_cookie, build_cross_site_cookie, clear_cookie, extract_cookie};
     use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
     use crate::server::AppState;
@@ -84,6 +83,9 @@ mod controller {
         #[error("request did not come from a trusted origin")]
         #[error_response(StatusCode::FORBIDDEN, details = "request did not come from a trusted origin")]
         UntrustedOrigin,
+        #[error("redirect_uri is not allowed")]
+        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
+        InvalidRedirectUri,
         #[error("backend returned an unexpected response")]
         #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
         BackendUnavailable,
@@ -112,17 +114,12 @@ mod controller {
 
     impl From<OidcConfirmLinkServiceError> for OidcConfirmLinkError {
         fn from(err: OidcConfirmLinkServiceError) -> Self {
-            tracing::warn!(%err, "oidc confirm-link failed");
             match err {
-                OidcConfirmLinkServiceError::BackendUnavailable(_) => OidcConfirmLinkError::BackendUnavailable,
-            }
-        }
-    }
-
-    impl From<CompleteLoginError> for OidcConfirmLinkError {
-        fn from(err: CompleteLoginError) -> Self {
-            match err {
-                CompleteLoginError::InvalidRedirectUri | CompleteLoginError::TokenExchangeFailed | CompleteLoginError::BackendUnavailable => {
+                OidcConfirmLinkServiceError::InvalidRedirectUri => {
+                    OidcConfirmLinkError::InvalidRedirectUri
+                }
+                OidcConfirmLinkServiceError::BackendUnavailable(_) => {
+                    tracing::warn!(%err, "oidc confirm-link failed");
                     OidcConfirmLinkError::BackendUnavailable
                 }
             }
@@ -174,10 +171,12 @@ mod controller {
         let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
         let state_cookie = build_cookie(STATE_COOKIE, &started.csrf_state, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
         let cookie_header = |cookie: &str| {
-            HeaderValue::from_str(cookie).map(|value| (header::SET_COOKIE, value)).map_err(|error| {
-                tracing::warn!(%error, "oidc flow cookie is not a valid header value");
-                OidcLoginError::BackendUnavailable
-            })
+            HeaderValue::from_str(cookie)
+                .map(|value| (header::SET_COOKIE, value))
+                .map_err(|error| {
+                    tracing::warn!(%error, "oidc flow cookie is not a valid header value");
+                    OidcLoginError::BackendUnavailable
+                })
         };
         let cookies = [
             cookie_header(&redirect_uri_cookie)?,
@@ -322,11 +321,10 @@ mod controller {
         headers: HeaderMap,
         Form(req): Form<OidcConfirmLinkRequest>,
     ) -> Result<Response, OidcConfirmLinkError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|error| {
-                tracing::warn!(%error, "request rejected");
-                OidcConfirmLinkError::UntrustedOrigin
-            })?;
+        require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
+            tracing::warn!(%error, "request rejected");
+            OidcConfirmLinkError::UntrustedOrigin
+        })?;
         if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
             return Err(OidcConfirmLinkError::InvalidNext);
         }
@@ -400,13 +398,19 @@ mod service {
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum OidcConfirmLinkServiceError {
+        #[error("redirect_uri is not allowed")]
+        InvalidRedirectUri,
         #[error("backend returned an unexpected response: {0}")]
         BackendUnavailable(String),
     }
 
     impl From<crate::server::api::complete_login::CompleteLoginServiceError> for OidcConfirmLinkServiceError {
         fn from(err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
-            OidcConfirmLinkServiceError::BackendUnavailable(err.to_string())
+            use crate::server::api::complete_login::CompleteLoginServiceError as E;
+            match err {
+                E::InvalidRedirectUri => OidcConfirmLinkServiceError::InvalidRedirectUri,
+                other => OidcConfirmLinkServiceError::BackendUnavailable(other.to_string()),
+            }
         }
     }
 
@@ -463,24 +467,42 @@ mod service {
             .get(format!("{}/oauth/oidc/{provider}/login", state.config.backend_url))
             .send()
             .await
-            .map_err(|error| OidcLoginServiceError::BackendUnavailable(format!("login request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                OidcLoginServiceError::BackendUnavailable(format!(
+                    "login request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
 
         if backend_resp.status() == StatusCode::NOT_FOUND {
             return Err(OidcLoginServiceError::UnknownProvider);
         }
         if !backend_resp.status().is_redirection() {
-            return Err(OidcLoginServiceError::BackendUnavailable(format!("login returned {}", backend_resp.status())));
+            return Err(OidcLoginServiceError::BackendUnavailable(format!(
+                "login returned {}",
+                backend_resp.status()
+            )));
         }
         let provider_auth_url = backend_resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OidcLoginServiceError::BackendUnavailable("login redirect has no usable Location".into()))?
+            .ok_or_else(|| {
+                OidcLoginServiceError::BackendUnavailable(
+                    "login redirect has no usable Location".into(),
+                )
+            })?
             .to_string();
         let csrf_state = url::Url::parse(&provider_auth_url)
             .ok()
-            .and_then(|url| url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()))
-            .ok_or_else(|| OidcLoginServiceError::BackendUnavailable("login redirect carries no state".into()))?;
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(k, _)| k == "state")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .ok_or_else(|| {
+                OidcLoginServiceError::BackendUnavailable("login redirect carries no state".into())
+            })?;
 
         Ok(StartedOidcLogin { provider_auth_url, csrf_state })
     }
@@ -530,16 +552,27 @@ mod service {
             .query(&[("code", code), ("state", req_state)])
             .send()
             .await
-            .map_err(|error| OidcCallbackServiceError::ExchangeFailed(format!("callback request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                OidcCallbackServiceError::ExchangeFailed(format!(
+                    "callback request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
         if resp.status() == StatusCode::FORBIDDEN {
             return Err(OidcCallbackServiceError::ConsentRequired);
         }
         if !resp.status().is_success() {
-            return Err(OidcCallbackServiceError::ExchangeFailed(format!("callback returned {}", resp.status())));
+            return Err(OidcCallbackServiceError::ExchangeFailed(format!(
+                "callback returned {}",
+                resp.status()
+            )));
         }
-        resp.json()
-            .await
-            .map_err(|error| OidcCallbackServiceError::ExchangeFailed(format!("callback response unreadable: {}", error.without_url())))
+        resp.json().await.map_err(|error| {
+            OidcCallbackServiceError::ExchangeFailed(format!(
+                "callback response unreadable: {}",
+                common::error::cause_chain(&error.without_url())
+            ))
+        })
     }
 
     pub(crate) enum ConfirmLinkOutcome {
@@ -567,7 +600,10 @@ mod service {
             .send()
             .await
             .map_err(|error| {
-                OidcConfirmLinkServiceError::BackendUnavailable(format!("confirm-link request failed: {}", error.without_url()))
+                OidcConfirmLinkServiceError::BackendUnavailable(format!(
+                    "confirm-link request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
             })?;
 
         if backend_resp.status() == StatusCode::UNAUTHORIZED || backend_resp.status() == StatusCode::BAD_REQUEST {
@@ -583,7 +619,10 @@ mod service {
             .json::<LoginSessionResponse>()
             .await
             .map_err(|error| {
-                OidcConfirmLinkServiceError::BackendUnavailable(format!("confirm-link response unreadable: {}", error.without_url()))
+                OidcConfirmLinkServiceError::BackendUnavailable(format!(
+                    "confirm-link response unreadable: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
             })?
             .login_session;
 
@@ -600,8 +639,9 @@ mod tests {
     use axum::Form;
 
     use crate::config::Config;
-    use crate::server::api::complete_login::CompleteLoginError;
+    use crate::server::api::complete_login::CompleteLoginServiceError;
     use crate::server::AppState;
+    use super::service::OidcConfirmLinkServiceError;
 
     fn state_with_trusted_origins(trusted_origins: Vec<String>) -> AppState {
         AppState::new(Config {
@@ -665,13 +705,25 @@ mod tests {
     }
 
     #[test]
-    fn every_complete_login_error_maps_to_backend_unavailable() {
+    fn a_disallowed_redirect_uri_is_a_client_error_not_a_backend_fault() {
+        let service_err =
+            OidcConfirmLinkServiceError::from(CompleteLoginServiceError::InvalidRedirectUri);
+
+        assert_eq!(service_err, OidcConfirmLinkServiceError::InvalidRedirectUri);
+        assert_eq!(
+            OidcConfirmLinkError::from(service_err),
+            OidcConfirmLinkError::InvalidRedirectUri
+        );
+    }
+
+    #[test]
+    fn other_complete_login_failures_are_a_backend_fault() {
         for err in [
-            CompleteLoginError::InvalidRedirectUri,
-            CompleteLoginError::TokenExchangeFailed,
-            CompleteLoginError::BackendUnavailable,
+            CompleteLoginServiceError::TokenExchangeFailed("x".into()),
+            CompleteLoginServiceError::BackendUnavailable("x".into()),
         ] {
-            assert_eq!(OidcConfirmLinkError::from(err), OidcConfirmLinkError::BackendUnavailable);
+            let mapped = OidcConfirmLinkError::from(OidcConfirmLinkServiceError::from(err));
+            assert_eq!(mapped, OidcConfirmLinkError::BackendUnavailable);
         }
     }
 }

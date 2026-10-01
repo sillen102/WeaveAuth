@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![warn(dead_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -65,14 +64,15 @@ impl Default for Config {
 
 impl Config {
     /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` / `WA_LOGIN_PUBLIC_URL` env
-    /// vars, falling back to defaults for anything unset.
-    pub fn load() -> Self {
+    /// vars, falling back to defaults for anything unset. A value that is set
+    /// but invalid is an error: silently using the defaults would point the
+    /// login page at localhost.
+    pub fn load() -> anyhow::Result<Self> {
         let defaults = Config::default();
 
-        let mut config: Config = Figment::from(Serialized::defaults(defaults.clone()))
-            // `WA_LOGIN_PORT` needs parse-or-fallback semantics (an invalid
-            // value should keep the default rather than fail the whole
-            // config), so it's applied by hand below instead.
+        let mut config: Config = Figment::from(Serialized::defaults(defaults))
+            // `WA_LOGIN_PORT` doesn't map 1:1 to its field name, so it's
+            // applied by hand below instead.
             .merge(
                 Env::raw()
                     .map(|k| match k.as_str() {
@@ -83,19 +83,15 @@ impl Config {
                     .ignore(&["_ignored"]),
             )
             .extract()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "ignoring invalid login configuration, using defaults");
-                defaults
-            });
+            .map_err(|error| anyhow::anyhow!("invalid login configuration: {error}"))?;
 
         if let Ok(raw) = env::var("WA_LOGIN_PORT") {
-            match raw.parse() {
-                Ok(port) => config.port = port,
-                Err(error) => tracing::warn!(%error, value = %raw, "ignoring invalid WA_LOGIN_PORT, keeping port {}", config.port),
-            }
+            config.port = raw
+                .parse()
+                .map_err(|error| anyhow::anyhow!("invalid WA_LOGIN_PORT {raw:?}: {error}"))?;
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -210,7 +206,7 @@ mod tests {
     #[test]
     fn defaults_when_no_env_set() {
         Jail::expect_with(|_jail| {
-            let config = Config::load();
+            let config = Config::load().unwrap();
             assert_eq!(config.port, 8081);
             assert_eq!(config.bff_url, "http://localhost:8080");
             Ok(())
@@ -224,7 +220,7 @@ mod tests {
             jail.set_env("WA_BFF_URL", "http://bff.env.test");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
 
-            let config = Config::load();
+            let config = Config::load().unwrap();
             assert_eq!(config.port, 9999);
             assert_eq!(config.bff_url, "http://bff.env.test");
             assert_eq!(config.own_origin, "https://login.env.test");
@@ -233,11 +229,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_port_falls_back_to_default() {
+    fn invalid_port_is_an_error() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_LOGIN_PORT", "not-a-port");
 
-            assert_eq!(Config::load().port, 8081);
+            let error =
+                Config::load().expect_err("an unparseable port must not fall back to the default");
+            assert!(
+                error.to_string().contains("WA_LOGIN_PORT"),
+                "unhelpful error: {error}"
+            );
             Ok(())
         });
     }

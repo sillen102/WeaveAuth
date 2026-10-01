@@ -169,15 +169,24 @@ impl Drop for PluginProcess {
 fn channel(pending: PendingConnection) -> Channel {
     // Lazy, so the first call (the startup check) is what connects, and so
     // the channel reconnects on its own after a restart.
-    Endpoint::from_static(UNUSED_AUTHORITY).connect_with_connector_lazy(tower::service_fn(move |_: Uri| {
-        // The slot is a plain Option, so a poisoned lock holds nothing inconsistent; recover rather than never reconnect.
-        let connection = pending.lock().unwrap_or_else(PoisonError::into_inner).take();
-        async move {
-            let stream = connection
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "the plugin is restarting"))?;
-            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-        }
-    }))
+    Endpoint::from_static(UNUSED_AUTHORITY).connect_with_connector_lazy(tower::service_fn(
+        move |_: Uri| {
+            // The slot is a plain Option, so a poisoned lock holds nothing inconsistent; recover rather than never reconnect.
+            let connection = pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            async move {
+                let stream = connection.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "the plugin is restarting",
+                    )
+                })?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        },
+    ))
 }
 
 /// Bytes of entropy behind the plugin token -- the same size as a refresh

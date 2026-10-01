@@ -65,7 +65,7 @@ pub(crate) fn is_safe_redirect_target(target: &str, trusted_origins: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_redirect_target, require_trusted_origin, OriginError};
+    use super::{OriginError, is_safe_redirect_target, require_trusted_origin};
     use axum::http::{HeaderMap, HeaderValue};
 
     fn trusted() -> Vec<String> {

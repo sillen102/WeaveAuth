@@ -25,7 +25,10 @@ mod controller {
         #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
         Unauthenticated,
         #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
         BackendUnavailable,
     }
 
@@ -174,15 +177,26 @@ mod service {
             })
             .send()
             .await
-            .map_err(|error| ProxyServiceError::BackendUnavailable(format!("refresh request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                ProxyServiceError::BackendUnavailable(format!(
+                    "refresh request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
         if resp.status().is_client_error() {
             return Err(ProxyServiceError::Unauthenticated);
         }
         if !resp.status().is_success() {
-            return Err(ProxyServiceError::BackendUnavailable(format!("refresh returned {}", resp.status())));
+            return Err(ProxyServiceError::BackendUnavailable(format!(
+                "refresh returned {}",
+                resp.status()
+            )));
         }
         let token: TokenResponse = resp.json().await.map_err(|error| {
-            ProxyServiceError::BackendUnavailable(format!("refresh response unreadable: {}", error.without_url()))
+            ProxyServiceError::BackendUnavailable(format!(
+                "refresh response unreadable: {}",
+                common::error::cause_chain(&error.without_url())
+            ))
         })?;
 
         let data = SessionData {
@@ -233,6 +247,9 @@ mod tests {
 
         let result = refresh_session(&mut state, "session-1", "refresh-token").await;
 
-        assert!(matches!(result, Err(ProxyServiceError::BackendUnavailable(_))));
+        assert!(matches!(
+            result,
+            Err(ProxyServiceError::BackendUnavailable(_))
+        ));
     }
 }

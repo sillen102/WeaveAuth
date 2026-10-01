@@ -574,8 +574,12 @@ async fn failed_refresh_call_is_unauthorized() -> anyhow::Result<()> {
     // the refresh call itself (e.g. it was already revoked/rotated there).
     let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
     let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, Some(StatusCode::BAD_REQUEST)).await?;
+    let (backend, _refresh_calls, _bh) = stub_backend_with_expiry(
+        already_expired,
+        refresh_still_valid,
+        Some(StatusCode::BAD_REQUEST),
+    )
+    .await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
@@ -607,6 +611,34 @@ async fn backend_failing_the_refresh_call_is_bad_gateway_not_unauthorized() -> a
         Some(StatusCode::INTERNAL_SERVER_ERROR),
     )
     .await?;
+    let routes = vec![RouteConfig {
+        path_prefix: "/api".into(),
+        upstream_url: "http://unused.test".into(),
+    }];
+    let app = app(test_config(backend, routes)).unwrap();
+    let cookie = seeded_cookie(app.clone(), "").await?;
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/api/whoami/42")
+                .header("cookie", &cookie)
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unparseable_refresh_response_is_bad_gateway() -> anyhow::Result<()> {
+    // 200 with a body that isn't a token response: backend answered, but
+    // nothing says the session is dead.
+    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
+    let (backend, _refresh_calls, _bh) =
+        stub_backend_with_expiry(already_expired, refresh_still_valid, Some(StatusCode::OK))
+            .await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),

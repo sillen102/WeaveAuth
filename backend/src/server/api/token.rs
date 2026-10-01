@@ -70,10 +70,13 @@ mod controller {
     impl From<TokenServiceError> for TokenError {
         fn from(err: TokenServiceError) -> Self {
             match &err {
-                TokenServiceError::DownstreamServiceFailed(_) | TokenServiceError::ReservedClaimOverridden(_) => {
+                TokenServiceError::DownstreamServiceFailed(_)
+                | TokenServiceError::ReservedClaimOverridden(_) => {
                     tracing::warn!(%err, "token request failed")
                 }
-                TokenServiceError::UnexpectedError(_) => tracing::error!(%err, "token request failed"),
+                TokenServiceError::UnexpectedError(_) => {
+                    tracing::error!(%err, "token request failed")
+                }
                 _ => {}
             }
             match err {
@@ -252,7 +255,9 @@ mod service {
         user_id: Uuid,
         family_id: Uuid,
     ) -> Result<TokenResponse, TokenServiceError> {
-        let user = state.users.get_user_by_id(user_id).await.ok_or_else(|| TokenServiceError::UnexpectedError(format!("user {user_id} not found")))?;
+        let user = state.users.get_user_by_id(user_id).await.ok_or_else(|| {
+            TokenServiceError::UnexpectedError(format!("user {user_id} not found"))
+        })?;
 
         let extra = match &state.login_claims_handler {
             Some(handler) => {
@@ -280,7 +285,11 @@ mod service {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(signing_key.kid.clone());
         let access_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key)
-            .map_err(|error| TokenServiceError::UnexpectedError(format!("signing the access token failed: {error}")))?;
+            .map_err(|error| {
+                TokenServiceError::UnexpectedError(format!(
+                    "signing the access token failed: {error}"
+                ))
+            })?;
 
         let mut token_bytes = [0u8; 32];
         rand::rng().fill(&mut token_bytes);
@@ -404,19 +413,28 @@ mod login_claims {
     impl LoginClaimsHandler for WebhookHandler {
         async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
             let payload = LoginClaimsPayload { user_id, email };
-            let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
-                LoginClaimsError(format!("login-claims webhook request to {} failed: {error}", self.url))
-            })?;
+            let response = self
+                .client
+                .post(&self.url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|error| {
+                    LoginClaimsError(format!(
+                        "login-claims webhook request failed: {}",
+                        common::error::cause_chain(&error.without_url())
+                    ))
+                })?;
 
             if !response.status().is_success() {
-                return Err(LoginClaimsError(format!("login-claims webhook {} returned {}", self.url, response.status())));
+                return Err(LoginClaimsError(format!("login-claims webhook returned {}", response.status())));
             }
 
             match response.json::<serde_json::Value>().await {
                 Ok(serde_json::Value::Object(claims)) => Ok(claims),
-                Ok(_) => Err(LoginClaimsError(format!("login-claims webhook {} did not return a JSON object", self.url))),
+                Ok(_) => Err(LoginClaimsError("login-claims webhook did not return a JSON object".to_string())),
                 Err(error) => {
-                    Err(LoginClaimsError(format!("login-claims webhook {} response was not valid JSON: {error}", self.url)))
+                    Err(LoginClaimsError(format!("login-claims webhook response was not valid JSON: {}", common::error::cause_chain(&error.without_url()))))
                 }
             }
         }

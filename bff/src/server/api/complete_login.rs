@@ -1,40 +1,4 @@
 pub(crate) use service::{complete_login, CompleteLoginServiceError};
-pub(crate) use controller::CompleteLoginError;
-
-mod controller {
-    use axum::http::StatusCode;
-    use common_macros::ErrorResponses;
-    use thiserror::Error;
-
-    use super::service::CompleteLoginServiceError;
-
-    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
-    pub(crate) enum CompleteLoginError {
-        #[error("redirect_uri is not allowed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
-        InvalidRedirectUri,
-        #[error("token exchange failed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
-        TokenExchangeFailed,
-        #[error("backend returned an unexpected response")]
-        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
-        BackendUnavailable,
-    }
-
-    impl From<CompleteLoginServiceError> for CompleteLoginError {
-        fn from(err: CompleteLoginServiceError) -> Self {
-            if !matches!(err, CompleteLoginServiceError::InvalidRedirectUri) {
-                tracing::warn!(%err, "login failed");
-            }
-            match err {
-                CompleteLoginServiceError::InvalidRedirectUri => CompleteLoginError::InvalidRedirectUri,
-                CompleteLoginServiceError::TokenExchangeFailed(_) => CompleteLoginError::TokenExchangeFailed,
-                CompleteLoginServiceError::BackendUnavailable(_) => CompleteLoginError::BackendUnavailable,
-            }
-        }
-    }
-}
 
 mod service {
     use axum::http::{header, StatusCode};
@@ -124,7 +88,10 @@ mod service {
             .send()
             .await
             .map_err(|error| {
-                CompleteLoginServiceError::BackendUnavailable(format!("authorize request failed: {}", error.without_url()))
+                CompleteLoginServiceError::BackendUnavailable(format!(
+                    "authorize request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
             })?;
 
         if authorize_resp.status() == StatusCode::BAD_REQUEST {
@@ -142,11 +109,23 @@ mod service {
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| CompleteLoginServiceError::BackendUnavailable("authorize redirect has no usable Location".into()))?;
+            .ok_or_else(|| {
+                CompleteLoginServiceError::BackendUnavailable(
+                    "authorize redirect has no usable Location".into(),
+                )
+            })?;
         let code = url::Url::parse(location)
             .ok()
-            .and_then(|u| u.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.into_owned()))
-            .ok_or_else(|| CompleteLoginServiceError::BackendUnavailable("authorize redirect carries no code".into()))?;
+            .and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .ok_or_else(|| {
+                CompleteLoginServiceError::BackendUnavailable(
+                    "authorize redirect carries no code".into(),
+                )
+            })?;
 
         let token_req = TokenExchangeRequest {
             grant_type: "authorization_code",
@@ -163,7 +142,10 @@ mod service {
             .send()
             .await
             .map_err(|error| {
-                CompleteLoginServiceError::BackendUnavailable(format!("token request failed: {}", error.without_url()))
+                CompleteLoginServiceError::BackendUnavailable(format!(
+                    "token request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
             })?;
 
         if !token_resp.status().is_success() {
@@ -172,12 +154,12 @@ mod service {
                 token_resp.status()
             )));
         }
-        let token: TokenResponse = token_resp
-            .json()
-            .await
-            .map_err(|error| {
-                CompleteLoginServiceError::BackendUnavailable(format!("token response unreadable: {}", error.without_url()))
-            })?;
+        let token: TokenResponse = token_resp.json().await.map_err(|error| {
+            CompleteLoginServiceError::BackendUnavailable(format!(
+                "token response unreadable: {}",
+                common::error::cause_chain(&error.without_url())
+            ))
+        })?;
 
         let session_id = Uuid::new_v4().to_string();
         state

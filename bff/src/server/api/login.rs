@@ -66,11 +66,10 @@ mod controller {
         headers: HeaderMap,
         Form(req): Form<LoginRequest>,
     ) -> Result<Response, LoginError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|error| {
-                tracing::warn!(%error, "request rejected");
-                LoginError::UntrustedOrigin
-            })?;
+        require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
+            tracing::warn!(%error, "request rejected");
+            LoginError::UntrustedOrigin
+        })?;
 
         match service::login(&mut state, &req.email, &req.password, &req.redirect_uri).await? {
             LoginOutcome::Rejected => {
@@ -112,9 +111,15 @@ mod service {
     impl From<CompleteLoginServiceError> for LoginServiceError {
         fn from(err: CompleteLoginServiceError) -> Self {
             match err {
-                CompleteLoginServiceError::InvalidRedirectUri => LoginServiceError::InvalidRedirectUri,
-                CompleteLoginServiceError::TokenExchangeFailed(cause) => LoginServiceError::TokenExchangeFailed(cause),
-                CompleteLoginServiceError::BackendUnavailable(cause) => LoginServiceError::BackendUnavailable(cause),
+                CompleteLoginServiceError::InvalidRedirectUri => {
+                    LoginServiceError::InvalidRedirectUri
+                }
+                CompleteLoginServiceError::TokenExchangeFailed(cause) => {
+                    LoginServiceError::TokenExchangeFailed(cause)
+                }
+                CompleteLoginServiceError::BackendUnavailable(cause) => {
+                    LoginServiceError::BackendUnavailable(cause)
+                }
             }
         }
     }
@@ -163,17 +168,30 @@ mod service {
             .json(&VerifyLoginRequest { email, password })
             .send()
             .await
-            .map_err(|error| LoginServiceError::BackendUnavailable(format!("login request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                LoginServiceError::BackendUnavailable(format!(
+                    "login request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
         if verify_resp.status() == StatusCode::UNAUTHORIZED {
             return Ok(LoginOutcome::Rejected);
         }
         if !verify_resp.status().is_success() {
-            return Err(LoginServiceError::BackendUnavailable(format!("login returned {}", verify_resp.status())));
+            return Err(LoginServiceError::BackendUnavailable(format!(
+                "login returned {}",
+                verify_resp.status()
+            )));
         }
         let login_session = verify_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|error| LoginServiceError::BackendUnavailable(format!("login response unreadable: {}", error.without_url())))?
+            .map_err(|error| {
+                LoginServiceError::BackendUnavailable(format!(
+                    "login response unreadable: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?
             .login_session;
 
         let cookie = complete_login(state, &login_session, redirect_uri).await?;

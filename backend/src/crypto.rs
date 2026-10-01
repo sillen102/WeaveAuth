@@ -21,9 +21,13 @@ pub(crate) static ARGON2: LazyLock<Argon2<'static>> = LazyLock::new(Argon2::defa
 /// Hashes `password` with argon2, off the tokio worker thread (argon2 is
 /// deliberately CPU-heavy, synchronous work).
 pub(crate) async fn hash_password(password: SecretString) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || ARGON2.hash_password(password.expose_secret().as_bytes()).map(|h| h.to_string()))
-        .await?
-        .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"))
+    tokio::task::spawn_blocking(move || {
+        ARGON2
+            .hash_password(password.expose_secret().as_bytes())
+            .map(|h| h.to_string())
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"))
 }
 
 /// A wrong password is an expected outcome, not an error -- kept out of

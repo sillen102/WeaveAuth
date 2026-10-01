@@ -83,11 +83,10 @@ mod controller {
         headers: HeaderMap,
         Form(req): Form<RegisterRequest>,
     ) -> Result<Response, RegisterError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|error| {
-                tracing::warn!(%error, "request rejected");
-                RegisterError::UntrustedOrigin
-            })?;
+        require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
+            tracing::warn!(%error, "request rejected");
+            RegisterError::UntrustedOrigin
+        })?;
 
         match service::register(&mut state, &req.email, &req.password, req.extra).await? {
             RegisterOutcome::Rejected => {
@@ -159,13 +158,21 @@ mod service {
             .json(&BackendCredentials { email, password, extra })
             .send()
             .await
-            .map_err(|error| RegisterServiceError::BackendUnavailable(format!("register request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                RegisterServiceError::BackendUnavailable(format!(
+                    "register request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
 
         if resp.status().is_client_error() {
             return Ok(RegisterOutcome::Rejected);
         }
         if !resp.status().is_success() {
-            return Err(RegisterServiceError::BackendUnavailable(format!("register returned {}", resp.status())));
+            return Err(RegisterServiceError::BackendUnavailable(format!(
+                "register returned {}",
+                resp.status()
+            )));
         }
 
         Ok(RegisterOutcome::Created)
@@ -184,24 +191,41 @@ mod service {
         result.ok()
     }
 
-    async fn try_auto_login(state: &mut AppState, email: &str, password: &str, redirect_uri: &str) -> Result<String, String> {
+    async fn try_auto_login(
+        state: &mut AppState,
+        email: &str,
+        password: &str,
+        redirect_uri: &str,
+    ) -> Result<String, String> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
             .json(&BackendCredentials { email, password, extra: HashMap::new() })
             .send()
             .await
-            .map_err(|error| format!("login request failed: {}", error.without_url()))?;
+            .map_err(|error| {
+                format!(
+                    "login request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                )
+            })?;
         if !verify_resp.status().is_success() {
             return Err(format!("login returned {}", verify_resp.status()));
         }
         let login_session = verify_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|error| format!("login response unreadable: {}", error.without_url()))?
+            .map_err(|error| {
+                format!(
+                    "login response unreadable: {}",
+                    common::error::cause_chain(&error.without_url())
+                )
+            })?
             .login_session;
 
-        complete_login(state, &login_session, redirect_uri).await.map_err(|error| error.to_string())
+        complete_login(state, &login_session, redirect_uri)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

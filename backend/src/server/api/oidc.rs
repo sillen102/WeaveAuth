@@ -306,15 +306,28 @@ mod service {
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.expose_secret().to_string()))
             .request_async(&*state.oidc_http_client)
             .await
-            .map_err(|error| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' code exchange: {error}")))?;
+            .map_err(|error| {
+                OidcServiceError::ExchangeFailed(format!(
+                    "provider '{stored_provider}' code exchange: {}",
+                    common::error::cause_chain(&error)
+                ))
+            })?;
 
         let id_token = token_response
             .id_token()
             .ok_or_else(|| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' returned no id_token")))?;
         let verifier = client.id_token_verifier();
         let claims = id_token
-            .claims(&verifier, &Nonce::new(login_state.nonce.expose_secret().to_string()))
-            .map_err(|error| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' id_token: {error}")))?;
+            .claims(
+                &verifier,
+                &Nonce::new(login_state.nonce.expose_secret().to_string()),
+            )
+            .map_err(|error| {
+                OidcServiceError::ExchangeFailed(format!(
+                    "provider '{stored_provider}' id_token: {}",
+                    common::error::cause_chain(&error)
+                ))
+            })?;
 
         // Accounts are linked across providers by matching this email against
         // existing users (see `resolve_oidc_login`), so it must be one the
@@ -440,13 +453,23 @@ mod service {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|error| format!("request to {url} failed: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "request to {url} failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                )
+            })?;
         if !response.status().is_success() {
             return Err(format!("{url} returned {}", response.status()));
         }
-        let body = response.text().await.map_err(|error| format!("reading {url} failed: {error}"))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&body).map_err(|error| format!("{url} did not return valid JSON: {error}"))?;
+        let body = response.text().await.map_err(|error| {
+            format!(
+                "reading {url} failed: {}",
+                common::error::cause_chain(&error.without_url())
+            )
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|error| format!("{url} did not return valid JSON: {error}"))?;
 
         let mut found = HashMap::new();
         let mut missing_pointers = Vec::new();

@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![warn(dead_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -21,4 +20,5 @@
 )]
 
 pub mod docs;
+pub mod error;
 pub mod model;
