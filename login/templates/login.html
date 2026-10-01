@@ -30,7 +30,9 @@
   <main class="card">
     <h1>WeaveAuth</h1>
     <p>Sign in with your account to continue.</p>
-    {% if error == "link_failed" %}
+    {% if error == "consent_required" %}
+    <p class="error">This app needs a permission you didn't grant. Please try Sign in with Google again and allow all of the requested permissions.</p>
+    {% elif error == "link_failed" %}
     <p class="error">That didn't work -- please try Sign in with Google again.</p>
     {% elif error %}
     <p class="error">Incorrect email or password.</p>

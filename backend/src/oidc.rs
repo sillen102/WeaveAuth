@@ -92,6 +92,7 @@ mod tests {
                 redirect_uri: "http://localhost/callback".to_string(),
                 extra_claims: HashMap::new(),
                 scopes: vec!["email".to_string()],
+                profile_apis: Vec::new(),
             },
         );
 

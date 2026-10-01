@@ -188,6 +188,35 @@ pub struct OidcProviderConfig {
     /// WeaveAuth relies on; changing it replaces the list, so keep `email`.
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
+    /// Extra API calls made with the provider's access token on a user's
+    /// first login, for claims the id_token doesn't carry (e.g. Google's
+    /// phone number lives in the People API). Called concurrently; on a
+    /// field-name clash the later entry wins.
+    #[serde(default)]
+    pub profile_apis: Vec<ProfileApiConfig>,
+}
+
+/// One profile API call. Its fields reach the extra-data handler together
+/// with the id_token `extra_claims`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileApiConfig {
+    /// GET with `Authorization: Bearer <access token>`. Must be `https://`
+    /// unless the host is loopback.
+    pub url: String,
+    /// `field name -> JSON pointer` (RFC 6901, e.g. `/phoneNumbers/0/value`)
+    /// into the JSON response.
+    pub claims: HashMap<String, String>,
+    /// OAuth scope the access token needs for this call. Checked against the
+    /// scopes the provider reports as granted before calling: if the user
+    /// declined it the call is skipped, or, for a `required` entry, the login
+    /// fails with an error saying the consent is needed. Unset: always called.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Whether a failed call (or a pointer that finds nothing) fails the
+    /// login. When false, a failed call is logged and its fields are left
+    /// out, and a pointer that finds nothing leaves just that field out.
+    #[serde(default)]
+    pub required: bool,
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -284,6 +313,26 @@ impl Config {
     }
 }
 
+/// Rejects a plaintext `http://` URL to a non-local host. The outbound calls
+/// configured here (webhooks, profile APIs) carry the user's email, fields or
+/// access token, which must not cross the network in the clear. `https://` is
+/// always accepted; `http://` only for loopback, for local dev/testing against
+/// a service on the same machine. `what` names the setting in the error.
+pub(crate) fn require_https_or_loopback(what: &str, url: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid {what} {url:?}: {e}"))?;
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() == "https" || is_loopback {
+        Ok(())
+    } else {
+        anyhow::bail!("{what} {url:?} must use https (http is only allowed for loopback hosts)")
+    }
+}
+
 #[cfg(test)]
 // figment::Jail::expect_with's closure signature is fixed by the crate; its
 // Result<(), figment::Error> can't be shrunk from call sites.
@@ -292,6 +341,30 @@ mod tests {
     use super::*;
     use figment::Jail;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn accepts_https_urls() {
+        assert!(require_https_or_loopback("hook url", "https://internal.example.com/hook").is_ok());
+    }
+
+    #[test]
+    fn accepts_http_for_loopback_hosts() {
+        assert!(require_https_or_loopback("hook url", "http://127.0.0.1:9000/hook").is_ok());
+        assert!(require_https_or_loopback("hook url", "http://localhost:9000/hook").is_ok());
+        assert!(require_https_or_loopback("hook url", "http://[::1]:9000/hook").is_ok());
+    }
+
+    #[test]
+    fn rejects_plain_http_for_a_non_loopback_host_naming_what_it_checked() {
+        let error = require_https_or_loopback("hook url", "http://internal.example.com/hook").unwrap_err();
+
+        assert!(error.to_string().contains("hook url"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unparseable_url() {
+        assert!(require_https_or_loopback("hook url", "not a url").is_err());
+    }
 
     #[test]
     fn defaults_when_no_env_and_no_file() {
@@ -422,6 +495,43 @@ mod tests {
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
             assert!(google.extra_claims.is_empty());
             assert_eq!(google.scopes, vec!["email".to_string(), "profile".to_string()]);
+            assert!(google.profile_apis.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_oidc_providers_profile_apis_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  \
+                 google:\n    \
+                 client_id: my-client-id\n    \
+                 client_secret: my-client-secret\n    \
+                 issuer: https://accounts.google.com\n    \
+                 redirect_uri: http://bff.test/oidc/google/callback\n    \
+                 profile_apis:\n      \
+                 - url: https://people.test/me\n        \
+                 claims:\n          \
+                 phone_number: /phoneNumbers/0/value\n      \
+                 - url: https://other.test/me\n        \
+                 required: true\n        \
+                 scope: https://other.test/scope\n        \
+                 claims:\n          \
+                 nickname: /nick\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            let apis = &config.oidc_providers.get("google").expect("google provider loaded").profile_apis;
+            assert_eq!(apis.len(), 2);
+            assert_eq!(apis[0].url, "https://people.test/me");
+            assert_eq!(apis[0].claims.get("phone_number").map(String::as_str), Some("/phoneNumbers/0/value"));
+            assert!(!apis[0].required, "not required unless asked");
+            assert_eq!(apis[0].scope, None);
+            assert_eq!(apis[1].scope.as_deref(), Some("https://other.test/scope"));
+            assert!(apis[1].required);
             Ok(())
         });
     }

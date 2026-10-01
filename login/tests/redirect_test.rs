@@ -147,6 +147,24 @@ async fn login_page_shows_the_link_failed_error_message() {
 }
 
 #[tokio::test]
+async fn login_page_explains_a_declined_permission() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/login.html?error=consent_required")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(body.contains("needs a permission you didn't grant"));
+    assert!(!body.contains("Incorrect email or password."));
+}
+
+#[tokio::test]
 async fn login_page_renders_the_confirm_link_form_when_email_is_present() {
     let app = app(test_config());
 
@@ -213,6 +231,24 @@ async fn register_page_shows_the_taken_email_error_message() {
 
     let body = body_string(resp).await;
     assert!(body.contains("That email is already taken."));
+}
+
+#[tokio::test]
+async fn register_page_explains_a_declined_permission() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/register.html?error=consent_required")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_string(resp).await;
+    assert!(body.contains("needs a permission you didn't grant"));
+    assert!(!body.contains("That email is already taken."));
 }
 
 #[tokio::test]

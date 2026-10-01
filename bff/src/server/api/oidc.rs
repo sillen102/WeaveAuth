@@ -238,15 +238,16 @@ mod controller {
             return Ok(with_cleared_cookies(OidcCallbackError::MissingFlowState));
         };
 
-        let error_redirect = |next: &str| -> Response {
+        let error_redirect_with = |next: &str, error: &str| -> Response {
             let sep = if next.contains('?') { '&' } else { '?' };
             (
                 StatusCode::SEE_OTHER,
                 AppendHeaders(clear_flow_cookies.clone()),
-                [(header::LOCATION, format!("{next}{sep}error=1"))],
+                [(header::LOCATION, format!("{next}{sep}error={error}"))],
             )
                 .into_response()
         };
+        let error_redirect = |next: &str| error_redirect_with(next, "1");
 
         // Provider declined (e.g. `?error=access_denied`) or otherwise
         // skipped `code`/`state` -- no exchange to attempt, bounce friendly.
@@ -262,6 +263,7 @@ mod controller {
         }
 
         match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri).await {
+            Err(OidcCallbackServiceError::ConsentRequired) => Ok(error_redirect_with(&next, "consent_required")),
             Err(_) => Ok(error_redirect(&next)),
             Ok(OidcCallbackOutcome::PasswordConfirmationRequired { pending_link_token, email }) => {
                 // `email` (not sensitive, and also what the login page gates
@@ -381,6 +383,9 @@ mod service {
     pub(crate) enum OidcCallbackServiceError {
         #[error("unknown oidc provider or exchange failed")]
         ExchangeFailed,
+        /// The user declined a permission this deployment requires (backend `403`).
+        #[error("a required permission was not granted at the oidc provider")]
+        ConsentRequired,
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -487,9 +492,7 @@ mod service {
         req_state: &str,
         redirect_uri: &str,
     ) -> Result<OidcCallbackOutcome, OidcCallbackServiceError> {
-        let Some(callback_response) = fetch_callback_response(state, provider, code, req_state).await else {
-            return Err(OidcCallbackServiceError::ExchangeFailed);
-        };
+        let callback_response = fetch_callback_response(state, provider, code, req_state).await?;
 
         match callback_response {
             OidcCallbackResponse::Authenticated { login_session } => {
@@ -502,26 +505,29 @@ mod service {
         }
     }
 
-    /// Hands `code`/`state` to backend and parses its response. `None`
-    /// covers every failure mode (network, non-2xx, bad body) since the
-    /// caller treats them all the same way.
+    /// Hands `code`/`state` to backend and parses its response. Every
+    /// failure (network, non-2xx, bad body) is `ExchangeFailed` except a
+    /// `403`, which backend uses for a declined permission.
     async fn fetch_callback_response(
         state: &AppState,
         provider: &str,
         code: &str,
         req_state: &str,
-    ) -> Option<OidcCallbackResponse> {
+    ) -> Result<OidcCallbackResponse, OidcCallbackServiceError> {
         let resp = state
             .http_client
             .get(format!("{}/oauth/oidc/{provider}/callback", state.config.backend_url))
             .query(&[("code", code), ("state", req_state)])
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+            .map_err(|_| OidcCallbackServiceError::ExchangeFailed)?;
+        if resp.status() == StatusCode::FORBIDDEN {
+            return Err(OidcCallbackServiceError::ConsentRequired);
         }
-        resp.json().await.ok()
+        if !resp.status().is_success() {
+            return Err(OidcCallbackServiceError::ExchangeFailed);
+        }
+        resp.json().await.map_err(|_| OidcCallbackServiceError::ExchangeFailed)
     }
 
     pub(crate) enum ConfirmLinkOutcome {

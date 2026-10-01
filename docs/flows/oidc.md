@@ -52,11 +52,22 @@ redirects the browser here with `code` + `state`.
   - completes the PKCE code exchange and OIDC claims verification with the
     provider;
   - if the login is for a new user and the provider has `extra_claims`
-    configured (`field name -> id_token claim name`), hands those claims to
+    configured (`field name -> id_token claim name`) and/or `profile_apis`
+    (GET calls made with the access token, each mapping `field name -> JSON
+    pointer` into the response, called concurrently), hands those fields to
     the `extra_data_handler` as the registration fields, *before* the user
     is created (with the id it will get). A handler failure fails the
     callback (`502`) and no user is created, so the downstream service and
-    WeaveAuth never disagree about whether the user exists;
+    WeaveAuth never disagree about whether the user exists. A profile API
+    call that fails (request error, non-2xx, body that isn't JSON) is skipped
+    with a warning unless that entry sets `required: true`, which fails the
+    callback (`502`) the same way. A pointer that finds nothing just leaves
+    that field out, silently, unless the entry is `required`. An entry with
+    a `scope` is only called if the token response lists that scope as
+    granted (no `scope` field means everything asked for was): when the user
+    declined it, an optional entry is skipped without a call, and a
+    `required` one fails the callback with `403` before any call is made,
+    which bff turns into a redirect to `next?error=consent_required`;
   - resolves the verified email against existing users.
 - Two outcomes:
   - **Authenticated** -- `complete_login` runs (mirrors a password login),

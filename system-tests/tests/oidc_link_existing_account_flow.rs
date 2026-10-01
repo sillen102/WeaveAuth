@@ -32,6 +32,7 @@ fn backend_config(issuer: String, oidc_callback_url: String) -> weaveauth::confi
             redirect_uri: oidc_callback_url,
             extra_claims: Default::default(),
             scopes: vec!["email".to_string(), "profile".to_string()],
+            profile_apis: Vec::new(),
         },
     );
     weaveauth::config::Config {

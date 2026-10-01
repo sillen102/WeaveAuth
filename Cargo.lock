@@ -4840,6 +4840,7 @@ dependencies = [
  "dotenvy",
  "email_address",
  "figment",
+ "futures-util",
  "hyper-util",
  "jsonwebtoken",
  "native-tls",

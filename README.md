@@ -125,7 +125,7 @@ bucket):
 | POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                                                                                                               |
 | POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                      |
 | GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; `404` for an unknown provider                                                                                                                                                                                                                                  |
-| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend; on success finishes the login like `/login` would; if backend reports `password_confirmation_required`, 303 → `next?pending_link_token=...&email=...` instead (the login page's own prompt, not an error); failure → 303 → `next?error=1`; `400` if the flow cookies are missing/expired |
+| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend; on success finishes the login like `/login` would; if backend reports `password_confirmation_required`, 303 → `next?pending_link_token=...&email=...` instead (the login page's own prompt, not an error); failure → 303 → `next?error=1` (`next?error=consent_required` if backend refused because a required permission was declined); `400` if the flow cookies are missing/expired |
 | POST   | `/oidc/confirm-link`         | Form `{pending_link_token, password, redirect_uri, next}`. Forwards to backend's `/oauth/oidc/confirm-link`; on success finishes the login like `/login` does, 303 → `redirect_uri` with session cookie set; wrong password or a dead/expired token → 303 → `next?error=link_failed` (the token is single-use on backend regardless of outcome, so there's nothing to retry); `403` if `Origin`/`Referer` isn't in `trusted_origins` |
 | *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                                                                                                                         |
 
@@ -290,9 +290,57 @@ extra_data_handler:
   url: http://localhost:10001/hooks/register
 ```
 
-Google returns no phone number over OIDC, so don't map one for it. Setting `extra_claims`
-without both an `extra_data_handler` and a `login_claims_handler` makes backend refuse to
-start (the fields are pointless unless they also come back as token claims).
+Setting `extra_claims` (or `profile_apis` below) without both an `extra_data_handler` and a
+`login_claims_handler` makes backend refuse to start (the fields are pointless unless they
+also come back as token claims).
+
+Some claims never appear in the id_token. Google's phone number is one: it can only be read
+from the People API. A provider's `profile_apis` is a list of extra GET calls made with the
+user's access token on their first login, each mapping `field name -> JSON pointer` (RFC 6901)
+into the response. Their fields are merged with the `extra_claims` ones and go to
+`extra_data_handler` in the same call. `url` must be `https://` (loopback excepted), since it
+carries the access token.
+
+```yaml
+oidc_providers:
+  google:
+    scopes:
+      - email
+      - profile
+      - https://www.googleapis.com/auth/contacts.readonly
+    profile_apis:
+      - url: https://people.googleapis.com/v1/people/me?personFields=phoneNumbers
+        required: false   # the default
+        scope: https://www.googleapis.com/auth/contacts.readonly
+        claims:
+          phone_number: /phoneNumbers/0/canonicalForm
+```
+
+`scope` is the permission the call needs. Google's consent screen lets users untick individual
+permissions and continue, so before calling, backend checks the scopes the token response says
+were granted (a response without a `scope` field counts as granting what was asked). If the
+user declined it, an optional entry is skipped without calling anything, and a `required` entry
+refuses the login with `403`; bff then sends the browser back to the login page with
+`?error=consent_required`, which says a permission is needed and to try again. Leave `scope`
+out and the call is always made.
+
+`required` decides what a failed call does. A failure is a transport error, a non-2xx
+response or a body that isn't JSON. With `required: false` (the default) it is logged as a
+warning and that call's fields are left out; the login carries on. With `required: true` the
+login fails (`502`) and no user is created. A pointer that finds nothing (a Google account
+with no saved phone number) is not a failed call: the field is simply left out, without a log
+line, while the call's other fields still count. Only a `required: true` entry treats a
+missing value as a failure.
+
+About the Google example. The phone number saved under the account's Personal info is not
+returned by `people/me` (not even with `user.phonenumbers.read`); Google returns phone numbers
+from the user's own **contact card** ("Me" in Google Contacts), which needs the
+`contacts.readonly` scope. Two consequences: that scope lets the app read *all* of the user's
+contacts, and the number is whatever the user typed on their contact card, so it is not
+verified, don't treat it as proof of ownership. `contacts.readonly` is a sensitive Google
+scope: until your Google Cloud app passes OAuth verification, only its test users can grant it,
+and it must be declared under the project's "Data Access" scopes. Users without a phone on that
+card get no `phone_number` and log in normally (`required: false`).
 
 ### Test doubles (`testing/`)
 

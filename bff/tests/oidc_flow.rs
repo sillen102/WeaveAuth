@@ -73,6 +73,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                         (Some("good-code"), Some("good-state")) => Ok(Json(
                             serde_json::json!({"status": "authenticated", "login_session": "stub-session"}),
                         )),
+                        (Some("declined-code"), Some("declined-state")) => Err(StatusCode::FORBIDDEN),
                         (Some("unverified-code"), Some("unverified-state")) => Ok(Json(serde_json::json!({
                             "status": "password_confirmation_required",
                             "pending_link_token": "stub-pending-link-token",
@@ -271,6 +272,30 @@ async fn oidc_callback_bounces_to_next_and_clears_flow_cookies_on_provider_error
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_redirect_uri=") && c.contains("Max-Age=0")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_next=") && c.contains("Max-Age=0")));
     assert!(cookies.iter().any(|c| c.starts_with("wa_oidc_state=") && c.contains("Max-Age=0")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_callback_bounces_to_next_with_consent_required_when_backend_says_a_permission_was_declined(
+) -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=declined-code&state=declined-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=declined-state",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=consent_required"));
+    assert!(set_cookie_values(&resp).iter().any(|c| c.starts_with("wa_oidc_state=;") || c.contains("wa_oidc_state=; ")), "flow cookies cleared");
     Ok(())
 }
 

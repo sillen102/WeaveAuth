@@ -16,10 +16,25 @@ oidc_providers:
     client_secret: set-in-.env
     issuer: https://accounts.google.com
     redirect_uri: http://localhost:8080/oidc/google/callback
+    # What the consent screen asks for besides `openid`. contacts.readonly is for the
+    # phone number: Google only returns it from the user's own contact card, and the
+    # scope reads ALL of their contacts.
+    scopes:
+      - email
+      - profile
+      - https://www.googleapis.com/auth/contacts.readonly
     # Sent to extra_data_handler on first login: field name -> id_token claim.
     extra_claims:
       first_name: given_name
       last_name: family_name
+    # Claims that aren't in the id_token: GET with the access token, field name -> JSON pointer.
+    profile_apis:
+      - url: https://people.googleapis.com/v1/people/me?personFields=phoneNumbers
+        required: false
+        # Skipped (or, if required, the login refused) when the user unticks this permission.
+        scope: https://www.googleapis.com/auth/contacts.readonly
+        claims:
+          phone_number: /phoneNumbers/0/canonicalForm
 # Local-testing webhooks served by testing/downstream-service.
 extra_data_handler:
   kind: webhook
