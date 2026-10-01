@@ -33,6 +33,16 @@ module outside the Cargo workspace, built by its own mise tasks.
 - Full build: `cargo build --workspace --release`
 - No linter/formatter is configured beyond `cargo clippy` (each crate's `mise.toml` has
   a `lint` task). Keep `cargo fmt`-style output manually.
+- `mise run crap` runs `cargo llvm-cov --workspace` (the whole test suite, instrumented)
+  and feeds the LCOV to `cargo crap`, listing functions with CRAP score >= 30 and failing
+  (`--fail-above`) if any scores above 30. It is not part of `lint` because of the
+  test-suite runtime. Writes `lcov.info` (git-ignored). Probe plugins run as subprocesses,
+  so code only they exercise shows 0% coverage.
+- After changing code, run cargo-crap scoped to the touched files, like `cargo-mutants`:
+  `cargo llvm-cov -p <package> --lcov --output-path lcov.info`, then
+  `cargo crap --path <file> --lcov lcov.info --fail-above`. Fix any function over 30 by
+  adding tests or splitting it before finishing. `--path` takes a file or a directory;
+  the scoped run overwrites the workspace `lcov.info`.
 
 ## Coding Rules
 - Formatting: use `rustfmt` with default settings.

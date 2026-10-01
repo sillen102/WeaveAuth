@@ -1,9 +1,10 @@
 monorepo_root = true
 
 [tools]
-rust = "1.98"
+rust = { version = "1.98", components = "llvm-tools-preview" }
 "cargo:cargo-mutants" = "latest"
 "cargo:cargo-crap" = "latest"
+"cargo:cargo-llvm-cov" = "latest"
 
 [monorepo]
 config_roots = [
@@ -82,3 +83,10 @@ run = [
 [tasks.mutants]
 description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth)"
 run = "cargo mutants"
+
+[tasks.crap]
+description = "Report CRAP scores per function (coverage from cargo test --workspace); fails if a function scores above 30"
+run = [
+    "cargo llvm-cov --workspace --lcov --output-path lcov.info",
+    "cargo crap --workspace --lcov lcov.info --exclude '**/tests/**' --exclude '**/main.rs' --exclude '**/build.rs' --min 30 --fail-above",
+]

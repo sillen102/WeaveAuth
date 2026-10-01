@@ -107,9 +107,15 @@ pub enum ServeError {
 /// so an implementation cannot forget to do it. Stdin itself is pointed at
 /// `/dev/null` once the connection is taken, so a subprocess can't inherit it.
 pub async fn serve<P: Plugin>(plugin: P) -> Result<(), ServeError> {
-    let mut stream = socket_on_stdin().map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let stream = socket_on_stdin().map_err(ServeError::NotSpawnedByWeaveAuth)?;
     let dev_null = std::fs::File::open("/dev/null").map_err(ServeError::ReleaseStdin)?;
     rustix::stdio::dup2_stdin(&dev_null).map_err(|errno| ServeError::ReleaseStdin(errno.into()))?;
+    serve_on(stream, plugin).await
+}
+
+/// [`serve`] on an already-taken connection, so it can run without a process
+/// whose stdin is a socket.
+async fn serve_on<P: Plugin>(mut stream: std::os::unix::net::UnixStream, plugin: P) -> Result<(), ServeError> {
     // A missing *or empty* token is a refusal to start, not a call that skips
     // the check -- an empty one would authenticate every caller that sends an
     // empty header.
@@ -288,5 +294,48 @@ mod tests {
     fn does_not_let_two_differences_cancel_each_other_out() {
         assert!(!constant_time_eq(b"ab", b"ba"));
         assert!(!constant_time_eq(b"token-AB", b"token-BA"));
+    }
+
+    struct Unimplemented;
+
+    #[async_trait]
+    impl Plugin for Unimplemented {
+        async fn invoke(&self, _: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+            Err(Status::unimplemented("test plugin"))
+        }
+    }
+
+    async fn serve_after_writing(first_bytes: &[u8]) -> Result<(), ServeError> {
+        use std::io::Write;
+        let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        client_end.write_all(first_bytes).expect("writes");
+        drop(client_end);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve_on(server_end, Unimplemented))
+            .await
+            .expect("serve_on returns once the connection is closed")
+    }
+
+    // An empty token would authenticate every caller that sends an empty header.
+    #[tokio::test]
+    async fn refuses_to_start_on_an_empty_token() {
+        assert!(matches!(serve_after_writing(b"\n").await, Err(ServeError::NoToken)));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_when_the_connection_closes_before_a_token() {
+        assert!(matches!(serve_after_writing(b"").await, Err(ServeError::NoToken)));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_on_a_token_line_that_never_ends() {
+        let endless = vec![b'a'; MAX_TOKEN_LINE + 1];
+        assert!(matches!(serve_after_writing(&endless).await, Err(ServeError::ReadToken(_))));
+    }
+
+    // Companion to the refusals above: a valid token must start the server,
+    // which then returns Ok once WeaveAuth closes the connection.
+    #[tokio::test]
+    async fn serves_until_the_connection_closes() {
+        assert!(serve_after_writing(b"s3cret\n").await.is_ok());
     }
 }
