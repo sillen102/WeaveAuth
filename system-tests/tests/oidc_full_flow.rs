@@ -32,6 +32,8 @@ fn backend_config_with_provider(issuer: String, oidc_callback_url: String) -> we
             client_secret: fake_idp::CLIENT_SECRET.to_string().into(),
             issuer,
             redirect_uri: oidc_callback_url,
+            extra_claims: Default::default(),
+            scopes: vec!["email".to_string(), "profile".to_string()],
         },
     );
     weaveauth::config::Config {

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use support::plugin::PROBE;
 use tonic::transport::{Channel, Endpoint, Uri};
-use weaveauth_plugin_sdk::HandleRegistrationRequest;
+use weaveauth_plugin_sdk::PluginRequest;
 use weaveauth_plugin_sdk::plugin_client::PluginClient;
 use weaveauth_plugin_sdk::{SOCKET_ENV, TOKEN_ENV, TOKEN_METADATA_KEY};
 
@@ -61,15 +61,16 @@ impl Plugin {
 
     /// Calls the plugin presenting `token`, or nothing at all.
     async fn call(&self, token: Option<&str>) -> Result<(), tonic::Status> {
-        let mut request = tonic::Request::new(HandleRegistrationRequest {
+        let mut request = tonic::Request::new(PluginRequest {
+            hook: "registration".to_string(),
             user_id: uuid::Uuid::new_v4().to_string(),
             email: "alice@example.com".to_string(),
-            fields: Default::default(),
+            data: None,
         });
         if let Some(token) = token {
             request.metadata_mut().insert(TOKEN_METADATA_KEY, token.parse().expect("ascii"));
         }
-        self.client().handle_registration(request).await.map(|_| ())
+        self.client().invoke(request).await.map(|_| ())
     }
 }
 

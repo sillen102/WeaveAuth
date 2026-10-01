@@ -81,7 +81,13 @@ impl UserStorage for InMemoryUserStorage {
         self.inner.lock().await.users.get(&id).cloned()
     }
 
-    async fn resolve_oidc_login(&mut self, provider: &str, subject: &str, email: &VerifiedEmail) -> OidcLinkOutcome {
+    async fn resolve_oidc_login(
+        &mut self,
+        provider: &str,
+        subject: &str,
+        email: &VerifiedEmail,
+        new_user_id: Uuid,
+    ) -> OidcLinkOutcome {
         let email = email.as_str();
         let mut inner = self.inner.lock().await;
 
@@ -106,7 +112,7 @@ impl UserStorage for InMemoryUserStorage {
             None => {
                 let now = Utc::now();
                 let user = User {
-                    id: Uuid::new_v4(),
+                    id: new_user_id,
                     email: email.to_string(),
                     password: None,
                     email_verified: true,
@@ -602,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_oidc_login_creates_on_first_login() {
         let mut storage = InMemoryUserStorage::new();
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
+        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
 
         let OidcLinkOutcome::Resolved(user) = outcome else {
             unreachable!("expected Resolved, got {outcome:?}");
@@ -616,12 +622,12 @@ mod tests {
     async fn resolve_oidc_login_returns_the_same_user_on_repeat_login() {
         let mut storage = InMemoryUserStorage::new();
         let OidcLinkOutcome::Resolved(first) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };
         let OidcLinkOutcome::Resolved(second) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };
@@ -640,7 +646,7 @@ mod tests {
         };
         let _ = storage.create_user(local_user.clone()).await;
 
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
+        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
 
         let OidcLinkOutcome::Resolved(oidc_user) = outcome else {
             unreachable!("expected Resolved, got {outcome:?}");
@@ -654,13 +660,13 @@ mod tests {
     async fn resolve_oidc_login_links_a_second_provider_to_the_same_account() {
         let mut storage = InMemoryUserStorage::new();
         let OidcLinkOutcome::Resolved(google_user) =
-            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };
 
         let OidcLinkOutcome::Resolved(linkedin_user) =
-            storage.resolve_oidc_login("linkedin", "linkedin-sub", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("linkedin", "linkedin-sub", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };
@@ -669,7 +675,7 @@ mod tests {
 
         // Both identities now resolve to the same account.
         let OidcLinkOutcome::Resolved(via_google) =
-            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("google", "google-sub", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };
@@ -691,7 +697,7 @@ mod tests {
         };
         let _ = storage.create_user(squatter.clone()).await;
 
-        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await;
+        let outcome = storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await;
 
         assert!(matches!(
             outcome,
@@ -723,7 +729,7 @@ mod tests {
 
         // The newly linked identity now resolves straight to this account.
         let OidcLinkOutcome::Resolved(via_google) =
-            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com")).await
+            storage.resolve_oidc_login("google", "sub-123", &verified("alice@example.com"), Uuid::new_v4()).await
         else {
             unreachable!("expected Resolved");
         };

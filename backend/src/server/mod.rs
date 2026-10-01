@@ -1,8 +1,12 @@
-use crate::config::{Config, ExtraDataHandlerConfig};
-use crate::extra_data::process::PLUGIN_NAME;
-use crate::extra_data::{ExtraDataHandler, ProcessHandler, WebhookHandler};
-use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
+use crate::config::{Config, ExtraDataHandlerConfig, LoginClaimsHandlerConfig};
 use crate::oidc::{self, OidcClient};
+use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
+use crate::server::api::register::{
+    self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME,
+};
+use crate::server::api::token::{
+    self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
+};
 use crate::server::router::router;
 use crate::storage::in_memory::{
     InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
@@ -28,12 +32,17 @@ pub(crate) struct AppState {
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
     pub(crate) refresh_token_ttl_secs: i64,
     pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
+    /// Per provider: `field name -> id_token claim name` (see `OidcProviderConfig::extra_claims`).
+    pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
+    /// Per provider: scopes requested on the consent screen, besides `openid`.
+    pub(crate) oidc_scopes: Arc<HashMap<String, Vec<String>>>,
     pub(crate) oidc_state: InMemoryOidcStateStorage,
     pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
     pub(crate) password_reset_tokens: InMemoryPasswordResetTokenStorage,
     pub(crate) max_bcrypt_cost: u32,
     pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
+    pub(crate) login_claims_handler: Option<Arc<dyn LoginClaimsHandler>>,
 }
 
 impl AppState {
@@ -49,6 +58,16 @@ impl AppState {
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
+        // Fail at boot rather than silently dropping the claims on every login.
+        if let Some((name, _)) = config.oidc_providers.iter().find(|(_, p)| !p.extra_claims.is_empty()) {
+            if config.extra_data_handler.is_none() {
+                anyhow::bail!("oidc provider '{name}' sets extra_claims but no extra_data_handler is configured");
+            }
+            if config.login_claims_handler.is_none() {
+                anyhow::bail!("oidc provider '{name}' sets extra_claims but no login_claims_handler is configured");
+            }
+        }
+
         // No redirects: an OIDC provider redirecting this server-side request
         // elsewhere would be a request-forgery vector, not a legitimate flow.
         let oidc_http_client = Arc::new(
@@ -58,6 +77,7 @@ impl AppState {
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
         let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref()).await?;
+        let login_claims_handler = build_login_claims_handler(config.login_claims_handler.as_ref()).await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -69,12 +89,17 @@ impl AppState {
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
             oidc_providers: Arc::new(oidc_providers),
+            oidc_scopes: Arc::new(config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.scopes.clone())).collect()),
+            oidc_extra_claims: Arc::new(
+                config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.extra_claims.clone())).collect(),
+            ),
             oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
             pending_oidc_links: InMemoryPendingOidcLinkStorage::new(config.pending_oidc_link_ttl_secs),
             oidc_http_client,
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(config.password_reset_token_ttl_secs),
             max_bcrypt_cost: config.max_bcrypt_cost,
             extra_data_handler,
+            login_claims_handler,
         })
     }
 }
@@ -85,13 +110,13 @@ async fn build_extra_data_handler(
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
-            Arc::new(WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
+            Arc::new(register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
         Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
             // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
-            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), PLUGIN_NAME)
+            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), EXTRA_DATA_PLUGIN_NAME)
                 .into_iter()
                 .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
                 .collect();
@@ -105,7 +130,39 @@ async fn build_extra_data_handler(
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
             })
             .await?;
-            Arc::new(ProcessHandler::new(plugin))
+            Arc::new(register::ProcessHandler::new(plugin))
+        }
+    };
+    Ok(Some(handler))
+}
+
+async fn build_login_claims_handler(
+    config: Option<&LoginClaimsHandlerConfig>,
+) -> anyhow::Result<Option<Arc<dyn LoginClaimsHandler>>> {
+    let handler: Arc<dyn LoginClaimsHandler> = match config {
+        None => return Ok(None),
+        Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => {
+            Arc::new(token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
+        }
+        Some(LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
+            // Ambient `WA_PLUGIN_LOGIN_CLAIMS_ENV_*` first, then the config
+            // file, so a deployer can override an inherited value without
+            // unsetting it.
+            let mut plugin_env: HashMap<_, _> = forwarded_env(std::env::vars_os(), LOGIN_CLAIMS_PLUGIN_NAME)
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                .collect();
+            plugin_env.extend(env.clone());
+
+            let plugin = PluginProcess::start(PluginConfig {
+                command: command.clone(),
+                args: args.clone(),
+                env: plugin_env,
+                timeout: Duration::from_secs(*timeout_secs),
+                startup_timeout: Duration::from_secs(*startup_timeout_secs),
+            })
+            .await?;
+            Arc::new(token::ProcessHandler::new(plugin))
         }
     };
     Ok(Some(handler))
@@ -136,4 +193,62 @@ fn spawn_expiry_sweep(mut state: AppState, interval: Duration) {
 /// Builds the router with a fresh in-memory `AppState`. Exposed for integration tests.
 pub async fn app(config: &Config) -> anyhow::Result<axum::Router> {
     Ok(router(AppState::new(config).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OidcProviderConfig;
+
+    fn webhook_pair() -> (ExtraDataHandlerConfig, LoginClaimsHandlerConfig) {
+        (
+            ExtraDataHandlerConfig::Webhook { url: "http://localhost:1/hook".to_string(), timeout_secs: 1 },
+            LoginClaimsHandlerConfig::Webhook { url: "http://localhost:1/claims".to_string(), timeout_secs: 1 },
+        )
+    }
+
+    fn config_with_extra_claims(
+        handler: Option<ExtraDataHandlerConfig>,
+        login_claims: Option<LoginClaimsHandlerConfig>,
+    ) -> Config {
+        let provider = OidcProviderConfig {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string().into(),
+            // Unreachable: the check under test must fire before discovery.
+            issuer: "http://127.0.0.1:1".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
+            scopes: vec!["email".to_string()],
+        };
+        Config {
+            oidc_providers: [("google".to_string(), provider)].into(),
+            extra_data_handler: handler,
+            login_claims_handler: login_claims,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_with_extra_claims_but_no_extra_data_handler() {
+        let error = AppState::new(&config_with_extra_claims(None, Some(webhook_pair().1))).await.err().expect("startup fails");
+
+        assert!(error.to_string().contains("extra_data_handler"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_with_extra_claims_but_no_login_claims_handler() {
+        let error = AppState::new(&config_with_extra_claims(Some(webhook_pair().0), None)).await.err().expect("startup fails");
+
+        assert!(error.to_string().contains("login_claims_handler"), "unexpected error: {error}");
+    }
+
+    // Positive control: with both handlers the check passes and startup only
+    // fails later, at the (unreachable) provider's discovery.
+    #[tokio::test]
+    async fn extra_claims_check_passes_when_both_handlers_are_configured() {
+        let (extra, login) = webhook_pair();
+        let error = AppState::new(&config_with_extra_claims(Some(extra), Some(login))).await.err().expect("discovery fails");
+
+        assert!(!error.to_string().contains("extra_claims"), "unexpected error: {error}");
+    }
 }

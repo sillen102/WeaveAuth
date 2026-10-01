@@ -1,31 +1,41 @@
 # `plugin` — the plugin runtime
 
 A deployer mounts an executable; WeaveAuth runs it as a child process and calls
-it over gRPC at a point in a flow. This module owns the process and the socket
-the two talk over. It knows nothing about what a plugin is *for* —
-registration is just its first caller.
+it over gRPC at a point in a flow. This module owns the process, the socket
+the two talk over, and the one generic `Invoke` rpc every hook shares. It
+knows nothing about what a plugin is *for* — registration and login claims are
+just its callers, and the JSON payload each one sends/reads is theirs to
+shape, not this module's.
 
 Deployer-facing docs live in [`docs/plugins.md`](../../../docs/plugins.md).
 This file is for working on WeaveAuth itself.
 
 | file | holds |
 | --- | --- |
-| `mod.rs` | `PluginProcess` — spawn, wait for readiness, supervise, call |
-| [`plugin-sdk/proto`](../../../plugin-sdk/proto/) | the contract, and the only place a new flow is added |
+| `mod.rs` | `PluginProcess` — spawn, wait for readiness, supervise, call; also `json_to_struct`/`struct_to_json`, the JSON ⇄ `google.protobuf.Struct` conversion every hook's payload goes through |
+| [`plugin-sdk/proto`](../../../plugin-sdk/proto/) | the one generic `Invoke` rpc; a new flow is a new `hook` value, not a proto change |
 
 ## Calling a plugin from a flow
 
 ```rust
-plugin.handle_registration(HandleRegistrationRequest { user_id, email, fields }).await?;
+let request = PluginRequest { hook: "registration".to_string(), user_id, email, data: Some(data) };
+let response = plugin.invoke(request).await?;
 ```
 
-`Ok` accepts; any `tonic::Status` rejects. A flow maps that status onto its own
-error type — don't leak it into an HTTP response.
+`Ok` accepts/succeeds; any `tonic::Status` rejects/fails. A flow maps that
+status onto its own error type — don't leak it into an HTTP response.
+`response.data` (a `google.protobuf.Struct`) carries whatever the hook returns
+-- `None` for a hook that only accepts/rejects, like registration.
 
-Wiring a plugin into a second flow is **a new rpc on the `Plugin` service**
-plus the three-line wrapper next to `handle_registration`, not a new runtime.
-The contract is generated from `plugin-sdk/proto` at build time, so adding an
-rpc there is what makes it exist on both sides at once.
+Wiring a plugin into a second flow is **a new `hook` name**, not a new rpc or a
+new runtime: `PluginProcess::invoke` is generic over every hook, so a flow only
+needs to build the right `PluginRequest` and interpret the right `data` shape
+back. `crate::server::api::register` and `crate::server::api::token` are the
+two callers today, each with its own handler trait
+(`ExtraDataHandler`/`LoginClaimsHandler`) and `Process`/`Webhook`
+implementations living in that endpoint's own file, per the vertical-slice
+rule in `backend/AGENTS.md` -- this module only owns the process/gRPC
+mechanics shared by every hook.
 
 ## Why a process
 
@@ -100,7 +110,8 @@ above.
 | `mod.rs` unit tests | startup failure modes, the private socket directory, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
 | `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check, both SDKs | — |
 | `system-tests/tests/plugin_auth.rs` | a caller with no/wrong token refused against a real plugin process | — |
-| `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register`: accept, reject, timeout, crash-and-restart, concurrency, environment isolation | — |
+| `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register` (`hook: "registration"`): accept, reject, timeout, crash-and-restart, concurrency, environment isolation | — |
+| `system-tests/tests/login_claims_flow.rs` | a real plugin process through backend's real PKCE flow (`hook: "login_claims"`): accept, reject, timeout, reserved-claim rejection, refresh grant | — |
 | `system-tests/tests/plugin_postgres_flow.rs` | a plugin holding a `deadpool-postgres` pool across registrations | Docker, `--features docker` |
 
 The probe plugins are bin targets of the `weaveauth-system-tests` package

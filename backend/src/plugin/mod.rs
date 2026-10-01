@@ -3,9 +3,10 @@
 //!
 //! This module owns the process -- spawning it, restarting it when it dies,
 //! and the unix socket the two talk over. The contract itself lives in
-//! `plugin-sdk/proto`, so a new flow is a new rpc on that service rather
-//! than a new runtime. Registration is the first caller (see
-//! `crate::extra_data`).
+//! `plugin-sdk/proto`, so a new flow is a new `hook` value on its one
+//! generic rpc rather than a new runtime. Registration
+//! (`crate::server::api::register`) and login claims
+//! (`crate::server::api::token`) are its callers.
 //!
 //! A plugin is a native binary, so it keeps its own async runtime and its
 //! own long-lived resources: a `deadpool`/`sqlx` connection pool, an AMQP
@@ -30,7 +31,7 @@ use tokio::process::{Child, Command};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint, Uri};
 use weaveauth_plugin_sdk::plugin_client::PluginClient;
-use weaveauth_plugin_sdk::{HandleRegistrationRequest, SOCKET_ENV, TOKEN_ENV, TOKEN_METADATA_KEY};
+use weaveauth_plugin_sdk::{PluginRequest, PluginResponse, SOCKET_ENV, TOKEN_ENV, TOKEN_METADATA_KEY};
 
 /// How long to wait after the plugin process dies before starting it again.
 /// A plugin that fails on startup would otherwise be respawned as fast as
@@ -108,15 +109,16 @@ impl PluginProcess {
         Ok(Self { client, timeout, token, dir, supervisor })
     }
 
-    /// Hands the plugin the fields a register request carried beyond
-    /// email/password. `Ok` accepts the registration; any status rejects it
-    /// and no user is created.
-    pub(crate) async fn handle_registration(&self, request: HandleRegistrationRequest) -> Result<(), tonic::Status> {
+    /// Calls the plugin's one generic rpc for `request.hook`. `Ok` accepts/
+    /// succeeds the caller's flow; any status rejects/fails it. What `Ok`'s
+    /// `data` means (extra claims, nothing at all, ...) is up to the hook,
+    /// not this method.
+    pub(crate) async fn invoke(&self, request: PluginRequest) -> Result<PluginResponse, tonic::Status> {
         let mut request = tonic::Request::new(request);
         request.set_timeout(self.timeout);
         request.metadata_mut().insert(TOKEN_METADATA_KEY, self.token.clone());
 
-        self.client.clone().handle_registration(request).await.map(|_| ())
+        self.client.clone().invoke(request).await.map(|response| response.into_inner())
     }
 }
 
@@ -184,6 +186,50 @@ where
             (!name.is_empty()).then_some((name, value))
         })
         .collect()
+}
+
+/// Encodes a JSON object as a `google.protobuf.Struct` for [`PluginRequest::data`]
+/// -- the generic contract's payload type, so every hook shares one
+/// conversion instead of each inventing its own.
+pub(crate) fn json_to_struct(map: serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
+    prost_types::Struct { fields: map.into_iter().map(|(key, value)| (key, json_value_to_prost(value))).collect() }
+}
+
+fn json_value_to_prost(value: serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(bool) => Kind::BoolValue(bool),
+        serde_json::Value::Number(number) => Kind::NumberValue(number.as_f64().unwrap_or_default()),
+        serde_json::Value::String(string) => Kind::StringValue(string),
+        serde_json::Value::Array(values) => {
+            Kind::ListValue(prost_types::ListValue { values: values.into_iter().map(json_value_to_prost).collect() })
+        }
+        serde_json::Value::Object(map) => Kind::StructValue(json_to_struct(map)),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// The inverse of [`json_to_struct`], decoding [`PluginResponse::data`] back
+/// into ordinary JSON.
+pub(crate) fn struct_to_json(value: prost_types::Struct) -> serde_json::Map<String, serde_json::Value> {
+    value.fields.into_iter().map(|(key, value)| (key, prost_value_to_json(value))).collect()
+}
+
+fn prost_value_to_json(value: prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+
+    match value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(number)) => {
+            serde_json::Number::from_f64(number).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        Some(Kind::StringValue(string)) => serde_json::Value::String(string),
+        Some(Kind::BoolValue(bool)) => serde_json::Value::Bool(bool),
+        Some(Kind::StructValue(inner)) => serde_json::Value::Object(struct_to_json(inner)),
+        Some(Kind::ListValue(list)) => serde_json::Value::Array(list.values.into_iter().map(prost_value_to_json).collect()),
+    }
 }
 
 fn spawn(config: &PluginConfig, socket: &Path, token: &str) -> std::io::Result<Child> {
@@ -350,6 +396,72 @@ mod tests {
     #[test]
     fn drops_a_variable_that_is_only_the_prefix() {
         assert!(forwarded_env(vars(&[("WA_PLUGIN_REGISTRATION_ENV_", "orphan")]), "REGISTRATION").is_empty());
+    }
+
+    fn string_value(value: &str) -> prost_types::Value {
+        prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(value.to_string())) }
+    }
+
+    fn list_value(values: Vec<prost_types::Value>) -> prost_types::Value {
+        prost_types::Value { kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue { values })) }
+    }
+
+    // The motivating shape: role -> list of ids, nested inside a struct
+    // rather than a flat string.
+    #[test]
+    fn struct_to_json_converts_a_nested_struct_with_a_list_of_strings() {
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert("admin".to_string(), list_value(vec![string_value("user-1"), string_value("user-2")]));
+        let data = prost_types::Struct {
+            fields: std::collections::BTreeMap::from([(
+                "roles".to_string(),
+                prost_types::Value { kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct { fields: roles })) },
+            )]),
+        };
+
+        let map = struct_to_json(data);
+
+        assert_eq!(map.get("roles").and_then(|v| v.get("admin")), Some(&serde_json::json!(["user-1", "user-2"])));
+    }
+
+    #[test]
+    fn struct_to_json_converts_scalar_kinds() {
+        let data = prost_types::Struct {
+            fields: std::collections::BTreeMap::from([
+                ("name".to_string(), string_value("alice")),
+                ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+                ("level".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(3.0)) }),
+                ("nothing".to_string(), prost_types::Value { kind: None }),
+            ]),
+        };
+
+        let map = struct_to_json(data);
+
+        assert_eq!(map.get("name"), Some(&serde_json::json!("alice")));
+        assert_eq!(map.get("active"), Some(&serde_json::json!(true)));
+        assert_eq!(map.get("level"), Some(&serde_json::json!(3.0)));
+        assert_eq!(map.get("nothing"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn struct_to_json_on_an_empty_struct_yields_an_empty_map() {
+        assert!(struct_to_json(prost_types::Struct::default()).is_empty());
+    }
+
+    #[test]
+    fn json_to_struct_is_the_inverse_of_struct_to_json() {
+        let original = serde_json::json!({
+            "roles": {"admin": ["user-1", "user-2"]},
+            "name": "alice",
+            "active": true,
+            "level": 3.0,
+            "nothing": null,
+        });
+        let map = original.as_object().cloned().expect("object");
+
+        let round_tripped = struct_to_json(json_to_struct(map));
+
+        assert_eq!(serde_json::Value::Object(round_tripped), original);
     }
 
     #[test]

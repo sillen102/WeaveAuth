@@ -23,7 +23,6 @@
 pub mod config;
 pub mod server;
 pub(crate) mod crypto;
-pub(crate) mod extra_data;
 pub(crate) mod plugin;
 pub(crate) mod model;
 pub(crate) mod oidc;

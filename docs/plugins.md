@@ -15,32 +15,59 @@ plugin mechanism constrains how you talk to your own systems.
 
 ## The contract
 
-One gRPC service, in
+One gRPC service, one rpc, in
 [`plugin-sdk/proto/weaveauth/plugin/plugin.proto`](../plugin-sdk/proto/weaveauth/plugin/plugin.proto):
 
 ```proto
 service Plugin {
-  rpc HandleRegistration(HandleRegistrationRequest) returns (HandleRegistrationResponse);
+  rpc Invoke(PluginRequest) returns (PluginResponse);
 }
 
-message HandleRegistrationRequest {
-  string user_id = 1;
-  string email = 2;
-  map<string, string> fields = 3;
+message PluginRequest {
+  string hook = 1;
+  string user_id = 2;
+  string email = 3;
+  google.protobuf.Struct data = 4;
+}
+
+message PluginResponse {
+  google.protobuf.Struct data = 1;
 }
 ```
 
+A new flow is a new `hook` value your plugin recognizes, not a new rpc: adding
+one (an email notification, say) never needs a proto change or a WeaveAuth
+release. A plugin only has to handle the hooks it's wired into; return
+`UNIMPLEMENTED` (or any other error) for the rest.
+
+### `hook: "registration"`
+
 - **Return `OK` to accept.** The user is then created with that `user_id`.
+  `data` in the response is ignored -- this hook only accepts/rejects.
 - **Return any other status to reject.** No user is created; the request gets
   `502`. A timeout, a crash or a plugin that isn't running rejects the same
   way.
-- `fields` is bounded before your plugin sees it: at most 50 entries, each key
-  and value at most 4096 bytes.
+- `data`'s fields are bounded before your plugin sees it: at most 50 entries,
+  each key and value at most 4096 bytes.
 - Your plugin runs *before* the user exists. Registration is only committed
   once you accept, which is what makes it atomic.
 
-A plugin only has to implement the rpcs for the flows it is wired into; both
-SDKs give you `UNIMPLEMENTED` for the rest.
+### `hook: "login_claims"`
+
+- Called on **every token mint** — both the initial `authorization_code`
+  exchange and every `refresh_token` grant. The request's `data` is unset;
+  there's nothing beyond `user_id`/`email` to send.
+- **Return `OK` with `data` set to add extra JWT claims.** `data` is a
+  `google.protobuf.Struct`, so values can nest (e.g.
+  `{"roles": {"admin": ["user-1", "user-2"]}}`), not just flat strings.
+- **Return any other status, or a claim name that collides with a reserved
+  one** (`sub`, `email`, `email_verified`, `iat`, `exp`) **to fail the
+  request.** No token is issued; the request gets `502`. This is
+  fail-closed by design: a token must not be minted without the claims it
+  was configured to carry, and a plugin can't spoof identity claims by
+  returning a reserved name.
+- An unset `data` field in the response is treated as no extra claims, not an
+  error.
 
 ## Running
 
@@ -68,12 +95,11 @@ socket is running as the same user, and could read the token out of
 [dependencies]
 weaveauth-plugin-sdk = { git = "https://github.com/sillen102/WeaveAuth" }
 tokio = { version = "1", features = ["full"] }
+prost-types = "0.14" # for reading/building `data`'s google.protobuf.Struct
 ```
 
 ```rust
-use weaveauth_plugin_sdk::{
-    HandleRegistrationRequest, HandleRegistrationResponse, Plugin, Request, Response, Status, serve,
-};
+use weaveauth_plugin_sdk::{Plugin, PluginRequest, PluginResponse, Request, Response, Status, serve};
 
 struct Register {
     pool: deadpool_postgres::Pool,
@@ -81,27 +107,63 @@ struct Register {
 
 #[weaveauth_plugin_sdk::async_trait]
 impl Plugin for Register {
-    async fn handle_registration(
-        &self,
-        request: Request<HandleRegistrationRequest>,
-    ) -> Result<Response<HandleRegistrationResponse>, Status> {
-        let registration = request.into_inner();
+    async fn invoke(&self, request: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+        let request = request.into_inner();
+        match request.hook.as_str() {
+            "registration" => self.handle_registration(request).await,
+            "login_claims" => self.handle_login_claims(request).await,
+            other => Err(Status::unimplemented(format!("unhandled hook {other:?}"))),
+        }
+    }
+}
 
-        let Some(company) = registration.fields.get("company").filter(|value| !value.is_empty()) else {
+impl Register {
+    async fn handle_registration(&self, request: PluginRequest) -> Result<Response<PluginResponse>, Status> {
+        let company = match request.data.as_ref().and_then(|data| data.fields.get("company")) {
+            Some(prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(company)) })
+                if !company.is_empty() =>
+            {
+                company
+            }
             // Rejecting fails the whole registration; no user is created.
-            return Err(Status::invalid_argument("company is required"));
+            _ => return Err(Status::invalid_argument("company is required")),
         };
 
         let client = self.pool.get().await.map_err(|e| Status::unavailable(e.to_string()))?;
         client
             .execute(
                 "insert into profile (user_id, email, company) values ($1, $2, $3)",
-                &[&registration.user_id, &registration.email, company],
+                &[&request.user_id, &request.email, company],
             )
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
-        Ok(Response::new(HandleRegistrationResponse {}))
+        Ok(Response::new(PluginResponse { data: None }))
+    }
+
+    async fn handle_login_claims(&self, request: PluginRequest) -> Result<Response<PluginResponse>, Status> {
+        let client = self.pool.get().await.map_err(|e| Status::unavailable(e.to_string()))?;
+        let row = client
+            .query_opt("select roles from profile where user_id = $1", &[&request.user_id])
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        let roles: Vec<String> = row.map(|row| row.get("roles")).unwrap_or_default();
+
+        let data = prost_types::Struct {
+            fields: [(
+                "roles".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue {
+                        values: roles
+                            .into_iter()
+                            .map(|role| prost_types::Value { kind: Some(prost_types::value::Kind::StringValue(role)) })
+                            .collect(),
+                    })),
+                },
+            )]
+            .into(),
+        };
+        Ok(Response::new(PluginResponse { data: Some(data) }))
     }
 }
 
@@ -138,10 +200,12 @@ import (
 	"log"
 	"os"
 
+	"github.com/lib/pq"
 	weaveauth "github.com/sillen102/WeaveAuth/plugin-sdk/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	weaveauthv1 "example.com/myplugin/gen/weaveauth/plugin"
 )
@@ -151,11 +215,19 @@ type plugin struct {
 	db *sql.DB
 }
 
-func (p *plugin) HandleRegistration(
-	ctx context.Context,
-	req *weaveauthv1.HandleRegistrationRequest,
-) (*weaveauthv1.HandleRegistrationResponse, error) {
-	company := req.Fields["company"]
+func (p *plugin) Invoke(ctx context.Context, req *weaveauthv1.PluginRequest) (*weaveauthv1.PluginResponse, error) {
+	switch req.Hook {
+	case "registration":
+		return p.handleRegistration(ctx, req)
+	case "login_claims":
+		return p.handleLoginClaims(ctx, req)
+	default:
+		return nil, status.Error(codes.Unimplemented, "unhandled hook "+req.Hook)
+	}
+}
+
+func (p *plugin) handleRegistration(ctx context.Context, req *weaveauthv1.PluginRequest) (*weaveauthv1.PluginResponse, error) {
+	company := req.Data.GetFields()["company"].GetStringValue()
 	if company == "" {
 		return nil, status.Error(codes.InvalidArgument, "company is required")
 	}
@@ -166,7 +238,21 @@ func (p *plugin) HandleRegistration(
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	return &weaveauthv1.HandleRegistrationResponse{}, nil
+	return &weaveauthv1.PluginResponse{}, nil
+}
+
+func (p *plugin) handleLoginClaims(ctx context.Context, req *weaveauthv1.PluginRequest) (*weaveauthv1.PluginResponse, error) {
+	var roles []string
+	err := p.db.QueryRowContext(ctx, "select roles from profile where user_id = $1", req.UserId).Scan(pq.Array(&roles))
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+
+	data, err := structpb.NewStruct(map[string]any{"roles": roles})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &weaveauthv1.PluginResponse{Data: data}, nil
 }
 
 func main() {
@@ -199,7 +285,17 @@ extra_data_handler:
     DATABASE_URL: postgres://plugin:secret@db/appdata
   timeout_secs: 5          # default 5, deadline on one call
   startup_timeout_secs: 10 # default 10, how long it has to start listening
+
+login_claims_handler:
+  kind: process
+  command: /plugins/login-claims
+  timeout_secs: 5
+  startup_timeout_secs: 10
 ```
+
+A single binary can implement both the `"registration"` and `"login_claims"`
+hooks -- pointing both `command:`s at it spawns two separate processes of it,
+each only ever called for its own hook.
 
 ```bash
 docker run -v ./register:/plugins/register \
@@ -220,7 +316,8 @@ for anything that isn't secret.
 
 Any variable in **WeaveAuth's own environment** named
 `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` is forwarded to that plugin as `<NAME>`, with
-the prefix stripped. The plugin behind `extra_data_handler` is `REGISTRATION`:
+the prefix stripped. The plugin behind `extra_data_handler` is `REGISTRATION`,
+and the one behind `login_claims_handler` is `LOGIN_CLAIMS`:
 
 ```bash
 WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL=postgres://plugin:secret@db/appdata

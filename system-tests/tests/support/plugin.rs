@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use weaveauth::config::ExtraDataHandlerConfig;
+use weaveauth::config::{ExtraDataHandlerConfig, LoginClaimsHandlerConfig};
 
 /// The probe plugin, built as a bin target of this package -- so it is
 /// already compiled by the time a test runs, and always from this source
@@ -16,6 +16,17 @@ pub fn plugin_handler(command: &str, env: HashMap<String, String>, timeout_secs:
         command: command.to_string(),
         args: vec![],
         env,
+        timeout_secs,
+        startup_timeout_secs: 10,
+    }
+}
+
+/// A backend `login_claims_handler` running `command`.
+pub fn login_claims_handler(command: &str, timeout_secs: u64) -> LoginClaimsHandlerConfig {
+    LoginClaimsHandlerConfig::Process {
+        command: command.to_string(),
+        args: vec![],
+        env: HashMap::new(),
         timeout_secs,
         startup_timeout_secs: 10,
     }

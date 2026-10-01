@@ -19,7 +19,8 @@ same-origin/trusted before use).
 
 - bff asks backend (server-to-server) for the provider's consent-screen URL.
 - backend builds that URL via the `oauth2` crate, which generates the
-  `state` CSRF token and PKCE verifier internally. Backend stores
+  `state` CSRF token and PKCE verifier internally, and requests `openid`
+  plus the provider's configured `scopes` (default `email`, `profile`). Backend stores
   `state -> {provider, pkce_verifier, nonce}` server-side
   (`oidc_state.save_state`) and returns the authorize URL in a redirect.
 - bff pulls `state` back out of that URL's query string and redirects the
@@ -50,6 +51,12 @@ redirects the browser here with `code` + `state`.
     against backend's own record rather than a cookie;
   - completes the PKCE code exchange and OIDC claims verification with the
     provider;
+  - if the login is for a new user and the provider has `extra_claims`
+    configured (`field name -> id_token claim name`), hands those claims to
+    the `extra_data_handler` as the registration fields, *before* the user
+    is created (with the id it will get). A handler failure fails the
+    callback (`502`) and no user is created, so the downstream service and
+    WeaveAuth never disagree about whether the user exists;
   - resolves the verified email against existing users.
 - Two outcomes:
   - **Authenticated** -- `complete_login` runs (mirrors a password login),

@@ -1,5 +1,6 @@
 pub(crate) use controller::issue_token;
 pub(crate) use controller::issue_token_doc;
+pub(crate) use login_claims::{LoginClaimsHandler, PLUGIN_NAME, ProcessHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -52,6 +53,15 @@ mod controller {
         #[error("invalid or expired refresh token")]
         #[error_response(StatusCode::BAD_REQUEST, details = "invalid or expired refresh token")]
         InvalidRefreshToken,
+        #[error("downstream login-claims handler failed")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "downstream login-claims handler failed")]
+        DownstreamServiceFailed,
+        #[error("downstream login-claims handler returned a reserved claim name")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "downstream login-claims handler returned a reserved claim name"
+        )]
+        ReservedClaimOverridden,
         #[error("internal error")]
         #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
         UnexpectedError,
@@ -59,12 +69,17 @@ mod controller {
 
     impl From<TokenServiceError> for TokenError {
         fn from(err: TokenServiceError) -> Self {
+            if let TokenServiceError::DownstreamServiceFailed(_) | TokenServiceError::ReservedClaimOverridden(_) = &err {
+                tracing::warn!(%err, "token request failed");
+            }
             match err {
                 TokenServiceError::InvalidCode => TokenError::InvalidCode,
                 TokenServiceError::RedirectUriMismatch => TokenError::RedirectUriMismatch,
                 TokenServiceError::InvalidCodeVerifier => TokenError::InvalidCodeVerifier,
                 TokenServiceError::MissingParameters => TokenError::MissingParameters,
                 TokenServiceError::InvalidRefreshToken => TokenError::InvalidRefreshToken,
+                TokenServiceError::DownstreamServiceFailed(_) => TokenError::DownstreamServiceFailed,
+                TokenServiceError::ReservedClaimOverridden(_) => TokenError::ReservedClaimOverridden,
                 TokenServiceError::UnexpectedError => TokenError::UnexpectedError,
             }
         }
@@ -131,11 +146,22 @@ mod service {
         MissingParameters,
         #[error("invalid or expired refresh token")]
         InvalidRefreshToken,
+        #[error("downstream login-claims handler failed: {0}")]
+        DownstreamServiceFailed(String),
+        #[error("downstream login-claims handler returned reserved claim name '{0}'")]
+        ReservedClaimOverridden(String),
         #[error("internal error")]
         UnexpectedError,
     }
 
-    /// Access token claims (RFC 7519).
+    /// Claim names this crate assigns itself -- a login-claims handler
+    /// (`super::login_claims`) that returns one of these would let a
+    /// downstream plugin/webhook spoof identity claims, so a collision fails
+    /// the token request instead of silently overwriting one.
+    const RESERVED_CLAIM_NAMES: &[&str] = &["sub", "email", "email_verified", "iat", "exp"];
+
+    /// Access token claims (RFC 7519), plus whatever the configured
+    /// login-claims handler (see `super::login_claims`) added.
     #[derive(Serialize)]
     struct Claims {
         sub: Uuid,
@@ -148,6 +174,8 @@ mod service {
         email_verified: bool,
         iat: i64,
         exp: i64,
+        #[serde(flatten)]
+        extra: std::collections::HashMap<String, serde_json::Value>,
     }
 
     pub(crate) struct AuthorizationCodeGrant {
@@ -222,6 +250,17 @@ mod service {
     ) -> Result<TokenResponse, TokenServiceError> {
         let user = state.users.get_user_by_id(user_id).await.ok_or(TokenServiceError::UnexpectedError)?;
 
+        let extra = match &state.login_claims_handler {
+            Some(handler) => {
+                let claims = handler.fetch(user_id, &user.email).await.map_err(|error| TokenServiceError::DownstreamServiceFailed(error.0))?;
+                if let Some(reserved) = claims.keys().find(|key| RESERVED_CLAIM_NAMES.contains(&key.as_str())) {
+                    return Err(TokenServiceError::ReservedClaimOverridden(reserved.clone()));
+                }
+                claims.into_iter().collect()
+            }
+            None => std::collections::HashMap::new(),
+        };
+
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
         let refresh_expires_at = issued_at + Duration::seconds(state.refresh_token_ttl_secs);
@@ -231,6 +270,7 @@ mod service {
             email_verified: user.email_verified,
             iat: issued_at.timestamp(),
             exp: expires_at.timestamp(),
+            extra,
         };
         let signing_key = state.jwt_keys.active_key().await;
         let mut header = Header::new(Algorithm::RS256);
@@ -257,6 +297,221 @@ mod service {
     }
 }
 
+/// Where extra JWT claims are fetched from on every token mint, over the
+/// generic plugin contract (`crate::plugin`) or a plain webhook. An error
+/// from either kind fails the whole token request -- no token is ever issued
+/// without the claims it's configured to carry.
+mod login_claims {
+    use std::time::Duration;
+
+    use serde::Serialize;
+    use uuid::Uuid;
+    use weaveauth_plugin_sdk::PluginRequest;
+
+    use crate::plugin::{self, PluginProcess};
+
+    /// Names this plugin surface in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables a
+    /// deployer sets. Upper case because environment variables are.
+    pub(crate) const PLUGIN_NAME: &str = "LOGIN_CLAIMS";
+
+    /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
+    const HOOK: &str = "login_claims";
+
+    /// Why the handler couldn't produce claims. Handlers only return it; it
+    /// is logged once, by the controller that turns it into a response.
+    /// Fetching claims fails closed: an error here fails the token request,
+    /// and no token is issued.
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    pub(crate) struct LoginClaimsError(pub(crate) String);
+
+    /// Implemented by whatever a deployer configures to supply extra JWT
+    /// claims at token issuance (see `config::LoginClaimsHandlerConfig`).
+    /// Called on every token mint (both `authorization_code` and
+    /// `refresh_token` grants). An error fails the whole request -- no token
+    /// is issued.
+    #[async_trait::async_trait]
+    pub(crate) trait LoginClaimsHandler: Send + Sync {
+        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError>;
+    }
+
+    /// Asks a deployer-supplied plugin process for extra JWT claims via the
+    /// generic `Invoke` rpc's `"login_claims"` hook. The deployer can write it
+    /// in any language with a gRPC server; WeaveAuth only needs the contract
+    /// in `plugin-sdk/proto` on the way in and a `google.protobuf.Struct` on
+    /// the way out.
+    pub(crate) struct ProcessHandler {
+        plugin: PluginProcess,
+    }
+
+    impl ProcessHandler {
+        pub(crate) fn new(plugin: PluginProcess) -> Self {
+            Self { plugin }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LoginClaimsHandler for ProcessHandler {
+        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+            let request =
+                PluginRequest { hook: HOOK.to_string(), user_id: user_id.to_string(), email: email.to_string(), data: None };
+
+            let response = self.plugin.invoke(request).await.map_err(|status| {
+                LoginClaimsError(format!("plugin rejected the login-claims request: {:?}: {}", status.code(), status.message()))
+            })?;
+
+            Ok(response.data.map(plugin::struct_to_json).unwrap_or_default())
+        }
+    }
+
+    /// The JSON body posted to the webhook.
+    #[derive(Serialize)]
+    struct LoginClaimsPayload<'a> {
+        user_id: Uuid,
+        email: &'a str,
+    }
+
+    /// Asks a deployer-configured HTTP endpoint for extra JWT claims. The
+    /// response body is expected to be a JSON object of claims to merge in;
+    /// any transport error, non-2xx response, or non-object body fails the
+    /// request.
+    pub(crate) struct WebhookHandler {
+        client: reqwest::Client,
+        url: String,
+    }
+
+    impl WebhookHandler {
+        pub(crate) fn new(url: String, timeout: Duration) -> anyhow::Result<Self> {
+            require_https_or_loopback(&url)?;
+
+            // No redirects: this is a server-to-server call to a
+            // deployer-configured (should be internal-only) target, so
+            // following a redirect elsewhere would be a request-forgery vector
+            // -- same reasoning as `oidc_http_client` in `server::AppState::new`.
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .build()?;
+            Ok(Self { client, url })
+        }
+    }
+
+    /// Same reasoning as `extra_data::webhook`'s check (`server::api::register`):
+    /// the request carries the user's email, so a plaintext hop to a
+    /// non-local host would ship that over the wire in the clear.
+    fn require_https_or_loopback(url: &str) -> anyhow::Result<()> {
+        let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid login-claims webhook url {url:?}: {e}"))?;
+        if parsed.scheme() == "https" {
+            return Ok(());
+        }
+        let is_loopback = match parsed.host() {
+            Some(url::Host::Domain(domain)) => domain == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if is_loopback {
+            return Ok(());
+        }
+        anyhow::bail!("login-claims webhook url {url:?} must use https (http is only allowed for loopback hosts)")
+    }
+
+    #[async_trait::async_trait]
+    impl LoginClaimsHandler for WebhookHandler {
+        async fn fetch(&self, user_id: Uuid, email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+            let payload = LoginClaimsPayload { user_id, email };
+            let response = self.client.post(&self.url).json(&payload).send().await.map_err(|error| {
+                LoginClaimsError(format!("login-claims webhook request to {} failed: {error}", self.url))
+            })?;
+
+            if !response.status().is_success() {
+                return Err(LoginClaimsError(format!("login-claims webhook {} returned {}", self.url, response.status())));
+            }
+
+            match response.json::<serde_json::Value>().await {
+                Ok(serde_json::Value::Object(claims)) => Ok(claims),
+                Ok(_) => Err(LoginClaimsError(format!("login-claims webhook {} did not return a JSON object", self.url))),
+                Err(error) => {
+                    Err(LoginClaimsError(format!("login-claims webhook {} response was not valid JSON: {error}", self.url)))
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        #[tokio::test]
+        async fn returns_the_claims_object_on_a_2xx_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"roles": ["admin"]})))
+                .mount(&server)
+                .await;
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+
+            let claims = handler.fetch(Uuid::new_v4(), "alice@example.com").await.expect("claims returned");
+
+            assert_eq!(claims.get("roles"), Some(&serde_json::json!(["admin"])));
+        }
+
+        #[tokio::test]
+        async fn fails_on_a_5xx_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+
+            let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn fails_when_the_body_is_not_a_json_object() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["not", "an", "object"])))
+                .mount(&server)
+                .await;
+            let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).expect("valid client");
+
+            let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn fails_when_the_endpoint_is_unreachable() {
+            let handler = WebhookHandler::new("http://127.0.0.1:1".to_string(), TIMEOUT).expect("valid client");
+
+            let result = handler.fetch(Uuid::new_v4(), "alice@example.com").await;
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn accepts_https_urls() {
+            assert!(require_https_or_loopback("https://internal.example.com/hook").is_ok());
+        }
+
+        #[test]
+        fn rejects_plain_http_for_a_non_loopback_host() {
+            assert!(require_https_or_loopback("http://internal.example.com/hook").is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::controller::*;
@@ -264,6 +519,7 @@ mod tests {
     use axum::extract::{Form, State};
     use common::model::token::GrantType;
 
+    use super::login_claims::{LoginClaimsError, LoginClaimsHandler};
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::User;
     use crate::server::AppState;
@@ -274,6 +530,28 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// A login-claims handler that always returns the same fixed claims,
+    /// for tests that need the merge path without a real plugin/webhook.
+    struct FixedClaimsHandler(serde_json::Map<String, serde_json::Value>);
+
+    #[async_trait::async_trait]
+    impl LoginClaimsHandler for FixedClaimsHandler {
+        async fn fetch(&self, _user_id: Uuid, _email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A login-claims handler that always fails, for tests pinning down the
+    /// fail-closed behavior.
+    struct FailingClaimsHandler;
+
+    #[async_trait::async_trait]
+    impl LoginClaimsHandler for FailingClaimsHandler {
+        async fn fetch(&self, _user_id: Uuid, _email: &str) -> Result<serde_json::Map<String, serde_json::Value>, LoginClaimsError> {
+            Err(LoginClaimsError("stub failed".to_string()))
+        }
+    }
 
     fn state() -> AppState {
         AppState {
@@ -287,12 +565,15 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
+            oidc_extra_claims: Arc::new(Default::default()),
+            oidc_scopes: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
+            login_claims_handler: None,
         }
     }
 
@@ -596,5 +877,139 @@ mod tests {
         // The still-unused sibling from the same family is dead too.
         let sibling = issue_token(State(state), Form(refresh_req(&second.refresh_token))).await;
         assert_eq!(sibling.err(), Some(TokenError::InvalidRefreshToken));
+    }
+
+    fn decode_claims(access_token: &str) -> serde_json::Value {
+        let payload = access_token.split('.').nth(1).expect("JWT has a payload segment");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("valid base64")).expect("valid JSON")
+    }
+
+    #[tokio::test]
+    async fn merges_login_claims_handler_output_into_the_access_token() {
+        let (mut state, user_id) = state_with_user().await;
+        let claims = serde_json::Map::from_iter([("roles".to_string(), serde_json::json!({"admin": ["user-1"]}))]);
+        state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+
+        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+
+        let decoded = decode_claims(&body.access_token);
+        assert_eq!(decoded["roles"]["admin"], serde_json::json!(["user-1"]));
+    }
+
+    // No handler configured: the merge path must be a no-op, not an error and
+    // not a spurious `extra` key in the token.
+    #[tokio::test]
+    async fn issues_a_token_with_no_extra_claims_when_no_handler_is_configured() {
+        let (mut state, user_id) = state_with_user().await;
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+
+        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+
+        let decoded = decode_claims(&body.access_token);
+        assert_eq!(
+            decoded.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["sub", "email", "email_verified", "iat", "exp"])
+        );
+    }
+
+    // Fail-closed: a login-claims handler configured but unreachable must
+    // fail the request, not silently issue a token without the claims it was
+    // configured to carry.
+    #[tokio::test]
+    async fn login_claims_handler_failure_fails_the_token_request() {
+        let (mut state, user_id) = state_with_user().await;
+        state.login_claims_handler = Some(Arc::new(FailingClaimsHandler));
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+
+        let result = issue_token(State(state), Form(req)).await;
+
+        assert_eq!(result.err(), Some(TokenError::DownstreamServiceFailed));
+    }
+
+    // A plugin/webhook that returns a reserved claim name (e.g. `sub`) could
+    // otherwise spoof identity claims -- the request must fail instead of
+    // silently letting the downstream value win or lose the merge.
+    #[tokio::test]
+    async fn a_reserved_claim_name_from_the_handler_fails_the_token_request() {
+        let (mut state, user_id) = state_with_user().await;
+        let claims = serde_json::Map::from_iter([("sub".to_string(), serde_json::json!("attacker-controlled"))]);
+        state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+
+        let result = issue_token(State(state), Form(req)).await;
+
+        assert_eq!(result.err(), Some(TokenError::ReservedClaimOverridden));
+    }
+
+    // "Every token mint" (the locked design decision): a refresh grant must
+    // also go through the login-claims handler, not just the initial
+    // authorization_code exchange.
+    #[tokio::test]
+    async fn refresh_grant_also_merges_login_claims_handler_output() {
+        let (mut state, user_id) = state_with_user().await;
+        let claims = serde_json::Map::from_iter([("roles".to_string(), serde_json::json!(["admin"]))]);
+        state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let Json(first) = issue_token(
+            State(state.clone()),
+            Form(code_req("code1", "correct-verifier", "http://redirect.test")),
+        )
+        .await
+        .unwrap();
+
+        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token))).await.unwrap();
+
+        let decoded = decode_claims(&second.access_token);
+        assert_eq!(decoded["roles"], serde_json::json!(["admin"]));
     }
 }

@@ -25,6 +25,18 @@
         <label for="password">Password</label>
         <input type="password" id="password" name="password" autocomplete="new-password" required minlength="8">
       </div>
+      <div>
+        <label for="first_name">First name</label>
+        <input type="text" id="first_name" name="first_name" autocomplete="given-name" required>
+      </div>
+      <div>
+        <label for="last_name">Last name</label>
+        <input type="text" id="last_name" name="last_name" autocomplete="family-name" required>
+      </div>
+      <div>
+        <label for="phone_number">Phone number</label>
+        <input type="tel" id="phone_number" name="phone_number" autocomplete="tel" required>
+      </div>
       <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
       <input type="hidden" name="next" value="{{ own_url }}">
       <button class="btn" type="submit">Create account</button>

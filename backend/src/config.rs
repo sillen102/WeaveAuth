@@ -59,6 +59,10 @@ pub struct Config {
     /// supported -- a register request carrying any is rejected.
     #[serde(default)]
     pub extra_data_handler: Option<ExtraDataHandlerConfig>,
+    /// Where extra JWT claims are fetched from on every token mint. `None`
+    /// means no extra claims are added.
+    #[serde(default)]
+    pub login_claims_handler: Option<LoginClaimsHandlerConfig>,
 }
 
 /// Where extra registration fields are forwarded. An error from either kind
@@ -103,6 +107,49 @@ pub enum ExtraDataHandlerConfig {
     },
 }
 
+/// Where extra JWT claims are fetched from on every token mint (both
+/// `authorization_code` and `refresh_token` grants). An error from either
+/// kind fails the token request -- no token is ever issued without the
+/// claims it's configured to carry. See `login_claims`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoginClaimsHandlerConfig {
+    /// POSTs `{user_id, email}` as JSON to this URL and expects a JSON
+    /// object of claims back. Must be `https://` unless the host is
+    /// loopback (`localhost`/127.0.0.1/::1) -- the request carries the
+    /// user's email, so a plaintext `http://` hop to a non-local host would
+    /// ship that over the wire in the clear.
+    Webhook {
+        url: String,
+        /// How long to wait for the webhook before failing the token
+        /// request -- a hung endpoint must not hold the request open
+        /// indefinitely.
+        #[serde(default = "default_webhook_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// Runs the executable at `command` as a child process and calls it
+    /// over gRPC (see `plugin`).
+    Process {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The plugin's entire environment -- it inherits nothing from
+        /// WeaveAuth, so a database URL or an API token the plugin needs
+        /// goes here.
+        #[serde(default)]
+        env: HashMap<String, String>,
+        /// How long a single call to the plugin may take before the token
+        /// request fails.
+        #[serde(default = "default_plugin_timeout_secs")]
+        timeout_secs: u64,
+        /// How long the plugin has to start listening at startup. A plugin
+        /// that misses it stops the server from booting, rather than
+        /// surfacing as failed logins later.
+        #[serde(default = "default_plugin_startup_timeout_secs")]
+        startup_timeout_secs: u64,
+    },
+}
+
 fn default_webhook_timeout_secs() -> u64 {
     10
 }
@@ -129,6 +176,22 @@ pub struct OidcProviderConfig {
     /// not backend's own address. bff forwards the provider's callback
     /// request to backend's matching route server-to-server.
     pub redirect_uri: String,
+    /// Extra profile fields to take from this provider's id_token, as
+    /// `field name -> id_token claim name` (e.g. `last_name: family_name`).
+    /// Claim names differ per provider, so nothing is forwarded by default.
+    /// On a user's first login through this provider the fields are handed to
+    /// the extra-data handler, same as a register request's extra fields.
+    #[serde(default)]
+    pub extra_claims: HashMap<String, String>,
+    /// Scopes requested on this provider's consent screen, in addition to
+    /// `openid` (always sent). The default covers the email and name claims
+    /// WeaveAuth relies on; changing it replaces the list, so keep `email`.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["email".to_string(), "profile".to_string()]
 }
 
 impl Default for Config {
@@ -147,6 +210,7 @@ impl Default for Config {
             oidc_providers: HashMap::new(),
             max_bcrypt_cost: bcrypt::DEFAULT_COST,
             extra_data_handler: None,
+            login_claims_handler: None,
         }
     }
 }
@@ -356,6 +420,54 @@ mod tests {
             assert_eq!(google.client_secret.expose_secret(), "my-client-secret");
             assert_eq!(google.issuer, "https://accounts.google.com");
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
+            assert!(google.extra_claims.is_empty());
+            assert_eq!(google.scopes, vec!["email".to_string(), "profile".to_string()]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_oidc_providers_scopes_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  \
+                 google:\n    \
+                 client_id: my-client-id\n    \
+                 client_secret: my-client-secret\n    \
+                 issuer: https://accounts.google.com\n    \
+                 redirect_uri: http://bff.test/oidc/google/callback\n    \
+                 scopes:\n      \
+                 - email\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            assert_eq!(google.scopes, vec!["email".to_string()]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_oidc_providers_extra_claims_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  \
+                 google:\n    \
+                 client_id: my-client-id\n    \
+                 client_secret: my-client-secret\n    \
+                 issuer: https://accounts.google.com\n    \
+                 redirect_uri: http://bff.test/oidc/google/callback\n    \
+                 extra_claims:\n      \
+                 last_name: family_name\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            assert_eq!(google.extra_claims.get("last_name").map(String::as_str), Some("family_name"));
             Ok(())
         });
     }
@@ -475,6 +587,62 @@ mod tests {
                     assert_eq!(args, vec!["--verbose".to_string()]);
                     assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
                     assert_eq!(timeout_secs, 20);
+                }
+                other => unreachable!("only a process handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn defaults_to_no_login_claims_handler() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+
+            let config = Config::load().unwrap();
+            assert!(config.login_claims_handler.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_webhook_login_claims_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "login_claims_handler:\n  kind: webhook\n  url: https://internal.test/claims\n  timeout_secs: 3\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.login_claims_handler.expect("handler configured") {
+                LoginClaimsHandlerConfig::Webhook { url, timeout_secs } => {
+                    assert_eq!(url, "https://internal.test/claims");
+                    assert_eq!(timeout_secs, 3);
+                }
+                other => unreachable!("only a webhook handler was configured, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_process_login_claims_handler_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "login_claims_handler:\n  kind: process\n  command: /opt/plugins/claims\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.login_claims_handler.expect("handler configured") {
+                LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                    assert_eq!(command, "/opt/plugins/claims");
+                    assert_eq!(timeout_secs, 5);
+                    assert_eq!(startup_timeout_secs, 10);
+                    assert!(args.is_empty());
+                    assert!(env.is_empty(), "a plugin is given no environment unless the deployer sets one");
                 }
                 other => unreachable!("only a process handler was configured, got {other:?}"),
             }

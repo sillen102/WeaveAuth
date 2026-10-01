@@ -7,24 +7,30 @@
 //! async runtime, its own connection pools and whatever crates it likes --
 //! `tokio-postgres`, `deadpool`, `lapin`, a vendor SDK.
 //!
+//! One generic rpc, [`Plugin::invoke`], serves every flow -- `request.hook`
+//! says which one, so adding a flow (registration, login claims, an email
+//! notification, ...) is a new hook name a plugin recognizes, not a new rpc.
+//!
 //! ```no_run
-//! use weaveauth_plugin_sdk::{
-//!     HandleRegistrationRequest, HandleRegistrationResponse, Request, Response, Status, serve,
-//! };
+//! use weaveauth_plugin_sdk::{PluginRequest, PluginResponse, Request, Response, Status, serve};
 //!
 //! struct MyPlugin;
 //!
 //! #[weaveauth_plugin_sdk::async_trait]
 //! impl weaveauth_plugin_sdk::Plugin for MyPlugin {
-//!     async fn handle_registration(
-//!         &self,
-//!         request: Request<HandleRegistrationRequest>,
-//!     ) -> Result<Response<HandleRegistrationResponse>, Status> {
-//!         let registration = request.into_inner();
-//!         if registration.fields.get("company").is_none_or(String::is_empty) {
-//!             return Err(Status::invalid_argument("company is required"));
+//!     async fn invoke(&self, request: Request<PluginRequest>) -> Result<Response<PluginResponse>, Status> {
+//!         let request = request.into_inner();
+//!         match request.hook.as_str() {
+//!             "registration" => {
+//!                 let has_company = request.data.as_ref().is_some_and(|data| data.fields.contains_key("company"));
+//!                 if !has_company {
+//!                     // Rejecting fails the whole registration; no user is created.
+//!                     return Err(Status::invalid_argument("company is required"));
+//!                 }
+//!                 Ok(Response::new(PluginResponse { data: None }))
+//!             }
+//!             other => Err(Status::unimplemented(format!("unhandled hook {other:?}"))),
 //!         }
-//!         Ok(Response::new(HandleRegistrationResponse {}))
 //!     }
 //! }
 //!

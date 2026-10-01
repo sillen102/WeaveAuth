@@ -58,15 +58,22 @@ mod controller {
             details = "oidc provider did not return a verified email"
         )]
         EmailNotVerified,
+        #[error("downstream extra-data handler rejected the new user")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "downstream extra-data handler rejected the new user")]
+        DownstreamServiceFailed,
     }
 
     impl From<service::OidcServiceError> for OidcError {
         fn from(err: service::OidcServiceError) -> Self {
+            if let service::OidcServiceError::ExchangeFailed(_) | service::OidcServiceError::DownstreamServiceFailed(_) = &err {
+                tracing::warn!(%err, "oidc callback failed");
+            }
             match err {
                 service::OidcServiceError::UnknownProvider => OidcError::UnknownProvider,
                 service::OidcServiceError::InvalidState => OidcError::InvalidState,
-                service::OidcServiceError::ExchangeFailed => OidcError::ExchangeFailed,
+                service::OidcServiceError::ExchangeFailed(_) => OidcError::ExchangeFailed,
                 service::OidcServiceError::EmailNotVerified => OidcError::EmailNotVerified,
+                service::OidcServiceError::DownstreamServiceFailed(_) => OidcError::DownstreamServiceFailed,
             }
         }
     }
@@ -158,7 +165,9 @@ mod controller {
 }
 
 mod service {
-    use openidconnect::core::CoreAuthenticationFlow;
+    use std::collections::HashMap;
+
+    use openidconnect::core::{CoreAuthenticationFlow, CoreIdToken};
     use openidconnect::{
         AuthorizationCode, CsrfToken, Nonce, PkceCodeChallenge, PkceCodeVerifier, Scope,
         TokenResponse,
@@ -181,8 +190,8 @@ mod service {
         UnknownProvider,
         #[error("invalid or expired oidc state")]
         InvalidState,
-        #[error("oidc token exchange or id token verification failed")]
-        ExchangeFailed,
+        #[error("oidc token exchange or id token verification failed: {0}")]
+        ExchangeFailed(String),
         /// Accounts are linked across providers by email (see
         /// `UserStorage::resolve_oidc_login`), so an id_token whose email
         /// isn't provider-confirmed can't be trusted for that -- rather than
@@ -192,6 +201,8 @@ mod service {
         /// something is misconfigured (e.g. missing the `email` scope).
         #[error("oidc provider did not return a verified email")]
         EmailNotVerified,
+        #[error("downstream extra-data handler rejected the new user: {0}")]
+        DownstreamServiceFailed(String),
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -225,14 +236,14 @@ mod service {
             .ok_or(OidcServiceError::UnknownProvider)?;
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let scopes = state.oidc_scopes.get(&provider).into_iter().flatten().cloned().map(Scope::new);
         let (auth_url, csrf_token, nonce) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
                 Nonce::new_random,
             )
-            .add_scope(Scope::new("email".to_string()))
-            .add_scope(Scope::new("profile".to_string()))
+            .add_scopes(scopes)
             .set_pkce_challenge(pkce_challenge)
             .url();
 
@@ -273,13 +284,15 @@ mod service {
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.expose_secret().to_string()))
             .request_async(&*state.oidc_http_client)
             .await
-            .map_err(|_| OidcServiceError::ExchangeFailed)?;
+            .map_err(|error| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' code exchange: {error}")))?;
 
-        let id_token = token_response.id_token().ok_or(OidcServiceError::ExchangeFailed)?;
+        let id_token = token_response
+            .id_token()
+            .ok_or_else(|| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' returned no id_token")))?;
         let verifier = client.id_token_verifier();
         let claims = id_token
             .claims(&verifier, &Nonce::new(login_state.nonce.expose_secret().to_string()))
-            .map_err(|_| OidcServiceError::ExchangeFailed)?;
+            .map_err(|error| OidcServiceError::ExchangeFailed(format!("provider '{stored_provider}' id_token: {error}")))?;
 
         // Accounts are linked across providers by matching this email against
         // existing users (see `resolve_oidc_login`), so it must be one the
@@ -294,8 +307,17 @@ mod service {
         let verified_email =
             VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true)).ok_or(OidcServiceError::EmailNotVerified)?;
         let subject = claims.subject().as_str();
+        let is_new_user = state.users.get_user_by_email(&email).await.is_none();
+        let profile = profile_fields(id_token, state.oidc_extra_claims.get(&stored_provider));
 
-        let response = match state.users.resolve_oidc_login(&stored_provider, subject, &verified_email).await {
+        // The handler hears about a new user before the user exists, so a
+        // rejection leaves nothing behind -- same order as password registration.
+        let new_user_id = uuid::Uuid::new_v4();
+        if is_new_user && !profile.is_empty() {
+            forward_profile(state, new_user_id, &email, &profile).await?;
+        }
+
+        let response = match state.users.resolve_oidc_login(&stored_provider, subject, &verified_email, new_user_id).await {
             OidcLinkOutcome::Resolved(user) => {
                 let login_session = state.login_sessions.create_session(user.id).await;
                 OidcCallbackResponse::Authenticated { login_session }
@@ -310,6 +332,39 @@ mod service {
         };
 
         Ok(response)
+    }
+
+    /// Reads the id_token claims the deployer mapped for this provider
+    /// (`OidcProviderConfig::extra_claims`). Only called with a token whose
+    /// signature `IdToken::claims` has already verified; scalar claims are
+    /// stringified, anything else is skipped.
+    fn profile_fields(id_token: &CoreIdToken, mapping: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+        use base64::Engine;
+        let payload = id_token
+            .to_string()
+            .split('.')
+            .nth(1)
+            .and_then(|segment| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let (Some(payload), Some(mapping)) = (payload, mapping) else { return HashMap::new() };
+        mapping
+            .iter()
+            .filter_map(|(field, claim)| match payload.get(claim)? {
+                serde_json::Value::String(value) => Some((field.clone(), value.clone())),
+                value @ (serde_json::Value::Bool(_) | serde_json::Value::Number(_)) => Some((field.clone(), value.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn forward_profile(
+        state: &AppState,
+        user_id: uuid::Uuid,
+        email: &str,
+        profile: &HashMap<String, String>,
+    ) -> Result<(), OidcServiceError> {
+        let Some(handler) = state.extra_data_handler.as_ref() else { return Ok(()) };
+        handler.handle(user_id, email, profile).await.map_err(|error| OidcServiceError::DownstreamServiceFailed(error.0))
     }
 
     /// Finishes linking an OIDC identity that `oidc_callback` flagged as
@@ -381,12 +436,15 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             oidc_providers: Arc::new(HashMap::new()),
+            oidc_extra_claims: Arc::new(Default::default()),
+            oidc_scopes: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
             password_reset_tokens: crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
+            login_claims_handler: None,
         }
     }
 
@@ -517,6 +575,8 @@ mod tests {
             nonce: &'a str,
             email: &'a str,
             email_verified: bool,
+            given_name: &'a str,
+            family_name: &'a str,
         }
 
         let now = chrono::Utc::now();
@@ -529,6 +589,8 @@ mod tests {
             nonce,
             email,
             email_verified,
+            given_name: "Alice",
+            family_name: "Liddell",
         };
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         header.kid = Some(signing_key.kid.clone());
@@ -552,6 +614,8 @@ mod tests {
                 client_id: "client-id".to_string(),
                 client_secret: secrecy::SecretString::from("client-secret".to_string()),
                 redirect_uri: "http://localhost/callback".to_string(),
+                extra_claims: HashMap::new(),
+                scopes: vec!["email".to_string()],
             },
         );
         let http_client = openidconnect::reqwest::Client::new();
@@ -588,6 +652,94 @@ mod tests {
         else {
             unreachable!("expected Authenticated");
         };
+    }
+
+    struct RecordingHandler {
+        calls: std::sync::Mutex<Vec<(uuid::Uuid, std::collections::HashMap<String, String>)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::api::register::ExtraDataHandler for RecordingHandler {
+        async fn handle(
+            &self,
+            user_id: uuid::Uuid,
+            _email: &str,
+            fields: &HashMap<String, String>,
+        ) -> Result<(), crate::server::api::register::ExtraDataError> {
+            self.calls.lock().unwrap().push((user_id, fields.clone()));
+            if self.fail { Err(crate::server::api::register::ExtraDataError("stub rejected".to_string())) } else { Ok(()) }
+        }
+    }
+
+    async fn run_callback(state: &AppState, csrf: &str) -> Result<(), OidcError> {
+        state
+            .oidc_state
+            .clone()
+            .save_state(csrf.to_string(), "test-provider".to_string(), "verifier".to_string(), "test-nonce".to_string())
+            .await;
+        let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: csrf.to_string() };
+        oidc_callback(State(state.clone()), Path("test-provider".to_string()), Query(query)).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn login_requests_the_providers_configured_scopes() {
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state.oidc_scopes = Arc::new(HashMap::from([(
+            "test-provider".to_string(),
+            vec!["email".to_string(), "https://example.com/phone".to_string()],
+        )]));
+
+        let auth_url = super::service::oidc_login(&mut state, "test-provider".to_string()).await.expect("login starts");
+
+        let url = url::Url::parse(&auth_url).expect("valid url");
+        let scope = url.query_pairs().find(|(key, _)| key == "scope").expect("scope param").1.into_owned();
+        assert_eq!(scope, "openid email https://example.com/phone");
+    }
+
+    #[tokio::test]
+    async fn first_oidc_login_forwards_profile_claims_to_the_extra_data_handler_once() {
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state.oidc_extra_claims = Arc::new(HashMap::from([(
+            "test-provider".to_string(),
+            HashMap::from([
+                ("first_name".to_string(), "given_name".to_string()),
+                ("surname".to_string(), "family_name".to_string()),
+            ]),
+        )]));
+        let handler = Arc::new(RecordingHandler { calls: Default::default(), fail: false });
+        state.extra_data_handler = Some(handler.clone());
+
+        run_callback(&state, "csrf-1").await.expect("callback succeeds");
+        run_callback(&state, "csrf-2").await.expect("callback succeeds");
+
+        let created = state.users.get_user_by_email("alice@example.com").await.expect("user created");
+        let calls = handler.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the login that creates the user forwards claims");
+        assert_eq!(calls[0].0, created.id, "handler is told the id the user is created with");
+        assert_eq!(calls[0].1.get("first_name").map(String::as_str), Some("Alice"));
+        assert_eq!(calls[0].1.get("surname").map(String::as_str), Some("Liddell"));
+    }
+
+    #[tokio::test]
+    async fn failing_extra_data_handler_fails_the_login_and_creates_no_user() {
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state.oidc_extra_claims = Arc::new(HashMap::from([(
+            "test-provider".to_string(),
+            HashMap::from([("first_name".to_string(), "given_name".to_string())]),
+        )]));
+        state.extra_data_handler = Some(Arc::new(RecordingHandler { calls: Default::default(), fail: true }));
+
+        let result = run_callback(&state, "csrf-1").await;
+
+        assert_eq!(result, Err(OidcError::DownstreamServiceFailed));
+        assert!(state.users.get_user_by_email("alice@example.com").await.is_none());
     }
 
     #[tokio::test]
