@@ -183,6 +183,15 @@ pub struct OidcProviderConfig {
     /// the extra-data handler, same as a register request's extra fields.
     #[serde(default)]
     pub extra_claims: HashMap<String, String>,
+    /// Scopes requested on this provider's consent screen, in addition to
+    /// `openid` (always sent). The default covers the email and name claims
+    /// WeaveAuth relies on; changing it replaces the list, so keep `email`.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["email".to_string(), "profile".to_string()]
 }
 
 impl Default for Config {
@@ -412,6 +421,30 @@ mod tests {
             assert_eq!(google.issuer, "https://accounts.google.com");
             assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
             assert!(google.extra_claims.is_empty());
+            assert_eq!(google.scopes, vec!["email".to_string(), "profile".to_string()]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_oidc_providers_scopes_from_the_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  \
+                 google:\n    \
+                 client_id: my-client-id\n    \
+                 client_secret: my-client-secret\n    \
+                 issuer: https://accounts.google.com\n    \
+                 redirect_uri: http://bff.test/oidc/google/callback\n    \
+                 scopes:\n      \
+                 - email\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            let google = config.oidc_providers.get("google").expect("google provider loaded");
+            assert_eq!(google.scopes, vec!["email".to_string()]);
             Ok(())
         });
     }

@@ -34,6 +34,8 @@ pub(crate) struct AppState {
     pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
     /// Per provider: `field name -> id_token claim name` (see `OidcProviderConfig::extra_claims`).
     pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
+    /// Per provider: scopes requested on the consent screen, besides `openid`.
+    pub(crate) oidc_scopes: Arc<HashMap<String, Vec<String>>>,
     pub(crate) oidc_state: InMemoryOidcStateStorage,
     pub(crate) pending_oidc_links: InMemoryPendingOidcLinkStorage,
     pub(crate) oidc_http_client: Arc<openidconnect::reqwest::Client>,
@@ -87,6 +89,7 @@ impl AppState {
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
             oidc_providers: Arc::new(oidc_providers),
+            oidc_scopes: Arc::new(config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.scopes.clone())).collect()),
             oidc_extra_claims: Arc::new(
                 config.oidc_providers.iter().map(|(name, p)| (name.clone(), p.extra_claims.clone())).collect(),
             ),
@@ -215,6 +218,7 @@ mod tests {
             issuer: "http://127.0.0.1:1".to_string(),
             redirect_uri: "http://localhost/callback".to_string(),
             extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
+            scopes: vec!["email".to_string()],
         };
         Config {
             oidc_providers: [("google".to_string(), provider)].into(),

@@ -236,14 +236,14 @@ mod service {
             .ok_or(OidcServiceError::UnknownProvider)?;
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let scopes = state.oidc_scopes.get(&provider).into_iter().flatten().cloned().map(Scope::new);
         let (auth_url, csrf_token, nonce) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
                 Nonce::new_random,
             )
-            .add_scope(Scope::new("email".to_string()))
-            .add_scope(Scope::new("profile".to_string()))
+            .add_scopes(scopes)
             .set_pkce_challenge(pkce_challenge)
             .url();
 
@@ -437,6 +437,7 @@ mod tests {
             refresh_token_ttl_secs: 2_592_000,
             oidc_providers: Arc::new(HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
+            oidc_scopes: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
@@ -614,6 +615,7 @@ mod tests {
                 client_secret: secrecy::SecretString::from("client-secret".to_string()),
                 redirect_uri: "http://localhost/callback".to_string(),
                 extra_claims: HashMap::new(),
+                scopes: vec!["email".to_string()],
             },
         );
         let http_client = openidconnect::reqwest::Client::new();
@@ -678,6 +680,23 @@ mod tests {
             .await;
         let query = OidcCallbackQuery { code: "irrelevant".to_string(), state: csrf.to_string() };
         oidc_callback(State(state.clone()), Path("test-provider".to_string()), Query(query)).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn login_requests_the_providers_configured_scopes() {
+        let (_issuer, providers, _id_token) = provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        state.oidc_scopes = Arc::new(HashMap::from([(
+            "test-provider".to_string(),
+            vec!["email".to_string(), "https://example.com/phone".to_string()],
+        )]));
+
+        let auth_url = super::service::oidc_login(&mut state, "test-provider".to_string()).await.expect("login starts");
+
+        let url = url::Url::parse(&auth_url).expect("valid url");
+        let scope = url.query_pairs().find(|(key, _)| key == "scope").expect("scope param").1.into_owned();
+        assert_eq!(scope, "openid email https://example.com/phone");
     }
 
     #[tokio::test]

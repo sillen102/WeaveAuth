@@ -261,7 +261,12 @@ login_claims_handler:
 
 Credentials for it are passed the same way, as `WA_PLUGIN_LOGIN_CLAIMS_ENV_<NAME>`.
 
-An OIDC provider entry can also set `extra_claims: {<field>: <id_token claim>}` (e.g.
+An OIDC provider entry can set `scopes: [...]`, what its consent screen asks for besides
+`openid` (always sent). Default `[email, profile]`; setting it replaces the list, so keep
+`email`. A scope only changes what the provider puts in the id_token — claims it doesn't
+return there (e.g. Google's phone number) aren't reachable by adding a scope.
+
+It can also set `extra_claims: {<field>: <id_token claim>}` (e.g.
 `last_name: family_name`; claim names vary by provider, so nothing is mapped by default).
 On a user's first login through that provider the mapped claims are handed to
 `extra_data_handler` like a register request's extra fields; a handler failure fails the login
@@ -274,6 +279,9 @@ oidc_providers:
     client_secret: set-in-.env
     issuer: https://accounts.google.com
     redirect_uri: https://bff.example.com/oidc/google/callback
+    scopes:                   # the default
+      - email
+      - profile
     extra_claims:
       first_name: given_name    # Google's id_token claim names (`profile` scope)
       last_name: family_name

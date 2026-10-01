@@ -49,9 +49,9 @@ async fn register_hook(Json(body): Json<Value>) -> StatusCode {
     };
     let field = |name: &str| fields.get(name).and_then(Value::as_str).unwrap_or_default();
     let profile = json!({
-        "firstName": field("first_name"),
-        "lastName": field("last_name"),
-        "phoneNumberVerified": !field("phone_number").is_empty(),
+        "first_name": field("first_name"),
+        "last_name": field("last_name"),
+        "phone_number": field("phone_number"),
     });
     PROFILES
         .lock()

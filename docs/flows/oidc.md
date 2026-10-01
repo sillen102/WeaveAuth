@@ -19,7 +19,8 @@ same-origin/trusted before use).
 
 - bff asks backend (server-to-server) for the provider's consent-screen URL.
 - backend builds that URL via the `oauth2` crate, which generates the
-  `state` CSRF token and PKCE verifier internally. Backend stores
+  `state` CSRF token and PKCE verifier internally, and requests `openid`
+  plus the provider's configured `scopes` (default `email`, `profile`). Backend stores
   `state -> {provider, pkce_verifier, nonce}` server-side
   (`oidc_state.save_state`) and returns the authorize URL in a redirect.
 - bff pulls `state` back out of that URL's query string and redirects the

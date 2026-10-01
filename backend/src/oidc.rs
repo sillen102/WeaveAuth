@@ -91,6 +91,7 @@ mod tests {
                 client_secret: SecretString::from("client-secret".to_string()),
                 redirect_uri: "http://localhost/callback".to_string(),
                 extra_claims: HashMap::new(),
+                scopes: vec!["email".to_string()],
             },
         );
 
