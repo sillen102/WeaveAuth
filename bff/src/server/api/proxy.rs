@@ -65,7 +65,10 @@ mod controller {
 
         let auth_value = format!("{} {}", TokenType::Bearer, access_token.expose_secret())
             .parse()
-            .map_err(|_| ProxyServiceError::Unauthenticated)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "session access token is not a valid header value");
+                ProxyServiceError::Unauthenticated
+            })?;
         req.headers_mut().remove(header::COOKIE);
         req.headers_mut().insert(header::AUTHORIZATION, auth_value);
 
@@ -141,8 +144,9 @@ mod service {
     /// backend's `/oauth/token` refresh grant, and persists it under the same
     /// `session_id` (backend rotates the refresh token on every use, so the
     /// old one stops working the moment this succeeds). Returns `None` on any
-    /// failure -- network error, non-2xx, or an unparseable body -- leaving
-    /// the caller to treat that the same as "no valid session".
+    /// failure -- network error, non-2xx, or an unparseable body, logged here
+    /// since it isn't returned -- leaving the caller to treat that the same
+    /// as "no valid session".
     ///
     /// Known limitation, not worth building around here: if several requests
     /// race in while the access token is expired, each calls this
@@ -163,11 +167,17 @@ mod service {
             })
             .send()
             .await
+            .map_err(|error| tracing::warn!(error = %error.without_url(), "session refresh request failed"))
             .ok()?;
         if !resp.status().is_success() {
+            tracing::warn!(status = %resp.status(), "session refresh rejected by backend");
             return None;
         }
-        let token: TokenResponse = resp.json().await.ok()?;
+        let token: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|error| tracing::warn!(error = %error.without_url(), "session refresh response unreadable"))
+            .ok()?;
 
         let data = SessionData {
             access_token: token.access_token.into(),

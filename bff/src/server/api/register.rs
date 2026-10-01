@@ -47,8 +47,9 @@ mod controller {
 
     impl From<RegisterServiceError> for RegisterError {
         fn from(err: RegisterServiceError) -> Self {
+            tracing::warn!(%err, "registration failed");
             match err {
-                RegisterServiceError::BackendUnavailable => RegisterError::BackendUnavailable,
+                RegisterServiceError::BackendUnavailable(_) => RegisterError::BackendUnavailable,
             }
         }
     }
@@ -115,8 +116,8 @@ mod service {
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum RegisterServiceError {
-        #[error("backend returned an unexpected response")]
-        BackendUnavailable,
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
     }
 
     #[derive(Serialize)]
@@ -155,13 +156,13 @@ mod service {
             .json(&BackendCredentials { email, password, extra })
             .send()
             .await
-            .map_err(|_| RegisterServiceError::BackendUnavailable)?;
+            .map_err(|error| RegisterServiceError::BackendUnavailable(format!("register request failed: {}", error.without_url())))?;
 
         if resp.status().is_client_error() {
             return Ok(RegisterOutcome::Rejected);
         }
         if !resp.status().is_success() {
-            return Err(RegisterServiceError::BackendUnavailable);
+            return Err(RegisterServiceError::BackendUnavailable(format!("register returned {}", resp.status())));
         }
 
         Ok(RegisterOutcome::Created)
@@ -169,23 +170,35 @@ mod service {
 
     /// Verifies the just-registered credentials against backend's
     /// `/oauth/login`, then drives the same PKCE exchange `start_login` uses.
-    /// `None` on any failure -- the caller falls back to sending the user to
-    /// the login page instead. Returns the `Set-Cookie` header value for the
-    /// new session.
+    /// `None` on any failure (logged here, since it isn't returned) -- the
+    /// caller falls back to sending the user to the login page instead.
+    /// Returns the `Set-Cookie` header value for the new session.
     pub(crate) async fn auto_login(state: &mut AppState, email: &str, password: &str, redirect_uri: &str) -> Option<String> {
+        let result = try_auto_login(state, email, password, redirect_uri).await;
+        if let Err(cause) = &result {
+            tracing::warn!(%cause, "auto-login after registration failed");
+        }
+        result.ok()
+    }
+
+    async fn try_auto_login(state: &mut AppState, email: &str, password: &str, redirect_uri: &str) -> Result<String, String> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
             .json(&BackendCredentials { email, password, extra: HashMap::new() })
             .send()
             .await
-            .ok()?;
+            .map_err(|error| format!("login request failed: {}", error.without_url()))?;
         if !verify_resp.status().is_success() {
-            return None;
+            return Err(format!("login returned {}", verify_resp.status()));
         }
-        let login_session = verify_resp.json::<LoginSessionResponse>().await.ok()?.login_session;
+        let login_session = verify_resp
+            .json::<LoginSessionResponse>()
+            .await
+            .map_err(|error| format!("login response unreadable: {}", error.without_url()))?
+            .login_session;
 
-        complete_login(state, &login_session, redirect_uri).await.ok()
+        complete_login(state, &login_session, redirect_uri).await.map_err(|error| error.to_string())
     }
 }
 

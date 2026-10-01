@@ -21,17 +21,9 @@ pub(crate) static ARGON2: LazyLock<Argon2<'static>> = LazyLock::new(Argon2::defa
 /// Hashes `password` with argon2, off the tokio worker thread (argon2 is
 /// deliberately CPU-heavy, synchronous work).
 pub(crate) async fn hash_password(password: SecretString) -> anyhow::Result<String> {
-    let result = tokio::task::spawn_blocking(move || {
-        ARGON2.hash_password(password.expose_secret().as_bytes()).map(|h| h.to_string())
-    })
-    .await?
-    .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"));
-
-    if let Err(e) = &result {
-        tracing::warn!(error = %e, "argon2 hashing failed");
-    }
-
-    result
+    tokio::task::spawn_blocking(move || ARGON2.hash_password(password.expose_secret().as_bytes()).map(|h| h.to_string()))
+        .await?
+        .map_err(|e| anyhow::anyhow!("argon2 hashing failed: {e}"))
 }
 
 /// A wrong password is an expected outcome, not an error -- kept out of
@@ -63,7 +55,7 @@ pub(crate) async fn verify_password(
     password: SecretString,
     max_bcrypt_cost: u32,
 ) -> Result<PasswordVerifyOutcome, PasswordVerifyError> {
-    let result = tokio::task::spawn_blocking(move || match hash {
+    tokio::task::spawn_blocking(move || match hash {
         PasswordHash::Argon2(s) => match Argon2PasswordHash::new(s.expose_secret()) {
             Ok(parsed) if ARGON2.verify_password(password.expose_secret().as_bytes(), &parsed).is_ok() => {
                 Ok(PasswordVerifyOutcome::Verified)
@@ -82,13 +74,7 @@ pub(crate) async fn verify_password(
         },
     })
     .await
-    .unwrap_or_else(|e| Err(anyhow::Error::from(e).into()));
-
-    if let Err(PasswordVerifyError::Error(e)) = &result {
-        tracing::warn!(error = %e, "password verification errored");
-    }
-
-    result
+    .unwrap_or_else(|e| Err(anyhow::Error::from(e).into()))
 }
 
 /// Reads the cost factor out of a `$2b$NN$...`-shaped bcrypt hash, without

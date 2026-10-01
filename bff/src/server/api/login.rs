@@ -44,10 +44,13 @@ mod controller {
 
     impl From<LoginServiceError> for LoginError {
         fn from(err: LoginServiceError) -> Self {
+            if !matches!(err, LoginServiceError::InvalidRedirectUri) {
+                tracing::warn!(%err, "login failed");
+            }
             match err {
                 LoginServiceError::InvalidRedirectUri => LoginError::InvalidRedirectUri,
-                LoginServiceError::TokenExchangeFailed => LoginError::TokenExchangeFailed,
-                LoginServiceError::BackendUnavailable => LoginError::BackendUnavailable,
+                LoginServiceError::TokenExchangeFailed(_) => LoginError::TokenExchangeFailed,
+                LoginServiceError::BackendUnavailable(_) => LoginError::BackendUnavailable,
             }
         }
     }
@@ -97,18 +100,18 @@ mod service {
     pub(crate) enum LoginServiceError {
         #[error("redirect_uri is not allowed")]
         InvalidRedirectUri,
-        #[error("token exchange failed")]
-        TokenExchangeFailed,
-        #[error("backend returned an unexpected response")]
-        BackendUnavailable,
+        #[error("token exchange failed: {0}")]
+        TokenExchangeFailed(String),
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
     }
 
     impl From<CompleteLoginServiceError> for LoginServiceError {
         fn from(err: CompleteLoginServiceError) -> Self {
             match err {
                 CompleteLoginServiceError::InvalidRedirectUri => LoginServiceError::InvalidRedirectUri,
-                CompleteLoginServiceError::TokenExchangeFailed => LoginServiceError::TokenExchangeFailed,
-                CompleteLoginServiceError::BackendUnavailable => LoginServiceError::BackendUnavailable,
+                CompleteLoginServiceError::TokenExchangeFailed(cause) => LoginServiceError::TokenExchangeFailed(cause),
+                CompleteLoginServiceError::BackendUnavailable(cause) => LoginServiceError::BackendUnavailable(cause),
             }
         }
     }
@@ -157,17 +160,17 @@ mod service {
             .json(&VerifyLoginRequest { email, password })
             .send()
             .await
-            .map_err(|_| LoginServiceError::BackendUnavailable)?;
+            .map_err(|error| LoginServiceError::BackendUnavailable(format!("login request failed: {}", error.without_url())))?;
         if verify_resp.status() == StatusCode::UNAUTHORIZED {
             return Ok(LoginOutcome::Rejected);
         }
         if !verify_resp.status().is_success() {
-            return Err(LoginServiceError::BackendUnavailable);
+            return Err(LoginServiceError::BackendUnavailable(format!("login returned {}", verify_resp.status())));
         }
         let login_session = verify_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|_| LoginServiceError::BackendUnavailable)?
+            .map_err(|error| LoginServiceError::BackendUnavailable(format!("login response unreadable: {}", error.without_url())))?
             .login_session;
 
         let cookie = complete_login(state, &login_session, redirect_uri).await?;

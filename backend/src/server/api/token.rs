@@ -69,8 +69,12 @@ mod controller {
 
     impl From<TokenServiceError> for TokenError {
         fn from(err: TokenServiceError) -> Self {
-            if let TokenServiceError::DownstreamServiceFailed(_) | TokenServiceError::ReservedClaimOverridden(_) = &err {
-                tracing::warn!(%err, "token request failed");
+            match &err {
+                TokenServiceError::DownstreamServiceFailed(_) | TokenServiceError::ReservedClaimOverridden(_) => {
+                    tracing::warn!(%err, "token request failed")
+                }
+                TokenServiceError::UnexpectedError(_) => tracing::error!(%err, "token request failed"),
+                _ => {}
             }
             match err {
                 TokenServiceError::InvalidCode => TokenError::InvalidCode,
@@ -80,7 +84,7 @@ mod controller {
                 TokenServiceError::InvalidRefreshToken => TokenError::InvalidRefreshToken,
                 TokenServiceError::DownstreamServiceFailed(_) => TokenError::DownstreamServiceFailed,
                 TokenServiceError::ReservedClaimOverridden(_) => TokenError::ReservedClaimOverridden,
-                TokenServiceError::UnexpectedError => TokenError::UnexpectedError,
+                TokenServiceError::UnexpectedError(_) => TokenError::UnexpectedError,
             }
         }
     }
@@ -150,8 +154,8 @@ mod service {
         DownstreamServiceFailed(String),
         #[error("downstream login-claims handler returned reserved claim name '{0}'")]
         ReservedClaimOverridden(String),
-        #[error("internal error")]
-        UnexpectedError,
+        #[error("internal error: {0}")]
+        UnexpectedError(String),
     }
 
     /// Claim names this crate assigns itself -- a login-claims handler
@@ -248,7 +252,7 @@ mod service {
         user_id: Uuid,
         family_id: Uuid,
     ) -> Result<TokenResponse, TokenServiceError> {
-        let user = state.users.get_user_by_id(user_id).await.ok_or(TokenServiceError::UnexpectedError)?;
+        let user = state.users.get_user_by_id(user_id).await.ok_or_else(|| TokenServiceError::UnexpectedError(format!("user {user_id} not found")))?;
 
         let extra = match &state.login_claims_handler {
             Some(handler) => {
@@ -276,7 +280,7 @@ mod service {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(signing_key.kid.clone());
         let access_token = jsonwebtoken::encode(&header, &claims, &signing_key.encoding_key)
-            .map_err(|_| TokenServiceError::UnexpectedError)?;
+            .map_err(|error| TokenServiceError::UnexpectedError(format!("signing the access token failed: {error}")))?;
 
         let mut token_bytes = [0u8; 32];
         rand::rng().fill(&mut token_bytes);

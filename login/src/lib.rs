@@ -168,11 +168,14 @@ fn render_page(
 
     let mut tera = Tera::new();
     tera.register_filter("urlencode", urlencode_filter);
-    tera.load_from_glob(TEMPLATES_GLOB)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tera.render(template, &ctx)
-        .map(Html)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    tera.load_from_glob(TEMPLATES_GLOB).map_err(|error| {
+        tracing::error!(%error, "could not load login page templates");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tera.render(template, &ctx).map(Html).map_err(|error| {
+        tracing::error!(%error, template, "could not render login page");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// Tera 2 dropped its built-in `urlencode` filter, so templates that rely on

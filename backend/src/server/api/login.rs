@@ -39,9 +39,12 @@ mod controller {
 
     impl From<service::LoginServiceError> for LoginError {
         fn from(err: service::LoginServiceError) -> Self {
+            if let service::LoginServiceError::UnexpectedError(_) = &err {
+                tracing::error!(%err, "login failed");
+            }
             match err {
                 service::LoginServiceError::InvalidCredentials => LoginError::InvalidCredentials,
-                service::LoginServiceError::UnexpectedError => LoginError::UnexpectedError,
+                service::LoginServiceError::UnexpectedError(_) => LoginError::UnexpectedError,
             }
         }
     }
@@ -96,8 +99,8 @@ mod service {
     pub(crate) enum LoginServiceError {
         #[error("invalid credentials")]
         InvalidCredentials,
-        #[error("internal error")]
-        UnexpectedError,
+        #[error("internal error: {0}")]
+        UnexpectedError(String),
     }
 
     pub(crate) async fn login(
@@ -115,7 +118,7 @@ mod service {
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
             Ok(crypto::PasswordVerifyOutcome::NotVerified) => return Err(LoginServiceError::InvalidCredentials),
-            Err(_) => return Err(LoginServiceError::UnexpectedError),
+            Err(error) => return Err(LoginServiceError::UnexpectedError(error.to_string())),
         }
 
         let user = user.ok_or(LoginServiceError::InvalidCredentials)?;

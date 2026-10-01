@@ -1,14 +1,5 @@
 # TODO
 
-- [ ] **Audit error logging against the "log or return, never both" rule** (see
-      `AGENTS.md`, Coding Rules > Logging). Only the register, token and OIDC callback flows
-      have been brought in line so far: their handlers and services carry the cause in the
-      returned error, and the controller's `From<XyzServiceError> for XyzError` logs it once.
-      Everything else still needs a pass, in particular:
-  - errors discarded with `map_err(|_| ...)` or `.ok()` that are never logged anywhere
-    (silent `4xx`/`5xx` responses);
-  - errors logged at the error site *and* returned, so they end up logged twice or more;
-  - the other controllers/services in `backend/`, `bff/` and `login/`, plus `backend/src/plugin/`.
 - [ ] **Password reset can't be completed yet.** An OIDC login whose email matches an existing
       but unverified local account can't merge into it automatically (would be an
       account-takeover vector -- see `UserStorage::resolve_oidc_login`), so it's routed to

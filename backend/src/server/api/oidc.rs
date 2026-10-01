@@ -505,7 +505,11 @@ mod service {
         // No dummy-hash timing guard needed: pending_link_token already reveals the account exists.
         match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
             Ok(crypto::PasswordVerifyOutcome::Verified) => {}
-            Ok(crypto::PasswordVerifyOutcome::NotVerified) | Err(_) => {
+            Ok(crypto::PasswordVerifyOutcome::NotVerified) => {
+                return Err(ConfirmLinkServiceError::PasswordConfirmationFailed);
+            }
+            Err(error) => {
+                tracing::warn!(%error, user_id = %user.id, "oidc confirm-link password check errored");
                 return Err(ConfirmLinkServiceError::PasswordConfirmationFailed);
             }
         }

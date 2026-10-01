@@ -94,9 +94,12 @@ mod controller {
 
     impl From<OidcLoginServiceError> for OidcLoginError {
         fn from(err: OidcLoginServiceError) -> Self {
+            if let OidcLoginServiceError::BackendUnavailable(_) = &err {
+                tracing::warn!(%err, "oidc login start failed");
+            }
             match err {
                 OidcLoginServiceError::UnknownProvider => OidcLoginError::UnknownProvider,
-                OidcLoginServiceError::BackendUnavailable => OidcLoginError::BackendUnavailable,
+                OidcLoginServiceError::BackendUnavailable(_) => OidcLoginError::BackendUnavailable,
             }
         }
     }
@@ -109,8 +112,9 @@ mod controller {
 
     impl From<OidcConfirmLinkServiceError> for OidcConfirmLinkError {
         fn from(err: OidcConfirmLinkServiceError) -> Self {
+            tracing::warn!(%err, "oidc confirm-link failed");
             match err {
-                OidcConfirmLinkServiceError::BackendUnavailable => OidcConfirmLinkError::BackendUnavailable,
+                OidcConfirmLinkServiceError::BackendUnavailable(_) => OidcConfirmLinkError::BackendUnavailable,
             }
         }
     }
@@ -169,19 +173,16 @@ mod controller {
         );
         let next_cookie = build_cookie(NEXT_COOKIE, &req.next, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
         let state_cookie = build_cookie(STATE_COOKIE, &started.csrf_state, FLOW_COOKIE_PATH, FLOW_COOKIE_TTL_SECS, secure);
+        let cookie_header = |cookie: &str| {
+            HeaderValue::from_str(cookie).map(|value| (header::SET_COOKIE, value)).map_err(|error| {
+                tracing::warn!(%error, "oidc flow cookie is not a valid header value");
+                OidcLoginError::BackendUnavailable
+            })
+        };
         let cookies = [
-            (
-                header::SET_COOKIE,
-                HeaderValue::from_str(&redirect_uri_cookie).map_err(|_| OidcLoginError::BackendUnavailable)?,
-            ),
-            (
-                header::SET_COOKIE,
-                HeaderValue::from_str(&next_cookie).map_err(|_| OidcLoginError::BackendUnavailable)?,
-            ),
-            (
-                header::SET_COOKIE,
-                HeaderValue::from_str(&state_cookie).map_err(|_| OidcLoginError::BackendUnavailable)?,
-            ),
+            cookie_header(&redirect_uri_cookie)?,
+            cookie_header(&next_cookie)?,
+            cookie_header(&state_cookie)?,
         ];
 
         Ok((
@@ -263,8 +264,14 @@ mod controller {
         }
 
         match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri).await {
-            Err(OidcCallbackServiceError::ConsentRequired) => Ok(error_redirect_with(&next, "consent_required")),
-            Err(_) => Ok(error_redirect(&next)),
+            Err(OidcCallbackServiceError::ConsentRequired) => {
+                tracing::info!("oidc callback refused: required permission not granted");
+                Ok(error_redirect_with(&next, "consent_required"))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "oidc callback failed");
+                Ok(error_redirect(&next))
+            }
             Ok(OidcCallbackOutcome::PasswordConfirmationRequired { pending_link_token, email }) => {
                 // `email` (not sensitive, and also what the login page gates
                 // the confirm-link form on) goes on the URL, but
@@ -375,14 +382,14 @@ mod service {
     pub(crate) enum OidcLoginServiceError {
         #[error("unknown oidc provider")]
         UnknownProvider,
-        #[error("backend returned an unexpected response")]
-        BackendUnavailable,
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum OidcCallbackServiceError {
-        #[error("unknown oidc provider or exchange failed")]
-        ExchangeFailed,
+        #[error("unknown oidc provider or exchange failed: {0}")]
+        ExchangeFailed(String),
         /// The user declined a permission this deployment requires (backend `403`).
         #[error("a required permission was not granted at the oidc provider")]
         ConsentRequired,
@@ -390,19 +397,19 @@ mod service {
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum OidcConfirmLinkServiceError {
-        #[error("backend returned an unexpected response")]
-        BackendUnavailable,
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
     }
 
     impl From<crate::server::api::complete_login::CompleteLoginServiceError> for OidcConfirmLinkServiceError {
-        fn from(_err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
-            OidcConfirmLinkServiceError::BackendUnavailable
+        fn from(err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
+            OidcConfirmLinkServiceError::BackendUnavailable(err.to_string())
         }
     }
 
     impl From<crate::server::api::complete_login::CompleteLoginServiceError> for OidcCallbackServiceError {
-        fn from(_err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
-            OidcCallbackServiceError::ExchangeFailed
+        fn from(err: crate::server::api::complete_login::CompleteLoginServiceError) -> Self {
+            OidcCallbackServiceError::ExchangeFailed(err.to_string())
         }
     }
 
@@ -453,24 +460,24 @@ mod service {
             .get(format!("{}/oauth/oidc/{provider}/login", state.config.backend_url))
             .send()
             .await
-            .map_err(|_| OidcLoginServiceError::BackendUnavailable)?;
+            .map_err(|error| OidcLoginServiceError::BackendUnavailable(format!("login request failed: {}", error.without_url())))?;
 
         if backend_resp.status() == StatusCode::NOT_FOUND {
             return Err(OidcLoginServiceError::UnknownProvider);
         }
         if !backend_resp.status().is_redirection() {
-            return Err(OidcLoginServiceError::BackendUnavailable);
+            return Err(OidcLoginServiceError::BackendUnavailable(format!("login returned {}", backend_resp.status())));
         }
         let provider_auth_url = backend_resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or(OidcLoginServiceError::BackendUnavailable)?
+            .ok_or_else(|| OidcLoginServiceError::BackendUnavailable("login redirect has no usable Location".into()))?
             .to_string();
         let csrf_state = url::Url::parse(&provider_auth_url)
             .ok()
             .and_then(|url| url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()))
-            .ok_or(OidcLoginServiceError::BackendUnavailable)?;
+            .ok_or_else(|| OidcLoginServiceError::BackendUnavailable("login redirect carries no state".into()))?;
 
         Ok(StartedOidcLogin { provider_auth_url, csrf_state })
     }
@@ -520,14 +527,16 @@ mod service {
             .query(&[("code", code), ("state", req_state)])
             .send()
             .await
-            .map_err(|_| OidcCallbackServiceError::ExchangeFailed)?;
+            .map_err(|error| OidcCallbackServiceError::ExchangeFailed(format!("callback request failed: {}", error.without_url())))?;
         if resp.status() == StatusCode::FORBIDDEN {
             return Err(OidcCallbackServiceError::ConsentRequired);
         }
         if !resp.status().is_success() {
-            return Err(OidcCallbackServiceError::ExchangeFailed);
+            return Err(OidcCallbackServiceError::ExchangeFailed(format!("callback returned {}", resp.status())));
         }
-        resp.json().await.map_err(|_| OidcCallbackServiceError::ExchangeFailed)
+        resp.json()
+            .await
+            .map_err(|error| OidcCallbackServiceError::ExchangeFailed(format!("callback response unreadable: {}", error.without_url())))
     }
 
     pub(crate) enum ConfirmLinkOutcome {
@@ -554,18 +563,25 @@ mod service {
             .json(&ConfirmLinkBackendRequest { pending_link_token, password })
             .send()
             .await
-            .map_err(|_| OidcConfirmLinkServiceError::BackendUnavailable)?;
+            .map_err(|error| {
+                OidcConfirmLinkServiceError::BackendUnavailable(format!("confirm-link request failed: {}", error.without_url()))
+            })?;
 
         if backend_resp.status() == StatusCode::UNAUTHORIZED || backend_resp.status() == StatusCode::BAD_REQUEST {
             return Ok(ConfirmLinkOutcome::Failed);
         }
         if !backend_resp.status().is_success() {
-            return Err(OidcConfirmLinkServiceError::BackendUnavailable);
+            return Err(OidcConfirmLinkServiceError::BackendUnavailable(format!(
+                "confirm-link returned {}",
+                backend_resp.status()
+            )));
         }
         let login_session = backend_resp
             .json::<LoginSessionResponse>()
             .await
-            .map_err(|_| OidcConfirmLinkServiceError::BackendUnavailable)?
+            .map_err(|error| {
+                OidcConfirmLinkServiceError::BackendUnavailable(format!("confirm-link response unreadable: {}", error.without_url()))
+            })?
             .login_session;
 
         let cookie = complete_login(state, &login_session, redirect_uri).await?;

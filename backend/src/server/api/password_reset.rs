@@ -41,9 +41,12 @@ mod controller {
 
     impl From<PasswordResetConfirmServiceError> for PasswordResetConfirmError {
         fn from(err: PasswordResetConfirmServiceError) -> Self {
+            if let PasswordResetConfirmServiceError::UnexpectedError(_) = &err {
+                tracing::error!(%err, "password reset failed");
+            }
             match err {
                 PasswordResetConfirmServiceError::InvalidOrExpiredToken => PasswordResetConfirmError::InvalidOrExpiredToken,
-                PasswordResetConfirmServiceError::UnexpectedError => PasswordResetConfirmError::UnexpectedError,
+                PasswordResetConfirmServiceError::UnexpectedError(_) => PasswordResetConfirmError::UnexpectedError,
             }
         }
     }
@@ -105,8 +108,8 @@ mod service {
     pub(crate) enum PasswordResetConfirmServiceError {
         #[error("invalid or expired password reset token")]
         InvalidOrExpiredToken,
-        #[error("internal error")]
-        UnexpectedError,
+        #[error("internal error: {0}")]
+        UnexpectedError(String),
     }
 
     /// Issues a single-use password reset token for the account matching
@@ -155,7 +158,7 @@ mod service {
 
         let password_hash = crypto::hash_password(new_password)
             .await
-            .map_err(|_| PasswordResetConfirmServiceError::UnexpectedError)?;
+            .map_err(|error| PasswordResetConfirmServiceError::UnexpectedError(error.to_string()))?;
 
         match state.users.set_password(user_id, PasswordHash::Argon2(password_hash.into())).await {
             SetPasswordOutcome::Ok => {}
@@ -174,10 +177,10 @@ mod service {
 
     async fn revoke_everything_for(state: &mut AppState, user_id: uuid::Uuid) -> Result<(), PasswordResetConfirmServiceError> {
         if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError);
+            return Err(PasswordResetConfirmServiceError::UnexpectedError("revoking refresh tokens failed".to_string()));
         }
         if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError);
+            return Err(PasswordResetConfirmServiceError::UnexpectedError("revoking login sessions failed".to_string()));
         }
         Ok(())
     }

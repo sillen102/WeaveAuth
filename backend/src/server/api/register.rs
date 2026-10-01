@@ -56,8 +56,10 @@ mod controller {
 
     impl From<RegisterServiceError> for RegisterError {
         fn from(err: RegisterServiceError) -> Self {
-            if let RegisterServiceError::DownstreamServiceFailed(_) = &err {
-                tracing::warn!(%err, "registration failed");
+            match &err {
+                RegisterServiceError::DownstreamServiceFailed(_) => tracing::warn!(%err, "registration failed"),
+                RegisterServiceError::UnexpectedError(_) => tracing::error!(%err, "registration failed"),
+                _ => {}
             }
             match err {
                 RegisterServiceError::InvalidEmail => RegisterError::InvalidEmail,
@@ -65,7 +67,7 @@ mod controller {
                 RegisterServiceError::ExtraDataNotSupported => RegisterError::ExtraDataNotSupported,
                 RegisterServiceError::ExtraDataTooLarge => RegisterError::ExtraDataTooLarge,
                 RegisterServiceError::DownstreamServiceFailed(_) => RegisterError::DownstreamServiceFailed,
-                RegisterServiceError::UnexpectedError => RegisterError::UnexpectedError,
+                RegisterServiceError::UnexpectedError(_) => RegisterError::UnexpectedError,
             }
         }
     }
@@ -119,8 +121,8 @@ mod service {
         ExtraDataTooLarge,
         #[error("downstream extra-data handler rejected the registration: {0}")]
         DownstreamServiceFailed(String),
-        #[error("internal error")]
-        UnexpectedError,
+        #[error("internal error: {0}")]
+        UnexpectedError(String),
     }
 
     /// Bounds on extra registration fields, checked before anything else
@@ -147,7 +149,7 @@ mod service {
             return Err(RegisterServiceError::InvalidEmail);
         }
 
-        let password_hash = crypto::hash_password(password).await.map_err(|_| RegisterServiceError::UnexpectedError)?;
+        let password_hash = crypto::hash_password(password).await.map_err(|error| RegisterServiceError::UnexpectedError(error.to_string()))?;
 
         // Generated up front (rather than left to storage) so it can be
         // handed to the extra-data handler before the user is created --
