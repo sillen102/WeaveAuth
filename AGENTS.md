@@ -114,12 +114,12 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 - It builds each mutant, runs the test suite, and reports mutants that survived (no
   test failed) vs. caught. A surviving mutant means a real gap in coverage.
 - **"0 missed" is not "all covered".** A mutant reported *unviable* never had a test run
-  against it -- it failed to build. In these crates that is common rather than rare:
-  `deny(dead_code)`/`unused` means replacing a function body with a constant orphans the
-  imports and constants it used, so the build fails first. Compare the unviable count
-  against the previous run; if a mutant moved from missed to unviable rather than to
-  caught, nothing was proven. Force it by hand (keep the orphaned bindings alive with a
-  `let _ = ...`) and check the test actually fails.
+  against it -- it failed to build. `dead_code` is a warning, not a denied lint, so a body
+  replaced by a constant that orphans imports or constants still builds. What stays unviable
+  is a mutant whose replacement value doesn't exist (`Ok(Default::default())` for a type
+  with no `Default`). Compare the unviable count against the previous run; if a mutant moved
+  from missed to unviable rather than to caught, nothing was proven. Force it by hand and
+  check the test actually fails.
 - Likewise, a package-scoped run only runs **that package's** tests. Mutating
   `plugin-sdk/rust` reports its own `serve`/`Debug` mutants as missed even though
   `system-tests/tests/plugin_auth.rs` catches both -- confirm cross-package coverage by

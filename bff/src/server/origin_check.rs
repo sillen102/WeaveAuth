@@ -1,4 +1,13 @@
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
+use thiserror::Error;
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub(crate) enum OriginError {
+    #[error("request has neither an Origin nor a usable Referer header")]
+    Missing,
+    #[error("request came from untrusted origin {0:?}")]
+    Untrusted(String),
+}
 
 /// Rejects a request unless it names one of `trusted_origins` as its origin.
 ///
@@ -17,7 +26,7 @@ use axum::http::{HeaderMap, StatusCode};
 pub(crate) fn require_trusted_origin(
     headers: &HeaderMap,
     trusted_origins: &[String],
-) -> Result<(), StatusCode> {
+) -> Result<(), OriginError> {
     let origin = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -29,12 +38,12 @@ pub(crate) fn require_trusted_origin(
                 .and_then(|r| url::Url::parse(r).ok())
                 .map(|u| u.origin().ascii_serialization())
         })
-        .ok_or(StatusCode::FORBIDDEN)?;
+        .ok_or(OriginError::Missing)?;
 
     if trusted_origins.iter().any(|t| t == &origin) {
         Ok(())
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(OriginError::Untrusted(origin))
     }
 }
 
@@ -56,8 +65,8 @@ pub(crate) fn is_safe_redirect_target(target: &str, trusted_origins: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_redirect_target, require_trusted_origin};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use super::{is_safe_redirect_target, require_trusted_origin, OriginError};
+    use axum::http::{HeaderMap, HeaderValue};
 
     fn trusted() -> Vec<String> {
         vec!["http://login.test".to_string()]
@@ -78,7 +87,7 @@ mod tests {
 
         assert_eq!(
             require_trusted_origin(&headers, &trusted()),
-            Err(StatusCode::FORBIDDEN)
+            Err(OriginError::Untrusted("http://evil.test".to_string()))
         );
     }
 
@@ -100,7 +109,7 @@ mod tests {
 
         assert_eq!(
             require_trusted_origin(&headers, &trusted()),
-            Err(StatusCode::FORBIDDEN)
+            Err(OriginError::Untrusted("http://evil.test".to_string()))
         );
     }
 
@@ -110,7 +119,7 @@ mod tests {
 
         assert_eq!(
             require_trusted_origin(&headers, &trusted()),
-            Err(StatusCode::FORBIDDEN)
+            Err(OriginError::Missing)
         );
     }
 

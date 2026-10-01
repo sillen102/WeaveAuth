@@ -24,12 +24,19 @@ mod controller {
         #[error("missing or invalid session")]
         #[error_response(StatusCode::UNAUTHORIZED, details = "missing or invalid session")]
         Unauthenticated,
+        #[error("backend returned an unexpected response")]
+        #[error_response(StatusCode::BAD_GATEWAY, details = "backend returned an unexpected response")]
+        BackendUnavailable,
     }
 
     impl From<ProxyServiceError> for ProxyError {
         fn from(err: ProxyServiceError) -> Self {
+            if let ProxyServiceError::BackendUnavailable(_) = &err {
+                tracing::warn!(%err, "session refresh failed");
+            }
             match err {
                 ProxyServiceError::Unauthenticated => ProxyError::Unauthenticated,
+                ProxyServiceError::BackendUnavailable(_) => ProxyError::BackendUnavailable,
             }
         }
     }
@@ -97,6 +104,8 @@ mod service {
     pub(crate) enum ProxyServiceError {
         #[error("missing or invalid session")]
         Unauthenticated,
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
     }
 
     #[derive(Serialize)]
@@ -130,9 +139,7 @@ mod service {
         let session = if session.expires_at > Utc::now() + ACCESS_TOKEN_REFRESH_LEEWAY {
             session
         } else if session.refresh_expires_at > Utc::now() {
-            refresh_session(state, session_id, session.refresh_token.expose_secret())
-                .await
-                .ok_or(ProxyServiceError::Unauthenticated)?
+            refresh_session(state, session_id, session.refresh_token.expose_secret()).await?
         } else {
             return Err(ProxyServiceError::Unauthenticated);
         };
@@ -143,10 +150,10 @@ mod service {
     /// Redeems `session.refresh_token` for a fresh token pair against
     /// backend's `/oauth/token` refresh grant, and persists it under the same
     /// `session_id` (backend rotates the refresh token on every use, so the
-    /// old one stops working the moment this succeeds). Returns `None` on any
-    /// failure -- network error, non-2xx, or an unparseable body, logged here
-    /// since it isn't returned -- leaving the caller to treat that the same
-    /// as "no valid session".
+    /// old one stops working the moment this succeeds). A `4xx` from backend
+    /// means the refresh token is dead, so the session is `Unauthenticated`;
+    /// a network error, `5xx` or unparseable body says nothing about the
+    /// session and is `BackendUnavailable`.
     ///
     /// Known limitation, not worth building around here: if several requests
     /// race in while the access token is expired, each calls this
@@ -157,7 +164,7 @@ mod service {
         state: &mut AppState,
         session_id: &str,
         refresh_token: &str,
-    ) -> Option<SessionData> {
+    ) -> Result<SessionData, ProxyServiceError> {
         let resp = state
             .http_client
             .post(format!("{}/oauth/token", state.config.backend_url))
@@ -167,17 +174,16 @@ mod service {
             })
             .send()
             .await
-            .map_err(|error| tracing::warn!(error = %error.without_url(), "session refresh request failed"))
-            .ok()?;
-        if !resp.status().is_success() {
-            tracing::warn!(status = %resp.status(), "session refresh rejected by backend");
-            return None;
+            .map_err(|error| ProxyServiceError::BackendUnavailable(format!("refresh request failed: {}", error.without_url())))?;
+        if resp.status().is_client_error() {
+            return Err(ProxyServiceError::Unauthenticated);
         }
-        let token: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|error| tracing::warn!(error = %error.without_url(), "session refresh response unreadable"))
-            .ok()?;
+        if !resp.status().is_success() {
+            return Err(ProxyServiceError::BackendUnavailable(format!("refresh returned {}", resp.status())));
+        }
+        let token: TokenResponse = resp.json().await.map_err(|error| {
+            ProxyServiceError::BackendUnavailable(format!("refresh response unreadable: {}", error.without_url()))
+        })?;
 
         let data = SessionData {
             access_token: token.access_token.into(),
@@ -190,7 +196,7 @@ mod service {
             .sessions
             .save_session(session_id.to_string(), data.clone())
             .await;
-        Some(data)
+        Ok(data)
     }
 }
 
@@ -222,11 +228,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_session_returns_none_when_backend_is_unreachable() {
+    async fn refresh_session_is_backend_unavailable_when_backend_is_unreachable() {
         let mut state = state_with_backend("http://127.0.0.1:1");
 
         let result = refresh_session(&mut state, "session-1", "refresh-token").await;
 
-        assert!(result.is_none());
+        assert!(matches!(result, Err(ProxyServiceError::BackendUnavailable(_))));
     }
 }

@@ -23,7 +23,7 @@ use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use base64::Engine;
@@ -170,7 +170,8 @@ fn channel(pending: PendingConnection) -> Channel {
     // Lazy, so the first call (the startup check) is what connects, and so
     // the channel reconnects on its own after a restart.
     Endpoint::from_static(UNUSED_AUTHORITY).connect_with_connector_lazy(tower::service_fn(move |_: Uri| {
-        let connection = pending.lock().ok().and_then(|mut slot| slot.take());
+        // The slot is a plain Option, so a poisoned lock holds nothing inconsistent; recover rather than never reconnect.
+        let connection = pending.lock().unwrap_or_else(PoisonError::into_inner).take();
         async move {
             let stream = connection
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "the plugin is restarting"))?;
@@ -345,9 +346,7 @@ async fn supervise(mut child: Child, config: PluginConfig, token: String, pendin
                 Ok((child, connection)) => {
                     // Replaces an end the channel never took, which led to the
                     // process that just died.
-                    if let Ok(mut slot) = pending.lock() {
-                        *slot = Some(connection);
-                    }
+                    *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(connection);
                     break child;
                 }
                 Err(error) => tracing::error!(%error, command = %config.command, "could not restart the plugin process"),

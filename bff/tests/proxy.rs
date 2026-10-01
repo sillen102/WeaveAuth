@@ -92,7 +92,7 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
 async fn stub_backend_with_expiry(
     access_expires_at: chrono::DateTime<chrono::Utc>,
     refresh_expires_at: chrono::DateTime<chrono::Utc>,
-    refresh_should_fail: bool,
+    refresh_failure: Option<StatusCode>,
 ) -> anyhow::Result<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>)> {
     use axum::response::IntoResponse;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -128,9 +128,8 @@ async fn stub_backend_with_expiry(
                             == Some(GrantType::RefreshToken.as_ref())
                         {
                             refresh_calls.fetch_add(1, Ordering::SeqCst);
-                            if refresh_should_fail {
-                                return (StatusCode::BAD_REQUEST, "invalid refresh token")
-                                    .into_response();
+                            if let Some(status) = refresh_failure {
+                                return (status, "refresh failed").into_response();
                             }
                             return Json(serde_json::json!({
                                 "access_token": "refreshed-access-token",
@@ -459,7 +458,7 @@ async fn access_token_within_the_refresh_leeway_is_refreshed_even_though_not_yet
     let expiring_very_soon = chrono::Utc::now() + chrono::Duration::seconds(1);
     let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
     let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(expiring_very_soon, refresh_still_valid, false).await?;
+        stub_backend_with_expiry(expiring_very_soon, refresh_still_valid, None).await?;
     let (upstream, _uh) = stub_upstream().await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
@@ -488,7 +487,7 @@ async fn expired_access_token_is_transparently_refreshed() -> anyhow::Result<()>
     let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
     let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
     let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, false).await?;
+        stub_backend_with_expiry(already_expired, refresh_still_valid, None).await?;
     let (upstream, _uh) = stub_upstream().await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
@@ -519,7 +518,7 @@ async fn refreshed_token_is_persisted_so_a_second_request_does_not_refresh_again
     let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
     let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
     let (backend, refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, false).await?;
+        stub_backend_with_expiry(already_expired, refresh_still_valid, None).await?;
     let (upstream, _uh) = stub_upstream().await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
@@ -549,7 +548,7 @@ async fn expired_access_and_refresh_token_is_unauthorized() -> anyhow::Result<()
     let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
     let refresh_also_expired = chrono::Utc::now() - chrono::Duration::seconds(1);
     let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_also_expired, false).await?;
+        stub_backend_with_expiry(already_expired, refresh_also_expired, None).await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
@@ -576,7 +575,7 @@ async fn failed_refresh_call_is_unauthorized() -> anyhow::Result<()> {
     let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
     let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
     let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, true).await?;
+        stub_backend_with_expiry(already_expired, refresh_still_valid, Some(StatusCode::BAD_REQUEST)).await?;
     let routes = vec![RouteConfig {
         path_prefix: "/api".into(),
         upstream_url: "http://unused.test".into(),
@@ -593,5 +592,36 @@ async fn failed_refresh_call_is_unauthorized() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backend_failing_the_refresh_call_is_bad_gateway_not_unauthorized() -> anyhow::Result<()> {
+    // A 5xx from backend says nothing about the session, so it must not
+    // look like an expired one (which would bounce the user to login).
+    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
+    let (backend, _refresh_calls, _bh) = stub_backend_with_expiry(
+        already_expired,
+        refresh_still_valid,
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+    )
+    .await?;
+    let routes = vec![RouteConfig {
+        path_prefix: "/api".into(),
+        upstream_url: "http://unused.test".into(),
+    }];
+    let app = app(test_config(backend, routes)).unwrap();
+    let cookie = seeded_cookie(app.clone(), "").await?;
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/api/whoami/42")
+                .header("cookie", &cookie)
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     Ok(())
 }

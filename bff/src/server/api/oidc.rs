@@ -323,7 +323,10 @@ mod controller {
         Form(req): Form<OidcConfirmLinkRequest>,
     ) -> Result<Response, OidcConfirmLinkError> {
         require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|_| OidcConfirmLinkError::UntrustedOrigin)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "request rejected");
+                OidcConfirmLinkError::UntrustedOrigin
+            })?;
         if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
             return Err(OidcConfirmLinkError::InvalidNext);
         }

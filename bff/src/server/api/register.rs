@@ -84,7 +84,10 @@ mod controller {
         Form(req): Form<RegisterRequest>,
     ) -> Result<Response, RegisterError> {
         require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|_| RegisterError::UntrustedOrigin)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "request rejected");
+                RegisterError::UntrustedOrigin
+            })?;
 
         match service::register(&mut state, &req.email, &req.password, req.extra).await? {
             RegisterOutcome::Rejected => {

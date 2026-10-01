@@ -283,7 +283,12 @@ impl Config {
     /// missing file is not an error, one that exists but can't be read is),
     /// then `WA_*` env vars.
     pub fn load() -> Result<Self, anyhow::Error> {
-        dotenvy::dotenv().ok();
+        // A missing .env is normal; a present but malformed one would otherwise be dropped silently.
+        if let Err(error) = dotenvy::dotenv()
+            && !error.not_found()
+        {
+            anyhow::bail!("could not load .env: {error}");
+        }
 
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
         // Figment treats a file it can't open like a missing one. Missing is

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
+#![warn(dead_code)]
 #![deny(
-    dead_code,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

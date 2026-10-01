@@ -67,7 +67,10 @@ mod controller {
         Form(req): Form<LoginRequest>,
     ) -> Result<Response, LoginError> {
         require_trusted_origin(&headers, &state.config.trusted_origins)
-            .map_err(|_| LoginError::UntrustedOrigin)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "request rejected");
+                LoginError::UntrustedOrigin
+            })?;
 
         match service::login(&mut state, &req.email, &req.password, &req.redirect_uri).await? {
             LoginOutcome::Rejected => {

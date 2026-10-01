@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
+#![warn(dead_code)]
 #![deny(
-    dead_code,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -83,10 +83,16 @@ impl Config {
                     .ignore(&["_ignored"]),
             )
             .extract()
-            .unwrap_or(defaults);
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "ignoring invalid login configuration, using defaults");
+                defaults
+            });
 
-        if let Some(port) = env::var("WA_LOGIN_PORT").ok().and_then(|p| p.parse().ok()) {
-            config.port = port;
+        if let Ok(raw) = env::var("WA_LOGIN_PORT") {
+            match raw.parse() {
+                Ok(port) => config.port = port,
+                Err(error) => tracing::warn!(%error, value = %raw, "ignoring invalid WA_LOGIN_PORT, keeping port {}", config.port),
+            }
         }
 
         config
