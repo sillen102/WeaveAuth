@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "signal", "rt"] }
+tokio = { workspace = true, features = ["net", "signal", "rt", "sync"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
@@ -13,6 +13,7 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+rustix = { workspace = true, features = ["stdio"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

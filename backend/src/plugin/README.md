@@ -59,7 +59,11 @@ separate from its own, and the identity of both ends of the socket.
   deadline. Any answer the plugin gives, even a refusal, means it is serving.
   A missing binary, a plugin that exits immediately, and a plugin that never
   answers all fail `AppState::new`, so the server doesn't boot into a state
-  where every registration 502s.
+  where every registration 502s. Telling the plugin's answer apart from a
+  transport failure relies on tonic 0.14 giving only the latter a
+  `source()`; `a_status_the_plugin_sent_has_no_source` and
+  `a_status_from_this_side_has_a_source` pin that, so a tonic upgrade that
+  changes it fails there rather than at startup.
 - **The connection is a socket pair, not an address.** `spawn` creates one,
   writes the token as its first line, and gives one end to the child as stdin.
   The channel's connector takes WeaveAuth's end out of a `PendingConnection`
@@ -68,12 +72,16 @@ separate from its own, and the identity of both ends of the socket.
 - **A supervisor task restarts the plugin when it dies**, after
   `RESTART_DELAY`. The call in flight fails; later ones recover. Without the
   delay a plugin that fails on startup would be respawned as fast as the OS can
-  fork.
+  fork. A broken connection counts as dying: the SDKs stop serving when it
+  closes, so the process exits and gets a fresh pair.
 - **Concurrency is the plugin's.** One process serves every registration over
   one HTTP/2 connection, so a slow call doesn't block the next — there is no
   pool size to guess and nothing to lock.
-- **Teardown.** `Drop` aborts the supervisor, which drops the `Child`
-  (`kill_on_drop`).
+- **Teardown is the connection closing.** `Drop` aborts the supervisor and
+  drops the channel, which closes WeaveAuth's end, and the SDK then stops the
+  plugin. The `Child`'s `kill_on_drop` only reaches a plugin running as this
+  process's own user: signalling another uid takes `CAP_KILL`, which nothing
+  here has.
 
 Invariants worth not breaking:
 
@@ -94,10 +102,21 @@ Invariants worth not breaking:
   changes. It's sent as the `x-weaveauth-token` metadata key, and the SDK
   enforces it before a call reaches the plugin's own code.
 - **The plugin runs as its configured `uid`/`gid`, never 0.** `start` refuses
-  0, and `spawn` always sets both. Each hook defaults to its own id
-  (registration 1001, login claims 1002), so plugins can't read WeaveAuth's
-  memory and environment, or each other's. In the image, backend gets
-  `CAP_SETUID`/`CAP_SETGID` as file capabilities (see the Dockerfile).
+  0 and warns when the uid is this process's own. Each hook defaults to its
+  own id (registration 1001, login claims 1002), so plugins can't read
+  WeaveAuth's memory and environment, or each other's.
+- **This process never holds the capabilities that switching takes.** With
+  `Config::setuid_helper` set (the image sets `WA_SETUID_HELPER`), `spawn`
+  runs `weaveauth-plugin-exec <uid> <gid> <command> <args>`
+  (`launcher/src/bin/`). It alone has `CAP_SETUID`/`CAP_SETGID` file caps,
+  refuses 0, and execs the plugin in place (std's `uid()` clears the
+  supplementary groups), so the plugin's parent is still this process. The
+  image installs it `root:weaveauth 0710`: only this process's user can run
+  it, never a plugin. Without the helper, `spawn` sets `uid`/`gid` on the
+  `Command` itself.
+- **Backend is non-dumpable** (`main.rs`, Linux): its `/proc/<pid>/environ`
+  and memory are hidden even from processes running as its own user (bff,
+  login, a plugin configured as its uid).
 - **Every rpc carries the configured deadline** (`Request::set_timeout`), so a
   plugin that hangs fails the registration instead of holding the HTTP request
   open.
@@ -114,13 +133,14 @@ above.
 
 | where | covers | needs |
 | --- | --- | --- |
-| `mod.rs` unit tests | startup failure modes, refusing uid/gid 0, applying the configured uid, the token's entropy, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
-| `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check (unary and streaming) and reading the token line without consuming gRPC bytes, both SDKs | — |
-| `system-tests/tests/plugin_connection.rs` | a real plugin process: served over its socket pair with the token, refused with no/wrong token, refusing to run without a socket on stdin or with an empty token | — |
-| `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register` (`hook: "registration"`): accept, reject, timeout, crash-and-restart, concurrency, environment isolation | — |
+| `mod.rs` unit tests | startup failure modes, refusing uid/gid 0, applying the configured uid (as root or not), the token's entropy, the tonic `source()` behaviour the startup check relies on, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
+| `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check (unary and streaming), reading the token line without consuming gRPC bytes and refusing an endless one; Go also: `Serve` returning once the connection closes, and fd 0 released | — |
+| `system-tests/tests/plugin_connection.rs` | a real plugin process: served over its socket pair with the token, refused with no/wrong token, exiting once the connection closes, refusing to run without a socket on stdin or with an empty token | — |
+| `launcher/src/bin/weaveauth-plugin-exec.rs` unit tests | the helper's argument parsing: refusing uid 0, gid 0, a non-numeric id and a missing command | — |
+| `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register` (`hook: "registration"`): accept, reject, timeout, crash-and-restart, concurrency, environment isolation, stdin released | — |
 | `system-tests/tests/login_claims_flow.rs` | a real plugin process through backend's real PKCE flow (`hook: "login_claims"`): accept, reject, timeout, reserved-claim rejection, refresh grant | — |
 | `system-tests/tests/plugin_postgres_flow.rs` | a plugin holding a `deadpool-postgres` pool across registrations | Docker, `--features docker` |
-| `system-tests/tests/plugin_privsep_flow.rs` | the shipped image: the plugin runs as `wa-registration` and can't read backend's `/proc/<pid>/environ` | Docker, `mise run test-docker` (builds `system-tests/docker/Dockerfile.plugin-test` first) |
+| `system-tests/tests/plugin_privsep_flow.rs` | the shipped image and its exec helper: the plugin runs as `wa-registration`, can't read backend's `/proc/<pid>/environ` (not even as backend's own uid) and can't run the helper, with a control for each check | Docker, `mise run test-docker` (builds `system-tests/docker/Dockerfile.plugin-test` first) |
 
 The probe plugins are bin targets of the `weaveauth-system-tests` package
 (`tests/fixtures/plugins/`), built from

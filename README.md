@@ -186,7 +186,8 @@ Open http://localhost:8081 for the optional standalone login page.
 
 Each of `backend` and `bff` reads an optional YAML file first (bare `config.yaml`,
 relative to the process's working directory — override the path with
-`WA_CONFIG_FILE`; a missing file is not an error, defaults apply), then lets the
+`WA_CONFIG_FILE`; a missing file is not an error, defaults apply, but one that exists and
+can't be read — wrong permissions, say — stops the service from starting), then lets the
 `WA_*` env vars below override individual scalar fields on top of it. `login` is
 env-only (nothing structured to configure). A route list (`routes:` on bff) only
 exists in the YAML file — there's no sane env-var shape for it.
@@ -374,6 +375,7 @@ exercising bff's proxy):
 | `WA_RATE_LIMIT_WINDOW_SECS`  | bff                 | `60`                                                    | Approximate window the burst size applies over; replenishes at `max_attempts / window_secs` per second                                                                                                                                                                                                                                                                                                                                                                                             |
 | `WA_DOCS_ENABLED`            | bff                 | `false`                                                 | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off by default — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                              |
 | `WA_MAX_BCRYPT_COST`         | backend             | `12`                                                    | Highest bcrypt cost factor accepted when verifying an imported legacy-user password hash — caps how long a single login can tie up a blocking-pool thread                                                                                                                                                                                                                                                                                                                                        |
+| `WA_SETUID_HELPER`           | backend             | *(unset; the image sets it)*                            | `weaveauth-plugin-exec`, the binary plugins are started through. It alone holds `CAP_SETUID`/`CAP_SETGID` and switches to each plugin's `uid`/`gid`, refusing 0. Unset, backend switches users itself, which needs `CAP_SETUID`/`CAP_SETGID` (or root), unless `uid`/`gid` are its own (local runs) |
 | `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else |
 
 ## Testing
@@ -407,14 +409,17 @@ members):
 ## Docker
 
 Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim-trixie` builder compiles
-the three services plus `weaveauth-launcher`. The `gcr.io/distroless/cc-debian13`
+the three services plus `weaveauth-launcher` and `weaveauth-plugin-exec`. The `gcr.io/distroless/cc-debian13`
 runtime (no shell) copies them plus `/app/login/static` and `/app/login/templates`, and
 runs `weaveauth-launcher`, which starts all three and exits when any one of them does.
-Everything runs as `weaveauth` (1000). Backend gets `CAP_SETUID`/`CAP_SETGID` as file
-capabilities so it can spawn each plugin as its own user (`wa-registration` 1001,
-`wa-login-claims` 1002), which means the container must
-not run with `no-new-privileges` or drop those caps. The launcher doesn't forward
-`SIGTERM`, so use `docker run --init` for a prompt `docker stop`.
+Everything runs as `weaveauth` (1000) with no capabilities. The exception is
+`weaveauth-plugin-exec` (`WA_SETUID_HELPER`), which has `CAP_SETUID`/`CAP_SETGID` as file
+capabilities, so plugins can run as their own users (`wa-registration` 1001,
+`wa-login-claims` 1002). A deployment without plugins needs no capabilities. With
+plugins, `capabilities.drop: [ALL]` (the Kubernetes restricted Pod Security Standard),
+`--cap-drop SETUID`/`SETGID` or `no-new-privileges` stop them from starting, and backend
+then refuses to boot; see [docs/plugins.md](docs/plugins.md#deploying). The launcher
+doesn't forward `SIGTERM`, so use `docker run --init` for a prompt `docker stop`.
 
 ```bash
 docker build -t weaveauth .

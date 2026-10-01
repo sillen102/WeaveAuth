@@ -33,6 +33,7 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -50,16 +51,23 @@ const TokenMetadataKey = "x-weaveauth-token"
 const maxTokenLine = 256
 
 // Serve serves whatever register adds to the server on the connection
-// WeaveAuth handed over as stdin, until the process is killed.
+// WeaveAuth handed over as stdin, and returns nil once WeaveAuth closes it --
+// when WeaveAuth stops, drops this plugin, or the connection breaks.
+// Returning from main then is what ends the process: WeaveAuth usually runs
+// as another user, so it can't kill it.
 //
 // There is no address: stdin is one end of a socket pair WeaveAuth created,
 // so WeaveAuth is the only process that can call the plugin. On top of that,
 // every call is checked against the token before it reaches a service, so an
-// implementation cannot forget to do it.
+// implementation cannot forget to do it. Stdin itself is pointed at /dev/null
+// once the connection is taken, so nothing the plugin starts can inherit it.
 func Serve(register func(*grpc.Server), opts ...grpc.ServerOption) error {
 	conn, err := net.FileConn(os.Stdin)
 	if err != nil {
 		return fmt.Errorf("stdin is not a unix socket -- a plugin is spawned by WeaveAuth, which connects it there: %w", err)
+	}
+	if err := releaseStdin(); err != nil {
+		return fmt.Errorf("could not point stdin at /dev/null: %w", err)
 	}
 	// Unbuffered: anything past the token's newline is already gRPC, and has
 	// to be left on the socket for the server.
@@ -76,6 +84,17 @@ func Serve(register func(*grpc.Server), opts ...grpc.ServerOption) error {
 	return serve(conn, token, register, opts...)
 }
 
+// releaseStdin points fd 0 at /dev/null; the connection lives on in the
+// duplicate net.FileConn made.
+func releaseStdin() error {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = devNull.Close() }()
+	return unix.Dup2(int(devNull.Fd()), 0)
+}
+
 // serve takes the connection rather than reading stdin so a test can hand
 // it one end of its own socket pair.
 func serve(conn net.Conn, token string, register func(*grpc.Server), opts ...grpc.ServerOption) error {
@@ -88,11 +107,32 @@ func serve(conn net.Conn, token string, register func(*grpc.Server), opts ...grp
 	)
 	server := grpc.NewServer(opts...)
 	register(server)
-	return server.Serve(newSingleConnListener(conn))
+
+	// The server closes the connection once WeaveAuth is gone; Stop then
+	// makes Serve return nil.
+	watched := &closeNotifyingConn{Conn: conn, closed: make(chan struct{})}
+	go func() {
+		<-watched.closed
+		server.Stop()
+	}()
+	return server.Serve(newSingleConnListener(watched))
+}
+
+// closeNotifyingConn closes its channel the first time it is closed.
+type closeNotifyingConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeNotifyingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 // readToken reads the first line one byte at a time.
 func readToken(r io.Reader) (string, error) {
+	tooLong := fmt.Errorf("the token line is longer than %d bytes", maxTokenLine)
 	line := make([]byte, 0, maxTokenLine)
 	b := make([]byte, 1)
 	for len(line) < maxTokenLine {
@@ -110,7 +150,7 @@ func readToken(r io.Reader) (string, error) {
 			return "", err
 		}
 	}
-	return "", nil
+	return "", tooLong
 }
 
 // singleConnListener hands the server its one connection, then blocks until

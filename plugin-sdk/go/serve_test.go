@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -178,10 +179,57 @@ func TestReadsTheTokenLineAndNotAByteFurther(t *testing.T) {
 	}
 }
 
-func TestReadsNoTokenFromAnEndlessLine(t *testing.T) {
-	token, err := readToken(strings.NewReader(strings.Repeat("a", maxTokenLine+1)))
+// Reported as too long, not as missing: the two point at different bugs.
+func TestRefusesATokenLineThatNeverEnds(t *testing.T) {
+	_, err := readToken(strings.NewReader(strings.Repeat("a", maxTokenLine+1)))
 
-	if err != nil || token != "" {
-		t.Fatalf("got %q, %v", token, err)
+	if err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Fatalf("got %v, want a too-long error", err)
+	}
+}
+
+// WeaveAuth usually runs as another user and can't kill its plugins, so a
+// plugin whose connection is gone has to end itself. The streaming tests
+// above are the control: an open connection keeps being served.
+func TestServeReturnsOnceTheConnectionCloses(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ours, theirs := fileConn(t, fds[0]), fileConn(t, fds[1])
+	returned := make(chan error, 1)
+	go func() { returned <- serve(theirs, "the-real-token", func(*grpc.Server) {}) }()
+
+	_ = ours.Close()
+
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatalf("serve failed instead of stopping: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve kept running after its connection closed")
+	}
+}
+
+// A subprocess inherits fd 0, and anything it reads or writes there would
+// corrupt the gRPC stream. A socket is put on fd 0 first, so this fails if
+// releaseStdin leaves it alone.
+func TestReleasesStdinFromTheConnection(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Close(fds[0]); _ = syscall.Close(fds[1]) }()
+	if err := unix.Dup2(fds[1], 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := releaseStdin(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := unix.Getsockname(0); err == nil {
+		t.Fatal("fd 0 is still a socket")
 	}
 }

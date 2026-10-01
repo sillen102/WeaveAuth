@@ -97,6 +97,33 @@ async fn a_caller_presenting_the_wrong_token_is_refused() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
+// WeaveAuth usually runs as another user and can't kill its plugins, so a
+// plugin whose connection is gone has to end itself -- otherwise every
+// dropped or restarted plugin stays behind. The tests above are the control:
+// a plugin whose connection is open keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_exits_once_its_connection_closes() {
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    writeln!(ours, "{TOKEN}").expect("hands over the token");
+    let mut child =
+        Command::new(PROBE).env_clear().stdin(Stdio::from(OwnedFd::from(theirs))).spawn().expect("the probe starts");
+
+    drop(ours);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the probe can be waited on") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the probe kept running after its connection closed");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(status.success(), "the probe failed instead of stopping: {status}");
+}
+
 /// Runs the probe with `stdin`, returning what it printed once it gave up.
 fn run_with_stdin(stdin: Stdio) -> std::process::Output {
     Command::new(PROBE).env_clear().stdin(stdin).output().expect("the probe runs")

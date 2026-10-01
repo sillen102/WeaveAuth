@@ -36,6 +36,8 @@ async fn handle_registration(request: &PluginRequest) -> Result<Response<PluginR
         Some("sleep") => tokio::time::sleep(Duration::from_millis(sleep_ms(request))).await,
         Some("env") => check_environment()?,
         Some("privsep") => check_privilege_separation()?,
+        Some("helper") => check_setuid_helper_denied()?,
+        Some("stdin") => check_stdin_released()?,
         Some(other) => return Err(Status::invalid_argument(format!("unknown probe {other:?}"))),
     }
     Ok(Response::new(PluginResponse { data: None }))
@@ -112,7 +114,10 @@ fn check_environment() -> Result<(), Status> {
 
 /// Accepts only if this process runs as `PLUGIN_EXPECTED_UID` and can't read
 /// WeaveAuth's environment -- where its signing keys and client secrets
-/// live. Linux-only (`/proc`); driven from the container test.
+/// live. `PLUGIN_ENVIRON_OF=self` points the read at this process's own
+/// environment instead, which is always readable: the control showing the
+/// read is really attempted. Linux-only (`/proc`); driven from the container
+/// test.
 fn check_privilege_separation() -> Result<(), Status> {
     let status = std::fs::read_to_string("/proc/self/status").map_err(|error| Status::internal(error.to_string()))?;
     let uid = status
@@ -125,9 +130,35 @@ fn check_privilege_separation() -> Result<(), Status> {
         return Err(Status::permission_denied(format!("running as uid {uid}, expected {expected:?}")));
     }
 
-    let parent = std::os::unix::process::parent_id();
-    if std::fs::read(format!("/proc/{parent}/environ")).is_ok() {
-        return Err(Status::permission_denied("could read WeaveAuth's environment"));
+    let target = match std::env::var("PLUGIN_ENVIRON_OF").as_deref() {
+        Ok("self") => "self".to_string(),
+        _ => std::os::unix::process::parent_id().to_string(),
+    };
+    if std::fs::read(format!("/proc/{target}/environ")).is_ok() {
+        return Err(Status::permission_denied(format!("could read /proc/{target}/environ")));
+    }
+    Ok(())
+}
+
+/// Accepts only if this process can't run the image's setuid helper: with
+/// it, a plugin could make itself backend's user or another plugin's.
+fn check_setuid_helper_denied() -> Result<(), Status> {
+    match std::process::Command::new("/usr/local/bin/weaveauth-plugin-exec").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(Status::internal(format!("could not try the helper: {error}"))),
+        Ok(_) => Err(Status::permission_denied("could run weaveauth-plugin-exec")),
+    }
+}
+
+/// Accepts only if fd 0 is no longer the connection: a subprocess the plugin
+/// starts inherits it, and anything it reads or writes there corrupts the
+/// gRPC stream.
+fn check_stdin_released() -> Result<(), Status> {
+    use std::os::fd::AsFd;
+
+    let stdin = std::io::stdin().as_fd().try_clone_to_owned().map_err(|error| Status::internal(error.to_string()))?;
+    if std::os::unix::net::UnixStream::from(stdin).local_addr().is_ok() {
+        return Err(Status::failed_precondition("stdin is still the connection"));
     }
     Ok(())
 }

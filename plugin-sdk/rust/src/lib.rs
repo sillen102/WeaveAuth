@@ -3,9 +3,10 @@
 //!
 //! A plugin is an ordinary binary. WeaveAuth spawns it with one end of a
 //! connected unix socket as its stdin, writes a secret token as the first
-//! line on it, and then calls the [`Plugin`] service over it with gRPC. Because it's an ordinary process, it keeps its own
-//! async runtime, its own connection pools and whatever crates it likes --
-//! `tokio-postgres`, `deadpool`, `lapin`, a vendor SDK.
+//! line on it, and then calls the [`Plugin`] service over it with gRPC.
+//! Because it's an ordinary process, it keeps its own async runtime, its own
+//! connection pools and whatever crates it likes -- `tokio-postgres`,
+//! `deadpool`, `lapin`, a vendor SDK.
 //!
 //! One generic rpc, [`Plugin::invoke`], serves every flow -- `request.hook`
 //! says which one, so adding a flow (registration, login claims, an email
@@ -43,9 +44,13 @@ tonic::include_proto!("weaveauth.plugin");
 
 use std::io::Read;
 use std::os::fd::AsFd;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use plugin_server::PluginServer;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
+use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tonic::metadata::MetadataValue;
 
@@ -81,41 +86,93 @@ impl std::fmt::Debug for ServeError {
 pub enum ServeError {
     #[error("stdin is not a unix socket -- a plugin is spawned by WeaveAuth, which connects it there")]
     NotSpawnedByWeaveAuth(#[source] std::io::Error),
+    #[error("could not read the token from the connection: {0}")]
+    ReadToken(#[source] std::io::Error),
     #[error("no token on the connection -- WeaveAuth writes one before its first call")]
     NoToken,
+    #[error("could not point stdin at /dev/null: {0}")]
+    ReleaseStdin(#[source] std::io::Error),
     #[error("the plugin server stopped: {0}")]
     Serve(#[from] tonic::transport::Error),
 }
 
-/// Serves `plugin` on the connection WeaveAuth handed over as stdin, until
-/// the process is killed.
+/// Serves `plugin` on the connection WeaveAuth handed over as stdin, and
+/// returns once WeaveAuth closes it -- when WeaveAuth stops, drops this
+/// plugin, or the connection breaks. Returning from `main` then is what ends
+/// the process: WeaveAuth usually runs as another user, so it can't kill it.
 ///
 /// There is no address: stdin is one end of a socket pair WeaveAuth created,
 /// so WeaveAuth is the only process that can call the plugin. On top of
 /// that, every call is checked against the token before it reaches `plugin`,
-/// so an implementation cannot forget to do it. A subprocess the plugin
-/// starts inherits stdin unless told otherwise, so give one `Stdio::null()`.
+/// so an implementation cannot forget to do it. Stdin itself is pointed at
+/// `/dev/null` once the connection is taken, so a subprocess can't inherit it.
 pub async fn serve<P: Plugin>(plugin: P) -> Result<(), ServeError> {
     let mut stream = socket_on_stdin().map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let dev_null = std::fs::File::open("/dev/null").map_err(ServeError::ReleaseStdin)?;
+    rustix::stdio::dup2_stdin(&dev_null).map_err(|errno| ServeError::ReleaseStdin(errno.into()))?;
     // A missing *or empty* token is a refusal to start, not a call that skips
     // the check -- an empty one would authenticate every caller that sends an
     // empty header.
-    let token = read_token(&mut stream).map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let token = read_token(&mut stream).map_err(ServeError::ReadToken)?;
     if token.is_empty() {
         return Err(ServeError::NoToken);
     }
     stream.set_nonblocking(true).map_err(ServeError::NotSpawnedByWeaveAuth)?;
-    let connection = UnixStream::from_std(stream).map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let (watched, closed) = Watched::new(UnixStream::from_std(stream).map_err(ServeError::NotSpawnedByWeaveAuth)?);
     tracing::info!("plugin serving on stdin");
 
     // The one connection is all there is: once it has been handed over, the
-    // server waits instead of shutting down for want of another.
-    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(connection)).chain(tokio_stream::pending());
+    // server waits for `closed` instead of shutting down for want of another.
+    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(watched)).chain(tokio_stream::pending());
     tonic::transport::Server::builder()
         .add_service(PluginServer::with_interceptor(plugin, move |request| authenticate(request, &token)))
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, async {
+            let _ = closed.await;
+        })
         .await?;
+    tracing::info!("WeaveAuth closed the connection, stopping");
     Ok(())
+}
+
+/// The connection, plus a sender dropped along with it: hyper drops the IO
+/// when its connection ends, and that is how [`serve`] learns WeaveAuth is
+/// gone.
+struct Watched {
+    stream: UnixStream,
+    _closed: oneshot::Sender<()>,
+}
+
+impl Watched {
+    fn new(stream: UnixStream) -> (Self, oneshot::Receiver<()>) {
+        let (sender, closed) = oneshot::channel();
+        (Self { stream, _closed: sender }, closed)
+    }
+}
+
+impl AsyncRead for Watched {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Watched {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for Watched {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
 fn socket_on_stdin() -> std::io::Result<std::os::unix::net::UnixStream> {
@@ -136,7 +193,10 @@ fn read_token(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
         }
         line.push(byte[0]);
     }
-    Ok(Vec::new())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("the token line is longer than {MAX_TOKEN_LINE} bytes"),
+    ))
 }
 
 fn authenticate(request: Request<()>, expected: &[u8]) -> Result<Request<()>, Status> {
@@ -211,11 +271,14 @@ mod tests {
         assert_eq!(stream, b"PRI * HTTP/2.0");
     }
 
+    // Reported as too long, not as missing: the two point at different bugs.
     #[test]
-    fn reads_no_token_from_an_endless_line() {
+    fn refuses_a_token_line_that_never_ends() {
         let mut stream: &[u8] = &[b'a'; MAX_TOKEN_LINE + 1];
 
-        assert!(read_token(&mut stream).expect("reads").is_empty());
+        let error = read_token(&mut stream).expect_err("an endless line is not a token");
+
+        assert!(error.to_string().contains("longer than"), "unhelpful error: {error}");
     }
 
     // The differences have to accumulate, not cancel. Folding them with `^`

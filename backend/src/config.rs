@@ -63,6 +63,13 @@ pub struct Config {
     /// means no extra claims are added.
     #[serde(default)]
     pub login_claims_handler: Option<LoginClaimsHandlerConfig>,
+    /// The `weaveauth-plugin-exec` binary to start plugins through. It is
+    /// the one that holds `CAP_SETUID`/`CAP_SETGID`, so this process needs
+    /// none. Unset, backend switches users itself, which needs
+    /// `CAP_SETUID`/`CAP_SETGID` (or root), unless a plugin's `uid`/`gid` are
+    /// this process's own (local runs).
+    #[serde(default)]
+    pub setuid_helper: Option<String>,
 }
 
 /// Where extra registration fields are forwarded. An error from either kind
@@ -174,9 +181,9 @@ fn default_plugin_startup_timeout_secs() -> u64 {
 
 /// The uid and gid of the image's `wa-registration` user. Every plugin runs
 /// as a user of its own -- not WeaveAuth's, and not another plugin's -- so it
-/// can't read their memory, environment or files. Switching to it needs
-/// `CAP_SETUID`/`CAP_SETGID`, which a local run without them avoids by
-/// setting `uid`/`gid` to its own.
+/// can't read their memory or environment. Switching to it needs
+/// `CAP_SETUID`/`CAP_SETGID` (held by `Config::setuid_helper` in the image),
+/// which a local run without them avoids by setting `uid`/`gid` to its own.
 fn default_registration_plugin_id() -> u32 {
     1001
 }
@@ -265,18 +272,28 @@ impl Default for Config {
             max_bcrypt_cost: bcrypt::DEFAULT_COST,
             extra_data_handler: None,
             login_claims_handler: None,
+            setuid_helper: None,
         }
     }
 }
 
 impl Config {
     /// Loads config, layering (highest precedence last): built-in defaults,
-    /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`, missing
-    /// file is not an error), then `WA_*` env vars.
+    /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`; a
+    /// missing file is not an error, one that exists but can't be read is),
+    /// then `WA_*` env vars.
     pub fn load() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
 
         let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
+        // Figment treats a file it can't open like a missing one. Missing is
+        // fine (no overlay); present but unreadable is a deployment mistake
+        // that would otherwise run on defaults, dropping every setting in it.
+        if let Err(error) = std::fs::File::open(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            anyhow::bail!("could not read config file {path:?}: {error}");
+        }
 
         // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
         // `login::Config::own_origin`) -- when the two run side by side, it's
@@ -366,6 +383,23 @@ mod tests {
     use super::*;
     use figment::Jail;
     use secrecy::ExposeSecret;
+
+    // A file that exists but can't be read is a deployment mistake, and
+    // running on defaults instead would quietly drop every setting in it. A
+    // path through a regular file can't be opened even by root, unlike a
+    // `chmod 000` file.
+    #[test]
+    fn refuses_a_config_file_it_cannot_read() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "port: 1984\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
+
+            let error = Config::load().expect_err("an unreadable config must not fall back to defaults");
+
+            assert!(error.to_string().contains("config.yaml/nested.yaml"), "unhelpful error: {error}");
+            Ok(())
+        });
+    }
 
     #[test]
     fn accepts_https_urls() {
@@ -679,6 +713,18 @@ mod tests {
                 ExtraDataHandlerConfig::Webhook { timeout_secs, .. } => assert_eq!(timeout_secs, 10),
                 other => unreachable!("only a webhook handler was configured, got {other:?}"),
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reads_the_setuid_helper_from_the_environment() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_SETUID_HELPER", "/usr/local/bin/weaveauth-plugin-exec");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.setuid_helper.as_deref(), Some("/usr/local/bin/weaveauth-plugin-exec"));
             Ok(())
         });
     }

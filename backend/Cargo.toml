@@ -41,6 +41,7 @@ prost-types = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 async-trait = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 url = { workspace = true }
 
 [dev-dependencies]

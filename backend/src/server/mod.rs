@@ -15,6 +15,7 @@ use crate::storage::in_memory::{
 };
 use crate::storage::ExpiryMaintenance;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,8 +84,8 @@ impl AppState {
                 .build()?,
         );
         let oidc_providers = oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
-        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref()).await?;
-        let login_claims_handler = build_login_claims_handler(config.login_claims_handler.as_ref()).await?;
+        let extra_data_handler = build_extra_data_handler(config.extra_data_handler.as_ref(), config.setuid_helper.as_deref()).await?;
+        let login_claims_handler = build_login_claims_handler(config.login_claims_handler.as_ref(), config.setuid_helper.as_deref()).await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -116,6 +117,7 @@ impl AppState {
 
 async fn build_extra_data_handler(
     config: Option<&ExtraDataHandlerConfig>,
+    setuid_helper: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
@@ -140,6 +142,7 @@ async fn build_extra_data_handler(
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
                 uid: *uid,
                 gid: *gid,
+                setuid_helper: setuid_helper.map(PathBuf::from),
             })
             .await?;
             Arc::new(register::ProcessHandler::new(plugin))
@@ -150,6 +153,7 @@ async fn build_extra_data_handler(
 
 async fn build_login_claims_handler(
     config: Option<&LoginClaimsHandlerConfig>,
+    setuid_helper: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn LoginClaimsHandler>>> {
     let handler: Arc<dyn LoginClaimsHandler> = match config {
         None => return Ok(None),
@@ -174,6 +178,7 @@ async fn build_login_claims_handler(
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
                 uid: *uid,
                 gid: *gid,
+                setuid_helper: setuid_helper.map(PathBuf::from),
             })
             .await?;
             Arc::new(token::ProcessHandler::new(plugin))

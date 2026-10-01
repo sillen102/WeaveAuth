@@ -128,6 +128,15 @@ async fn a_plugin_is_given_only_the_environment_it_was_configured_with() {
     assert_eq!(status, reqwest::StatusCode::CREATED, "the plugin inherited WeaveAuth's environment");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugins_stdin_no_longer_reaches_its_connection() {
+    let (backend_url, _handle) = spawn_backend(&backend_config(10, HashMap::new())).await.expect("backend starts");
+
+    let status = register(&backend_url, "alice@example.com", &registration_fields("stdin")).await;
+
+    assert_eq!(status, reqwest::StatusCode::CREATED, "a subprocess of the plugin could inherit its connection");
+}
+
 // Positive control for the test above: the same probe rejects when the
 // environment it expects isn't there, so that test isn't passing on a check
 // that never runs.

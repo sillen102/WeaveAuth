@@ -8,11 +8,23 @@ ARG BASE_IMAGE=weaveauth
 
 # The same toolchain as the main image, so the probe runs on its glibc.
 FROM rust:1.98-slim-trixie AS probe-builder
+# The probe links the system-tests library, and with it backend's openssl-sys.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p weaveauth-system-tests --bin probe-plugin
+# root:weaveauth, files 0640 and the directory 0750, the way docs/plugins.md
+# asks deployers to mount a config: backend reads it, a plugin running as its
+# own user can't. Built here rather than with COPY --chmod, which would give
+# the directory it creates the files' mode too, and with it no search bit.
+RUN mkdir /out \
+    && cp system-tests/docker/plugin-test.yaml /out/config.yaml \
+    && cp system-tests/docker/same-user.yaml /out/same-user.yaml \
+    && chown -R 0:1000 /out && chmod 0750 /out && chmod 0640 /out/*.yaml
 
 FROM ${BASE_IMAGE}
 COPY --from=probe-builder /app/target/release/probe-plugin /usr/local/bin/probe-plugin
-COPY system-tests/docker/plugin-test.yaml /etc/weaveauth/config.yaml
+COPY --from=probe-builder /out /etc/weaveauth
 ENV WA_CONFIG_FILE=/etc/weaveauth/config.yaml

@@ -1,4 +1,4 @@
 target
 .git
 .idea
-backend/.env
+**/.env

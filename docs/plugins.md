@@ -85,17 +85,35 @@ your plugin. The token is a second layer on top of that. It's regenerated
 every time WeaveAuth starts, and a plugin WeaveAuth restarts is handed the
 same one, so there is nothing to configure or rotate.
 
-Two things follow from this:
+What follows from this:
 
-- **Don't read or write stdin yourself**, and start subprocesses with stdin set
-  to null (`Stdio::null()` in Rust; Go's `os/exec` already does this), so they
-  don't inherit the connection.
+- **`serve()` / `Serve()` return once WeaveAuth closes the connection**: when it
+  stops, drops the plugin or restarts it. Return from `main` then. WeaveAuth
+  usually runs as another user and can't kill your process, so a plugin that
+  keeps running after that is left behind.
+- **Stdin is pointed at `/dev/null`** once the SDK has taken the connection, so
+  subprocesses you start can't inherit it.
 - **Answer the `weaveauth.startup` hook with anything.** WeaveAuth calls it once
   at startup to learn the plugin is serving, and any response counts, including
-  `UNIMPLEMENTED` for a hook you don't know.
+  `UNIMPLEMENTED` for a hook you don't know. Dispatch on `hook`: a plugin that
+  runs its registration logic for every call will run it once at boot, with
+  empty data.
 
 Every plugin runs as a user of its own, not WeaveAuth's and not another
-plugin's, so it can't read their memory, environment or files.
+plugin's, so it can't read their memory or environment. Files are protected
+only by their permissions, as for any other user: mount WeaveAuth's config
+(it holds client secrets) `0640` owned by `root:weaveauth`, not
+world-readable.
+
+### Contract changes
+
+A plugin built against an earlier contract needs rebuilding against the
+current SDK:
+
+- The connection is the socket pair on stdin. `WA_PLUGIN_SOCKET` is gone.
+- The token is the first line on that connection, not an environment
+  variable or a separate stdin line.
+- `weaveauth.startup` is called once at boot (see above).
 
 ## Rust
 
@@ -307,16 +325,41 @@ login_claims_handler:
 
 The plugin is always spawned as `uid`/`gid`, and each hook defaults to its own
 id. Any other numeric id works too, and needs no entry in `/etc/passwd`. Give
-every plugin its own. In the image, backend has the file capabilities this
-takes (`CAP_SETUID`/`CAP_SETGID`). Two container settings break it:
-`--security-opt no-new-privileges` (file capabilities are ignored) and
-`--cap-drop SETUID`/`SETGID`. Either way the plugin fails to start with `EPERM`
-and backend doesn't boot. Running backend outside the image without those
-capabilities, for local development, means setting `uid`/`gid` to your own
-(`id -u` / `id -g`).
+every plugin its own: a plugin configured as WeaveAuth's own uid can read the
+environment of every process running as that user, and WeaveAuth logs a
+warning when it sees one.
+
+In the image, switching users is done by `weaveauth-plugin-exec`
+(`WA_SETUID_HELPER`), the only binary with capabilities (`CAP_SETUID`/
+`CAP_SETGID`, as file capabilities). Backend holds none, so a deployment
+without plugins needs no capabilities at all. With plugins, these settings
+stop the plugin from starting, and backend then refuses to boot:
+
+- `capabilities.drop: [ALL]`, which the Kubernetes **restricted** Pod Security
+  Standard requires. Plugins need `SETUID` and `SETGID` kept, so they run under
+  the **baseline** standard, not restricted.
+- `--cap-drop SETUID` / `SETGID`.
+- `--security-opt no-new-privileges`, which makes the kernel ignore file
+  capabilities.
+- Running the container under a group other than 1000. The helper is
+  `root:weaveauth 0710`, so backend's process needs group 1000, either as its
+  primary group or as a supplementary one. OpenShift's default policy (a
+  random uid with gid 0) and a Kubernetes `runAsGroup` both change it, so add
+  1000 as a supplementary group there (`supplementalGroups: [1000]`).
+
+The helper refuses uid and gid 0, and is installed `root:weaveauth 0710`, so
+only WeaveAuth's own user can run it; a plugin can't use it to become
+WeaveAuth's user or another plugin's. The residual risk: a compromised
+backend, bff or login (all `weaveauth`) can run code as a plugin's user,
+never as root. Backend also marks itself non-dumpable, so its environment
+and memory stay hidden even from bff, login, or a plugin configured as
+WeaveAuth's uid.
+
+Running backend outside the image without that helper (local development)
+means setting `uid`/`gid` to your own (`id -u` / `id -g`).
 
 The image is distroless (`gcr.io/distroless/cc-debian13`): there is no shell,
-and backend execs the plugin binary directly. Ship a binary that runs on
+and none is involved in starting a plugin. Ship a binary that runs on
 the image's glibc, or a static one (Go with `CGO_ENABLED=0`).
 
 A single binary can implement both the `"registration"` and `"login_claims"`
@@ -379,7 +422,9 @@ schema on our side.
   `startup_timeout_secs` stops WeaveAuth from booting rather than turning into
   failed registrations later.
 - **If it dies, WeaveAuth restarts it** after about a second. The call in
-  flight fails; later ones recover on their own.
+  flight fails; later ones recover on their own. A broken connection counts as
+  dying: the SDK returns from `serve()`/`Serve()`, your `main` returns, and the
+  replacement gets a fresh connection.
 - **`timeout_secs` is the deadline on one call.** It arrives as the gRPC
   deadline, so an SDK-provided `ctx`/`Request` already carries it — honour it
   and your own downstream calls get cancelled with it.

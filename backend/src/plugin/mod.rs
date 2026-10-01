@@ -21,6 +21,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,6 +80,9 @@ pub(crate) struct PluginConfig {
     /// this process holds.
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// `weaveauth-plugin-exec`, which switches to `uid`/`gid` and execs the
+    /// plugin; see `Config::setuid_helper`.
+    pub(crate) setuid_helper: Option<PathBuf>,
 }
 
 /// WeaveAuth's end of the connection to the current plugin process, waiting
@@ -107,6 +111,15 @@ impl PluginProcess {
     /// command fails at startup rather than at the first registration.
     pub(crate) async fn start(config: PluginConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(config.uid != 0 && config.gid != 0, "plugin {:?} is configured to run as root", config.command);
+        if config.uid == rustix::process::geteuid().as_raw() {
+            tracing::warn!(
+                command = %config.command,
+                uid = config.uid,
+                "plugin runs as WeaveAuth's own user, so it can read the environment of other processes running \
+                 as that user (bff, login) and run weaveauth-plugin-exec -- fine for local development, not for a \
+                 deployment"
+            );
+        }
 
         let secret = generate_token();
         let token = MetadataValue::try_from(&secret)?;
@@ -145,7 +158,10 @@ impl PluginProcess {
 
 impl Drop for PluginProcess {
     fn drop(&mut self) {
-        // Aborting drops the `Child`, which is `kill_on_drop`.
+        // Dropping the channel and the supervisor's pending end closes the
+        // connection, and the SDK stops the plugin when it sees that; the
+        // `Child`'s `kill_on_drop` only reaches a plugin running as this
+        // process's own user.
         self.supervisor.abort();
     }
 }
@@ -249,8 +265,19 @@ fn spawn(config: &PluginConfig, token: &str) -> std::io::Result<(Child, UnixStre
     let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     // Never waits on the plugin: the line is far below the socket buffer.
     ours.write_all(format!("{token}\n").as_bytes())?;
-    let child = Command::new(&config.command)
-        .args(&config.args)
+    let mut command = match &config.setuid_helper {
+        Some(helper) => {
+            let mut command = Command::new(helper);
+            command.arg(config.uid.to_string()).arg(config.gid.to_string()).arg(&config.command).args(&config.args);
+            command
+        }
+        None => {
+            let mut command = Command::new(&config.command);
+            command.args(&config.args).uid(config.uid).gid(config.gid);
+            command
+        }
+    };
+    let child = command
         // The plugin inherits nothing: this process's environment holds
         // WeaveAuth's own secrets (signing keys, OIDC client secrets,
         // database credentials), and a plugin has no business reading them.
@@ -258,8 +285,6 @@ fn spawn(config: &PluginConfig, token: &str) -> std::io::Result<(Child, UnixStre
         .env_clear()
         .envs(&config.env)
         .stdin(Stdio::from(OwnedFd::from(theirs)))
-        .uid(config.uid)
-        .gid(config.gid)
         .kill_on_drop(true)
         .spawn()?;
 
@@ -288,7 +313,10 @@ async fn wait_until_serving(
     match answer {
         Ok(_) => Ok(child),
         // A status the plugin sent itself has no source; one with a source
-        // came from this side (transport error, deadline).
+        // came from this side (transport error, deadline). That is how tonic
+        // 0.14 builds them, not a documented guarantee, so the tests
+        // `a_status_the_plugin_sent_has_no_source` and
+        // `a_status_from_this_side_has_a_source` pin it.
         Err(status) if status.source().is_none() => Ok(child),
         Err(status) => {
             // A plugin that died takes the connection with it, so the call
@@ -339,16 +367,11 @@ mod tests {
             env: HashMap::new(),
             timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_millis(500),
-            uid: current_id("-u"),
-            gid: current_id("-g"),
+            // The one user a plugin can be spawned as without privileges.
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+            setuid_helper: None,
         }
-    }
-
-    /// This process's own uid (`-u`) or gid (`-g`), the one user a plugin can
-    /// be spawned as without privileges.
-    fn current_id(flag: &str) -> u32 {
-        let output = std::process::Command::new("id").arg(flag).output().expect("id runs");
-        String::from_utf8_lossy(&output.stdout).trim().parse().expect("id prints a number")
     }
 
     #[tokio::test]
@@ -369,16 +392,66 @@ mod tests {
         assert!(error.to_string().contains("root"), "unhelpful error: {error}");
     }
 
-    // Spawning as a user this unprivileged test process isn't must fail --
-    // if it started, the configured uid was never applied.
+    // As root the plugin must really become 4242:4242 (it exits 7 only
+    // then). Unprivileged, it keeps its own group so that only the uid switch
+    // can fail -- and must. Either way a plugin that silently kept this
+    // process's user fails the test.
     #[tokio::test]
     async fn runs_the_plugin_as_the_configured_user() {
-        let uid = current_id("-u") + 1;
-        let error = PluginProcess::start(PluginConfig { uid, ..config("/bin/sh", &["-c", "sleep 30"]) })
-            .await
-            .expect_err("started as a user it had no right to become");
+        let root = rustix::process::geteuid().is_root();
+        let check = r#"[ "$(id -u)" = 4242 ] && [ "$(id -g)" = 4242 ] && exit 7; exit 9"#;
+        let gid = if root { 4242 } else { rustix::process::getegid().as_raw() };
+        let config = PluginConfig { uid: 4242, gid, ..config("/bin/sh", &["-c", check]) };
 
-        assert!(error.to_string().contains("CAP_SETUID"), "unhelpful error: {error}");
+        let error = PluginProcess::start(config).await.expect_err("the check exits either way");
+
+        if root {
+            assert!(error.to_string().contains("exit status: 7"), "did not run as 4242:4242: {error}");
+        } else {
+            assert!(error.to_string().contains("CAP_SETUID"), "switched user without privileges: {error}");
+        }
+    }
+
+    struct Refusing;
+
+    #[weaveauth_plugin_sdk::async_trait]
+    impl weaveauth_plugin_sdk::Plugin for Refusing {
+        async fn invoke(
+            &self,
+            _: tonic::Request<PluginRequest>,
+        ) -> Result<tonic::Response<PluginResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("no such hook"))
+        }
+    }
+
+    // `wait_until_serving` counts a status without a source as the plugin's
+    // own answer. These two pin that tonic behaviour.
+    #[tokio::test]
+    async fn a_status_the_plugin_sent_has_no_source() {
+        use tokio_stream::StreamExt;
+
+        let (ours, theirs) = UnixStream::pair().expect("socket pair");
+        let incoming = tokio_stream::once(Ok::<_, std::io::Error>(theirs)).chain(tokio_stream::pending());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(weaveauth_plugin_sdk::plugin_server::PluginServer::new(Refusing))
+                .serve_with_incoming(incoming),
+        );
+        let mut client = PluginClient::new(channel(Arc::new(Mutex::new(Some(ours)))));
+
+        let status = client.invoke(PluginRequest::default()).await.expect_err("the plugin refuses");
+
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(status.source().is_none(), "a status the plugin sent carries a source: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_status_from_this_side_has_a_source() {
+        let mut client = PluginClient::new(channel(Arc::new(Mutex::new(None))));
+
+        let status = client.invoke(PluginRequest::default()).await.expect_err("there is no connection");
+
+        assert!(status.source().is_some(), "a transport failure carries no source: {status:?}");
     }
 
     #[tokio::test]
