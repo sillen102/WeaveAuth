@@ -35,6 +35,7 @@ async fn handle_registration(request: &PluginRequest) -> Result<Response<PluginR
         Some("crash") => std::process::exit(1),
         Some("sleep") => tokio::time::sleep(Duration::from_millis(sleep_ms(request))).await,
         Some("env") => check_environment()?,
+        Some("privsep") => check_privilege_separation()?,
         Some(other) => return Err(Status::invalid_argument(format!("unknown probe {other:?}"))),
     }
     Ok(Response::new(PluginResponse { data: None }))
@@ -107,6 +108,28 @@ fn check_environment() -> Result<(), Status> {
         Ok("yes") => Ok(()),
         _ => Err(Status::failed_precondition("the configured environment never arrived")),
     }
+}
+
+/// Accepts only if this process runs as `PLUGIN_EXPECTED_UID` and can't read
+/// WeaveAuth's environment -- where its signing keys and client secrets
+/// live. Linux-only (`/proc`); driven from the container test.
+fn check_privilege_separation() -> Result<(), Status> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| Status::internal(error.to_string()))?;
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().next())
+        .ok_or_else(|| Status::internal("no Uid line in /proc/self/status"))?;
+    let expected = std::env::var("PLUGIN_EXPECTED_UID").unwrap_or_default();
+    if uid != expected {
+        return Err(Status::permission_denied(format!("running as uid {uid}, expected {expected:?}")));
+    }
+
+    let parent = std::os::unix::process::parent_id();
+    if std::fs::read(format!("/proc/{parent}/environ")).is_ok() {
+        return Err(Status::permission_denied("could read WeaveAuth's environment"));
+    }
+    Ok(())
 }
 
 #[tokio::main]

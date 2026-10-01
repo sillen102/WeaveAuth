@@ -1,9 +1,9 @@
 //! The WeaveAuth plugin contract, and the server side of it for a Rust
 //! plugin.
 //!
-//! A plugin is an ordinary binary. WeaveAuth spawns it, hands it a unix
-//! socket path in `WA_PLUGIN_SOCKET`, and calls the [`Plugin`]
-//! service over gRPC. Because it's an ordinary process, it keeps its own
+//! A plugin is an ordinary binary. WeaveAuth spawns it with one end of a
+//! connected unix socket as its stdin, writes a secret token as the first
+//! line on it, and then calls the [`Plugin`] service over it with gRPC. Because it's an ordinary process, it keeps its own
 //! async runtime, its own connection pools and whatever crates it likes --
 //! `tokio-postgres`, `deadpool`, `lapin`, a vendor SDK.
 //!
@@ -41,31 +41,30 @@
 
 tonic::include_proto!("weaveauth.plugin");
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::os::fd::AsFd;
 
 use plugin_server::PluginServer;
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio::net::UnixStream;
+use tokio_stream::StreamExt;
 use tonic::metadata::MetadataValue;
 
 pub use plugin_server::Plugin;
 pub use tonic::{Request, Response, Status, async_trait};
 
-/// Where WeaveAuth tells a plugin to listen. WeaveAuth owns the directory it
-/// points into and removes it when the plugin is torn down.
-pub const SOCKET_ENV: &str = "WA_PLUGIN_SOCKET";
-
-/// The shared secret WeaveAuth generates at startup and presents on every
-/// call. It is regenerated whenever WeaveAuth restarts, and the same value is
-/// handed to a plugin that gets restarted under it.
-pub const TOKEN_ENV: &str = "WA_PLUGIN_TOKEN";
-
-/// The metadata key [`TOKEN_ENV`]'s value travels in.
+/// The metadata key WeaveAuth presents its token in on every call. The token
+/// itself is the first line WeaveAuth writes on the connection, before any
+/// gRPC traffic: a secret generated at startup and handed to every restart
+/// of the plugin.
 pub const TOKEN_METADATA_KEY: &str = "x-weaveauth-token";
+
+/// Longest token line read before giving up. WeaveAuth's is 43 characters;
+/// the cap only stops a stray stream from being read forever.
+const MAX_TOKEN_LINE: usize = 256;
 
 /// Returning this from `main` prints it with `Debug`, so `Debug` is the
 /// message rather than the variant name -- otherwise a plugin that failed to
-/// start reports `NoToken` and leaves its operator guessing.
+/// start reports `NotSpawnedByWeaveAuth` and leaves its operator guessing.
 impl std::fmt::Debug for ServeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{self}")?;
@@ -80,48 +79,64 @@ impl std::fmt::Debug for ServeError {
 
 #[derive(thiserror::Error)]
 pub enum ServeError {
-    #[error("{SOCKET_ENV} is not set -- a plugin is spawned by WeaveAuth, which sets it")]
-    NoSocketPath,
-    #[error("{TOKEN_ENV} is unset or empty -- a plugin is spawned by WeaveAuth, which sets it")]
+    #[error("stdin is not a unix socket -- a plugin is spawned by WeaveAuth, which connects it there")]
+    NotSpawnedByWeaveAuth(#[source] std::io::Error),
+    #[error("no token on the connection -- WeaveAuth writes one before its first call")]
     NoToken,
-    #[error("could not listen on {path}: {source}")]
-    Bind {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("the plugin server stopped: {0}")]
     Serve(#[from] tonic::transport::Error),
 }
 
-/// Serves `plugin` on the socket WeaveAuth assigned, until the process is
-/// killed.
+/// Serves `plugin` on the connection WeaveAuth handed over as stdin, until
+/// the process is killed.
 ///
-/// A plugin does not choose its own address: WeaveAuth creates a private
-/// directory per plugin process and passes the path in. Every call is checked
-/// against the secret in [`TOKEN_ENV`] before it reaches `plugin`, so an
-/// implementation cannot forget to do it.
+/// There is no address: stdin is one end of a socket pair WeaveAuth created,
+/// so WeaveAuth is the only process that can call the plugin. On top of
+/// that, every call is checked against the token before it reaches `plugin`,
+/// so an implementation cannot forget to do it. A subprocess the plugin
+/// starts inherits stdin unless told otherwise, so give one `Stdio::null()`.
 pub async fn serve<P: Plugin>(plugin: P) -> Result<(), ServeError> {
-    let path = PathBuf::from(std::env::var_os(SOCKET_ENV).ok_or(ServeError::NoSocketPath)?);
+    let mut stream = socket_on_stdin().map_err(ServeError::NotSpawnedByWeaveAuth)?;
     // A missing *or empty* token is a refusal to start, not a call that skips
     // the check -- an empty one would authenticate every caller that sends an
     // empty header.
-    let token = std::env::var(TOKEN_ENV).unwrap_or_default().into_bytes();
+    let token = read_token(&mut stream).map_err(ServeError::NotSpawnedByWeaveAuth)?;
     if token.is_empty() {
         return Err(ServeError::NoToken);
     }
+    stream.set_nonblocking(true).map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    let connection = UnixStream::from_std(stream).map_err(ServeError::NotSpawnedByWeaveAuth)?;
+    tracing::info!("plugin serving on stdin");
 
-    // A restarted plugin inherits the path of the one that died, and bind
-    // fails on a leftover file rather than replacing it.
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).map_err(|source| ServeError::Bind { path: path.clone(), source })?;
-    tracing::info!(path = %path.display(), "plugin listening");
-
+    // The one connection is all there is: once it has been handed over, the
+    // server waits instead of shutting down for want of another.
+    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(connection)).chain(tokio_stream::pending());
     tonic::transport::Server::builder()
         .add_service(PluginServer::with_interceptor(plugin, move |request| authenticate(request, &token)))
-        .serve_with_incoming(UnixListenerStream::new(listener))
+        .serve_with_incoming(incoming)
         .await?;
     Ok(())
+}
+
+fn socket_on_stdin() -> std::io::Result<std::os::unix::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    // Fails with ENOTSOCK on a terminal, a pipe or /dev/null.
+    stream.local_addr()?;
+    Ok(stream)
+}
+
+/// Reads the first line one byte at a time: anything past the newline is
+/// already gRPC, and has to be left on the socket for the server.
+fn read_token(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.len() < MAX_TOKEN_LINE {
+        if stream.read(&mut byte)? == 0 || byte[0] == b'\n' {
+            return Ok(line);
+        }
+        line.push(byte[0]);
+    }
+    Ok(Vec::new())
 }
 
 fn authenticate(request: Request<()>, expected: &[u8]) -> Result<Request<()>, Status> {
@@ -184,6 +199,23 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    // Whatever follows the newline is the client's HTTP/2 preface; reading
+    // one byte too many would corrupt the connection.
+    #[test]
+    fn reads_the_token_line_and_not_a_byte_further() {
+        let mut stream: &[u8] = b"s3cret\nPRI * HTTP/2.0";
+
+        assert_eq!(read_token(&mut stream).expect("reads"), b"s3cret");
+        assert_eq!(stream, b"PRI * HTTP/2.0");
+    }
+
+    #[test]
+    fn reads_no_token_from_an_endless_line() {
+        let mut stream: &[u8] = &[b'a'; MAX_TOKEN_LINE + 1];
+
+        assert!(read_token(&mut stream).expect("reads").is_empty());
     }
 
     // The differences have to accumulate, not cancel. Folding them with `^`

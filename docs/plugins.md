@@ -9,8 +9,9 @@ runtime, its own connection pools and whatever libraries it likes — `sqlx`,
 `deadpool`, `database/sql`, an AMQP client, a vendor SDK. Nothing about the
 plugin mechanism constrains how you talk to your own systems.
 
-> **A plugin is not sandboxed.** It runs as a child of WeaveAuth with the same
-> privileges. Mounting one is equivalent to shipping application code into this
+> **A plugin is not sandboxed.** It runs as a child of WeaveAuth, as its own
+> user (`uid`/`gid`, see [Deploying](#deploying)), with whatever that user can
+> reach. Mounting one is equivalent to shipping application code into this
 > deployment — see [Before you ship](#before-you-ship).
 
 ## The contract
@@ -71,23 +72,30 @@ release. A plugin only has to handle the hooks it's wired into; return
 
 ## Running
 
-WeaveAuth sets two variables and the SDKs do the rest:
+WeaveAuth spawns the plugin with one end of a connected unix socket as its
+**stdin**, and writes a secret token as the first line on it before any gRPC
+traffic. The SDKs do the rest: `serve()` / `Serve()` read the token, serve gRPC
+on that connection, and reject any call that doesn't present the token before
+it reaches your code. A plugin started any other way (stdin a terminal, a pipe,
+`/dev/null`, or no token) refuses to run rather than serving everyone.
 
-| variable | is |
-| --- | --- |
-| `WA_PLUGIN_SOCKET` | the unix socket to listen on, in a private (`0700`) directory WeaveAuth owns |
-| `WA_PLUGIN_TOKEN` | a secret WeaveAuth generates at startup and presents on every call |
+There is no socket file, port or path: the connection exists only between
+WeaveAuth and the process it spawned, so nothing else on the machine can call
+your plugin. The token is a second layer on top of that. It's regenerated
+every time WeaveAuth starts, and a plugin WeaveAuth restarts is handed the
+same one, so there is nothing to configure or rotate.
 
-A plugin never reads either directly — `serve()` / `Serve()` take them, listen,
-and reject any call that doesn't present the token before it reaches your
-code. A plugin started without them refuses to run rather than serving
-everyone.
+Two things follow from this:
 
-The token is regenerated every time WeaveAuth starts, and a plugin WeaveAuth
-restarts is handed the same one, so there is nothing to configure or rotate.
-It is defence in depth rather than a boundary: a process able to open the
-socket is running as the same user, and could read the token out of
-`/proc` anyway.
+- **Don't read or write stdin yourself**, and start subprocesses with stdin set
+  to null (`Stdio::null()` in Rust; Go's `os/exec` already does this), so they
+  don't inherit the connection.
+- **Answer the `weaveauth.startup` hook with anything.** WeaveAuth calls it once
+  at startup to learn the plugin is serving, and any response counts, including
+  `UNIMPLEMENTED` for a hook you don't know.
+
+Every plugin runs as a user of its own, not WeaveAuth's and not another
+plugin's, so it can't read their memory, environment or files.
 
 ## Rust
 
@@ -260,7 +268,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Serve owns the socket and the token check; the callback owns the service.
+	// Serve owns the connection and the token check; the callback owns the service.
 	err = weaveauth.Serve(func(server *grpc.Server) {
 		weaveauthv1.RegisterPluginServer(server, &plugin{db: db})
 	})
@@ -284,14 +292,32 @@ extra_data_handler:
   env:                     # the plugin's ENTIRE environment
     DATABASE_URL: postgres://plugin:secret@db/appdata
   timeout_secs: 5          # default 5, deadline on one call
-  startup_timeout_secs: 10 # default 10, how long it has to start listening
+  startup_timeout_secs: 10 # default 10, how long it has to answer weaveauth.startup
+  uid: 1001                # default 1001 (the image's wa-registration), never 0
+  gid: 1001                # default 1001, never 0
 
 login_claims_handler:
   kind: process
   command: /plugins/login-claims
   timeout_secs: 5
   startup_timeout_secs: 10
+  uid: 1002                # default 1002 (the image's wa-login-claims)
+  gid: 1002
 ```
+
+The plugin is always spawned as `uid`/`gid`, and each hook defaults to its own
+id. Any other numeric id works too, and needs no entry in `/etc/passwd`. Give
+every plugin its own. In the image, backend has the file capabilities this
+takes (`CAP_SETUID`/`CAP_SETGID`). Two container settings break it:
+`--security-opt no-new-privileges` (file capabilities are ignored) and
+`--cap-drop SETUID`/`SETGID`. Either way the plugin fails to start with `EPERM`
+and backend doesn't boot. Running backend outside the image without those
+capabilities, for local development, means setting `uid`/`gid` to your own
+(`id -u` / `id -g`).
+
+The image is distroless (`gcr.io/distroless/cc-debian13`): there is no shell,
+and backend execs the plugin binary directly. Ship a binary that runs on
+the image's glibc, or a static one (Go with `CGO_ENABLED=0`).
 
 A single binary can implement both the `"registration"` and `"login_claims"`
 hooks -- pointing both `command:`s at it spawns two separate processes of it,
@@ -349,7 +375,7 @@ schema on our side.
 - **One process serves every call**, concurrently, over one HTTP/2 connection.
   A slow call does not block the next one.
 - **It is started before the server serves traffic.** A missing binary, a
-  plugin that exits immediately, or one that doesn't listen within
+  plugin that exits immediately, or one that doesn't answer `weaveauth.startup` within
   `startup_timeout_secs` stops WeaveAuth from booting rather than turning into
   failed registrations later.
 - **If it dies, WeaveAuth restarts it** after about a second. The call in
@@ -371,9 +397,9 @@ can't rot.
 
 ## Before you ship
 
-- **A plugin is not sandboxed.** It is a process with WeaveAuth's privileges:
-  it can read the filesystem, open any connection and exhaust any resource the
-  host allows. There are no allowlists to configure because there is nothing
+- **A plugin is not sandboxed.** It runs as its own user, not as WeaveAuth,
+  but it can still read anything that user can, open any connection and
+  exhaust any resource the host allows. There are no allowlists to configure because there is nothing
   here that could enforce one. If you need isolation, it comes from the
   platform — a separate container or user, a seccomp profile, a network policy
   — not from WeaveAuth.

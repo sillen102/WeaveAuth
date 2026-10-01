@@ -104,6 +104,11 @@ pub enum ExtraDataHandlerConfig {
         /// surfacing as failed registrations later.
         #[serde(default = "default_plugin_startup_timeout_secs")]
         startup_timeout_secs: u64,
+        /// The user the plugin runs as, see [`default_registration_plugin_id`].
+        #[serde(default = "default_registration_plugin_id")]
+        uid: u32,
+        #[serde(default = "default_registration_plugin_id")]
+        gid: u32,
     },
 }
 
@@ -147,6 +152,11 @@ pub enum LoginClaimsHandlerConfig {
         /// surfacing as failed logins later.
         #[serde(default = "default_plugin_startup_timeout_secs")]
         startup_timeout_secs: u64,
+        /// The user the plugin runs as, see [`default_login_claims_plugin_id`].
+        #[serde(default = "default_login_claims_plugin_id")]
+        uid: u32,
+        #[serde(default = "default_login_claims_plugin_id")]
+        gid: u32,
     },
 }
 
@@ -160,6 +170,21 @@ fn default_plugin_timeout_secs() -> u64 {
 
 fn default_plugin_startup_timeout_secs() -> u64 {
     10
+}
+
+/// The uid and gid of the image's `wa-registration` user. Every plugin runs
+/// as a user of its own -- not WeaveAuth's, and not another plugin's -- so it
+/// can't read their memory, environment or files. Switching to it needs
+/// `CAP_SETUID`/`CAP_SETGID`, which a local run without them avoids by
+/// setting `uid`/`gid` to its own.
+fn default_registration_plugin_id() -> u32 {
+    1001
+}
+
+/// The uid and gid of the image's `wa-login-claims` user; see
+/// [`default_registration_plugin_id`].
+fn default_login_claims_plugin_id() -> u32 {
+    1002
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -669,8 +694,9 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid } => {
                     assert_eq!(command, "/opt/plugins/register");
+                    assert_eq!((uid, gid), (1001, 1001), "a plugin runs as its own user unless told otherwise");
                     assert_eq!(timeout_secs, 5);
                     assert_eq!(startup_timeout_secs, 10);
                     assert!(args.is_empty());
@@ -687,13 +713,14 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n",
+                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n  uid: 2000\n  gid: 2001\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process { args, env, timeout_secs, .. } => {
+                ExtraDataHandlerConfig::Process { args, env, timeout_secs, uid, gid, .. } => {
+                    assert_eq!((uid, gid), (2000, 2001));
                     assert_eq!(args, vec!["--verbose".to_string()]);
                     assert_eq!(env.get("DATABASE_URL").map(String::as_str), Some("postgres://plugin@db/appdata"));
                     assert_eq!(timeout_secs, 20);
@@ -747,8 +774,9 @@ mod tests {
 
             let config = Config::load().unwrap();
             match config.login_claims_handler.expect("handler configured") {
-                LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs } => {
+                LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid } => {
                     assert_eq!(command, "/opt/plugins/claims");
+                    assert_eq!((uid, gid), (1002, 1002), "a plugin runs as its own user unless told otherwise");
                     assert_eq!(timeout_secs, 5);
                     assert_eq!(startup_timeout_secs, 10);
                     assert!(args.is_empty());

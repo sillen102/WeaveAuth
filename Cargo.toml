@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "bff", "common", "common/macros", "login", "plugin-sdk/rust", "system-tests"]
+members = ["backend", "bff", "common", "common/macros", "launcher", "login", "plugin-sdk/rust", "system-tests"]
 resolver = "2"
 
 [profile.dev]

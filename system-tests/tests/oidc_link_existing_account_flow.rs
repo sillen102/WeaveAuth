@@ -7,8 +7,7 @@
 //! fake IdP: register a password account, attempt an OIDC login against the
 //! same email, then confirm the link with the account's password.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::sync::Arc;
 

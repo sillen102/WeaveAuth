@@ -11,8 +11,7 @@
 //! `bff`'s own tests mock `backend` but never involve the provider or the
 //! real OIDC code exchange.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::collections::HashMap;
 use std::sync::Arc;

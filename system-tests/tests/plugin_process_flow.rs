@@ -9,15 +9,20 @@
 //! A system test sees only HTTP status codes, so each behaviour is selected
 //! by a `probe` field the plugin reads off the registration.
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use support::config::FINAL_REDIRECT;
-use support::plugin::{PROBE, env, plugin_handler, register, registration_fields};
+use support::plugin::{env, plugin_handler, register, registration_fields};
 use support::servers::spawn_backend;
+
+/// The probe plugin, built as a bin target of this package -- so it is
+/// already compiled by the time a test runs, and always from this source
+/// tree rather than a stale artifact. Only a test target sees this variable,
+/// which is why it isn't in the library.
+const PROBE: &str = env!("CARGO_BIN_EXE_probe-plugin");
 
 fn backend_config(timeout_secs: u64, env: HashMap<String, String>) -> weaveauth::config::Config {
     weaveauth::config::Config {

@@ -47,21 +47,24 @@ an in-process sandbox cannot give without reimplementing every protocol as a
 host capability.
 
 The price is stated plainly in the deployer docs and again here: **a plugin is
-not sandboxed.** It runs with this process's privileges. Mounting one is
-equivalent to shipping application code, and isolation is the deployer's
-(container, user, seccomp). The one boundary WeaveAuth does enforce is the
-environment.
+not sandboxed.** Mounting one is equivalent to shipping application code,
+and isolation beyond what's below is the deployer's (container, seccomp,
+network policy). What WeaveAuth does enforce is the environment, a user
+separate from its own, and the identity of both ends of the socket.
 
 ## The process lifecycle
 
 - **Startup is synchronous.** `PluginProcess::start` spawns the command and
-  polls the socket until the plugin accepts a connection. A missing binary, a
-  plugin that exits immediately, and a plugin that never listens all fail
-  `AppState::new`, so the server doesn't boot into a state where every
-  registration 502s.
-- **The socket path is fixed for the life of the `PluginProcess`.** That's what
-  lets the tonic `Channel` be built once and connect lazily: after a restart it
-  reconnects to the same path on its own, with no invalidation logic anywhere.
+  calls the `weaveauth.startup` hook once, with `startup_timeout` as the
+  deadline. Any answer the plugin gives, even a refusal, means it is serving.
+  A missing binary, a plugin that exits immediately, and a plugin that never
+  answers all fail `AppState::new`, so the server doesn't boot into a state
+  where every registration 502s.
+- **The connection is a socket pair, not an address.** `spawn` creates one,
+  writes the token as its first line, and gives one end to the child as stdin.
+  The channel's connector takes WeaveAuth's end out of a `PendingConnection`
+  slot. The supervisor puts a fresh end there on every restart, so the
+  channel is built once and reconnects on its own.
 - **A supervisor task restarts the plugin when it dies**, after
   `RESTART_DELAY`. The call in flight fails; later ones recover. Without the
   delay a plugin that fails on startup would be respawned as fast as the OS can
@@ -70,27 +73,31 @@ environment.
   one HTTP/2 connection, so a slow call doesn't block the next — there is no
   pool size to guess and nothing to lock.
 - **Teardown.** `Drop` aborts the supervisor, which drops the `Child`
-  (`kill_on_drop`), then removes the socket directory.
+  (`kill_on_drop`).
 
 Invariants worth not breaking:
 
 - **The plugin inherits no environment.** `env_clear()`, then only what the
   deployer named for it: `WA_PLUGIN_<PLUGIN>_ENV_*` from this process's
   environment (prefix stripped by `forwarded_env`, which is scoped to one
-  plugin name so a second surface doesn't inherit this one's credentials), the
-  config file's `env`, and the two channel variables. This process's environment holds WeaveAuth's signing
+  plugin name so a second surface doesn't inherit this one's credentials) and
+  the config file's `env`. This process's environment holds WeaveAuth's signing
   keys, OIDC client secrets and database credentials.
-- **Every call presents `WA_PLUGIN_TOKEN`.** Generated per `PluginProcess`,
-  handed to the child on every spawn (including restarts, so the client never
-  changes), sent as the `x-weaveauth-token` metadata key. The SDK enforces it
-  before a call reaches the plugin's own code. It guards against the socket
-  directory's permissions being wrong, and it is what would make a future TCP
-  transport safe -- it is *not* a boundary against a hostile plugin, which
-  runs as this user and can read the token from `/proc`.
-- **The socket lives in a `0700` directory.** Anyone who can open it can drive
-  the plugin, and through it whatever credentials the deployer gave it. The
-  directory name is deliberately short: a unix socket path is capped around 104
-  bytes and macOS spends half of that on `$TMPDIR`.
+- **Only WeaveAuth can reach the plugin.** There is no socket file, port or
+  path: the two ends of the pair are held by this process and by the child
+  alone, and WeaveAuth's end is close-on-exec, so no other child inherits it.
+  That's what makes per-plugin users workable: no group or directory has to
+  be shared with anyone.
+- **Every call presents the plugin token**, a second layer behind the socket
+  pair. It's generated per `PluginProcess` and written as the first line on
+  every new connection, including after restarts, so the client never
+  changes. It's sent as the `x-weaveauth-token` metadata key, and the SDK
+  enforces it before a call reaches the plugin's own code.
+- **The plugin runs as its configured `uid`/`gid`, never 0.** `start` refuses
+  0, and `spawn` always sets both. Each hook defaults to its own id
+  (registration 1001, login claims 1002), so plugins can't read WeaveAuth's
+  memory and environment, or each other's. In the image, backend gets
+  `CAP_SETUID`/`CAP_SETGID` as file capabilities (see the Dockerfile).
 - **Every rpc carries the configured deadline** (`Request::set_timeout`), so a
   plugin that hangs fails the registration instead of holding the HTTP request
   open.
@@ -99,20 +106,21 @@ Invariants worth not breaking:
 
 There are none to grant, and nothing here to allowlist. A plugin reaches the
 network, the filesystem and the machine exactly as any other process run by
-this user does; WeaveAuth is not in a position to intercept any of it. The
-security boundary is the deployer's own isolation, plus the environment rule
+its user does; WeaveAuth is not in a position to intercept any of it. The
+security boundary is the deployer's own isolation, plus the invariants
 above.
 
 ## Tests
 
 | where | covers | needs |
 | --- | --- | --- |
-| `mod.rs` unit tests | startup failure modes, the private socket directory, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
-| `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check, both SDKs | — |
-| `system-tests/tests/plugin_auth.rs` | a caller with no/wrong token refused against a real plugin process | — |
+| `mod.rs` unit tests | startup failure modes, refusing uid/gid 0, applying the configured uid, the token's entropy, the `WA_PLUGIN_<PLUGIN>_ENV_` forwarding rule | — |
+| `plugin-sdk/rust` unit tests, `plugin-sdk/go/serve_test.go` | the token check (unary and streaming) and reading the token line without consuming gRPC bytes, both SDKs | — |
+| `system-tests/tests/plugin_connection.rs` | a real plugin process: served over its socket pair with the token, refused with no/wrong token, refusing to run without a socket on stdin or with an empty token | — |
 | `system-tests/tests/plugin_process_flow.rs` | a real plugin process through backend's real `POST /register` (`hook: "registration"`): accept, reject, timeout, crash-and-restart, concurrency, environment isolation | — |
 | `system-tests/tests/login_claims_flow.rs` | a real plugin process through backend's real PKCE flow (`hook: "login_claims"`): accept, reject, timeout, reserved-claim rejection, refresh grant | — |
 | `system-tests/tests/plugin_postgres_flow.rs` | a plugin holding a `deadpool-postgres` pool across registrations | Docker, `--features docker` |
+| `system-tests/tests/plugin_privsep_flow.rs` | the shipped image: the plugin runs as `wa-registration` and can't read backend's `/proc/<pid>/environ` | Docker, `mise run test-docker` (builds `system-tests/docker/Dockerfile.plugin-test` first) |
 
 The probe plugins are bin targets of the `weaveauth-system-tests` package
 (`tests/fixtures/plugins/`), built from
@@ -131,8 +139,8 @@ code at all (the plugin author generates from `plugin-sdk/proto`).
 ## Mutation testing
 
 Not part of the per-change loop — see the repo `AGENTS.md`. When a deeper pass
-is warranted here (the environment rule, the token, and the socket directory
-mode are the parts worth it):
+is warranted here (the environment rule, the token, the uid/gid rules and the
+connection handover are the parts worth it):
 
 ```bash
 mise run mutants -- -p weaveauth --file backend/src/plugin/mod.rs

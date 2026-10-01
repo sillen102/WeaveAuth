@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "signal", "rt"] }
-tokio-stream = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }

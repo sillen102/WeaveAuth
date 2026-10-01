@@ -2,9 +2,9 @@
 
 The WeaveAuth plugin contract, and the server side of it for Rust and Go.
 
-A plugin is an ordinary executable. WeaveAuth spawns it, hands it a private
-unix socket path in `WA_PLUGIN_SOCKET`, and calls the `Plugin` service over
-gRPC. Depend on one of these and you write a service implementation and a
+A plugin is an ordinary executable. WeaveAuth spawns it with one end of a
+connected unix socket as its stdin, writes a token as the first line on it, and
+calls the `Plugin` service over it with gRPC. Depend on one of these and you write a service implementation and a
 `main`, not a transport.
 
 | directory | holds |
@@ -38,9 +38,10 @@ func main() {
 
 ## What the SDKs do for you
 
-- Read `WA_PLUGIN_SOCKET`, clear a socket file left by a previous process,
-  listen, and serve.
-- Enforce `WA_PLUGIN_TOKEN` on every call, with a constant-time comparison,
+- Take the connection on stdin and serve it, refusing to start if stdin isn't a
+  unix socket.
+- Read the token from the first line on that connection and enforce it on every
+  call, unary and streaming, with a constant-time comparison,
   before it reaches your code — and refuse to start if it is missing, so
   there's no configuration in which the check is silently off.
 - Give you the generated request/response types and a base implementation, so

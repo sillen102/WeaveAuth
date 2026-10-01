@@ -122,7 +122,7 @@ async fn build_extra_data_handler(
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => {
             Arc::new(register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
-        Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
+        Some(ExtraDataHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid }) => {
             // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
@@ -138,6 +138,8 @@ async fn build_extra_data_handler(
                 env: plugin_env,
                 timeout: Duration::from_secs(*timeout_secs),
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
+                uid: *uid,
+                gid: *gid,
             })
             .await?;
             Arc::new(register::ProcessHandler::new(plugin))
@@ -154,7 +156,7 @@ async fn build_login_claims_handler(
         Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => {
             Arc::new(token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?)
         }
-        Some(LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs }) => {
+        Some(LoginClaimsHandlerConfig::Process { command, args, env, timeout_secs, startup_timeout_secs, uid, gid }) => {
             // Ambient `WA_PLUGIN_LOGIN_CLAIMS_ENV_*` first, then the config
             // file, so a deployer can override an inherited value without
             // unsetting it.
@@ -170,6 +172,8 @@ async fn build_login_claims_handler(
                 env: plugin_env,
                 timeout: Duration::from_secs(*timeout_secs),
                 startup_timeout: Duration::from_secs(*startup_timeout_secs),
+                uid: *uid,
+                gid: *gid,
             })
             .await?;
             Arc::new(token::ProcessHandler::new(plugin))

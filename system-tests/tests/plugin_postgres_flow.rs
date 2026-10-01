@@ -8,8 +8,7 @@
 
 #![cfg(feature = "docker")]
 
-#[allow(dead_code)]
-mod support;
+use weaveauth_system_tests::support;
 
 use std::time::Duration;
 
