@@ -4,7 +4,7 @@ Scoped to `login/` — overrides the repo-root `AGENTS.md` where they conflict.
 
 ## Deployer-replaceable page templates are JavaScript-free
 
-`login/templates/*.html` (`login.html`, `register.html`, and any future page)
+`templates/pages/*.html` (`login.html`, `register.html`, and any future page)
 are rendered server-side (Tera, see `login/src/lib.rs`) and are meant to be
 replaced wholesale by a deployer reskinning the login UI. A deployer supplies
 **plain HTML and CSS only** — no `<script>` tags, no inline event handlers, no
@@ -26,5 +26,5 @@ client-side logic of any kind.
   `Context` in `render_page` (or a new per-page render function) rather than
   reaching for client-side JS to fill it in.
 
-Enforce this with a grep before adding anything to `login/templates/`:
-`grep -rn '<script\|on[a-z]*="' login/templates/` should return nothing.
+Enforce this with a grep before adding anything to `templates/pages/`:
+`grep -rn '<script\|on[a-z]*="' templates/pages/` should return nothing.

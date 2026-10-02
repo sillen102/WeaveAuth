@@ -2,7 +2,7 @@ pub(crate) use controller::register;
 pub(crate) use controller::register_doc;
 #[cfg(test)]
 pub(crate) use extra_data::ExtraDataError;
-pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, ProcessHandler, WebhookHandler};
+pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, PluginHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -122,6 +122,7 @@ mod service {
     use crate::model::email::normalize_email;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
+    use crate::server::api::email_verification::send_verification_email;
     use crate::storage::{CreateUserOutcome, UserStorage};
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -205,19 +206,23 @@ mod service {
             .users
             .create_user(User {
                 id: user_id,
-                email,
+                email: email.clone(),
                 password: Some(PasswordHash::Argon2(password_hash.into())),
-                // This app has no verification-email flow of its own -- only
-                // an OIDC provider confirming the address (see
-                // `UserStorage::link_or_create_oidc_user`) flips this to true.
+                // Set by entering the emailed code (then also
+                // `email_verified_by_code`) or by an OIDC provider confirming
+                // the address.
                 email_verified: false,
+                email_verified_by_code: false,
                 created_at: now,
                 updated_at: now,
             })
             .await;
 
         match outcome {
-            CreateUserOutcome::Created => Ok(()),
+            CreateUserOutcome::Created => {
+                drop(send_verification_email(state, user_id, &email).await);
+                Ok(())
+            }
             CreateUserOutcome::EmailTaken => Err(RegisterServiceError::EmailTaken),
         }
     }
@@ -268,18 +273,18 @@ mod extra_data {
     /// via the generic `Invoke` rpc's `"registration"` hook. The deployer can
     /// write it in any language with a gRPC server; WeaveAuth only needs the
     /// contract in `plugin-sdk/proto` on the way in and an `OK` on the way out.
-    pub(crate) struct ProcessHandler {
+    pub(crate) struct PluginHandler {
         plugin: PluginProcess,
     }
 
-    impl ProcessHandler {
+    impl PluginHandler {
         pub(crate) fn new(plugin: PluginProcess) -> Self {
             Self { plugin }
         }
     }
 
     #[async_trait::async_trait]
-    impl ExtraDataHandler for ProcessHandler {
+    impl ExtraDataHandler for PluginHandler {
         async fn handle(
             &self,
             user_id: Uuid,
@@ -490,6 +495,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            email_verification: crate::server::api::email_verification::EmailVerification::disabled(
+            ),
             password_reset_tokens:
                 crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
@@ -540,6 +547,51 @@ mod tests {
                 ("plan".to_string(), "pro".to_string())
             ])
         );
+    }
+
+    struct Recorder(tokio::sync::mpsc::UnboundedSender<String>);
+
+    #[async_trait::async_trait]
+    impl crate::server::api::email_verification::EmailVerificationHandler for Recorder {
+        async fn send(
+            &self,
+            mail: &crate::server::api::email_verification::VerificationEmail,
+        ) -> Result<(), crate::server::api::email_verification::EmailDeliveryError> {
+            let _ = self.0.send(mail.email.clone());
+            Ok(())
+        }
+    }
+
+    fn state_with_recorder() -> (AppState, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = state();
+        state.email_verification.handler = Some(Arc::new(Recorder(tx)));
+        state.email_verification.login_public_url = Some("https://login.test".to_string());
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn registering_sends_a_verification_email_to_the_normalized_address() {
+        let (state, mut rx) = state_with_recorder();
+
+        let result = register(State(state), Json(req("Alice+x@Example.com", "hunter2"))).await;
+
+        assert_eq!(result, Ok(StatusCode::CREATED));
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a mail was sent");
+        assert_eq!(sent.as_deref(), Some("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_registration_sends_no_verification_email() {
+        let (state, mut rx) = state_with_recorder();
+
+        let result = register(State(state), Json(req("not-an-email", "hunter2"))).await;
+
+        assert_eq!(result.err(), Some(RegisterError::InvalidEmail));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -31,6 +31,10 @@ Relevant code:
   - Backend `401` -> `LoginOutcome::Rejected` -> bff redirects the browser back to
     `next?error=1`. A plain form POST, not a fetch, so a friendly bounce is what the
     browser shows, not a bare 401 body.
+  - Backend returns only a `verification_session` (`require_verified_email` and the account
+    isn't verified) -> `LoginOutcome::VerificationRequired`: no `wa_session`, a restricted
+    `wa_verify_session` cookie and `303` to login's `verify-email.html`
+    ([verify email](verify-email.md)).
   - Any other non-2xx -> `LoginError::BackendUnavailable` (`502`).
 - On success, backend's response carries a `login_session`; bff hands it to
   `complete_login`, which drives the authorization-code + PKCE exchange
@@ -61,6 +65,10 @@ Relevant code:
   the upgrade behavior can't drift between the two call sites. A failure to upgrade
   (hashing error, or `set_password` not finding the user) is logged (`tracing::warn!`)
   but never fails the login -- the password was already confirmed correct.
+- An account whose `email_verified` is `false` also gets a `verification_session`; with
+  `require_verified_email` set that is *all* it gets (no `login_session`, and the code email is
+  sent). This happens only after the password verified, so a wrong password still gets `401`
+  and the response can't be used to probe which addresses are registered.
 - On success, `login_sessions.create_session(user.id)` mints a single-use
   `login_session` token (`login_session_ttl_secs`, default 60s) and returns it.
 

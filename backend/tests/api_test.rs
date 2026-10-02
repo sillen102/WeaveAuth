@@ -22,12 +22,18 @@ fn test_config() -> Config {
         oidc_state_ttl_secs: 300,
         pending_oidc_link_ttl_secs: 600,
         password_reset_token_ttl_secs: 1_800,
+        email_verification_code_ttl_secs: 900,
+        email_verification_resend_cooldown_secs: 60,
+        email_verification_session_ttl_secs: 1_800,
         expiry_sweep_interval_secs: 60,
         oidc_providers: HashMap::new(),
         max_bcrypt_cost: 12,
         extra_data_handler: None,
         login_claims_handler: None,
         setuid_helper: None,
+        email_handler: None,
+        login_public_url: None,
+        require_verified_email: false,
     }
 }
 

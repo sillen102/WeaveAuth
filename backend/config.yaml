@@ -42,3 +42,11 @@ extra_data_handler:
 login_claims_handler:
   kind: webhook
   url: http://localhost:10001/hooks/login-claims
+# Verification email, sent to Mailpit (testing/mailpit/docker-compose.yml; inbox at http://localhost:7025).
+login_public_url: http://localhost:8081
+email_handler:
+  kind: smtp
+  host: 127.0.0.1
+  port: 1025
+  tls: none
+  from: WeaveAuth <no-reply@example.com>

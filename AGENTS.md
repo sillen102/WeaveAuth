@@ -233,7 +233,7 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 - `Dockerfile` — multi-stage: builds the services and `launcher/`, and runs them from a
   distroless runtime as `weaveauth`, with file caps on `weaveauth-plugin-exec` only.
   Each plugin hook defaults to its own user (`wa-registration` 1001, `wa-login-claims`
-  1002). `system-tests/docker/Dockerfile.plugin-test` builds on it, adding the probe
+  1002, `wa-email` 1003). `system-tests/docker/Dockerfile.plugin-test` builds on it, adding the probe
   plugin for `system-tests/tests/plugin_privsep_flow.rs`.
 
 ## Conventions
@@ -257,6 +257,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 
 - Docker must copy `/app/login/static` to the same absolute path the binary was built
   with (the static-dir root is baked from `CARGO_MANIFEST_DIR` at compile time).
+- Deployer-replaceable templates live in the top-level `templates/` (`pages/` for login, `emails/` for backend's
+  email). Both crates bake the path as `<crate>/../templates/...` at compile time, so Docker must copy
+  `/app/templates` and keep `/app/login` present. Never put templates back under a crate directory.
 - If a backend or bff route is added, update the route table in `README.md`.
 - Backend must never be deployed with a public-facing listener/ingress — only bff and
   login are meant to be internet-exposed; a trusted internal service may reach backend

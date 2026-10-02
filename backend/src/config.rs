@@ -34,6 +34,16 @@ pub struct Config {
     /// `oidc_state_ttl_secs` -- this one waits on a human reading an email
     /// and clicking a link, not just a redirect round-trip.
     pub password_reset_token_ttl_secs: i64,
+    /// How long an emailed verification code stays valid. Short, since a
+    /// 6-digit code is guessable (it also dies after a few wrong attempts).
+    pub email_verification_code_ttl_secs: i64,
+    /// Minimum time between two verification emails to the same user, so the
+    /// resend endpoint can't be used to flood an inbox or to keep replacing
+    /// the code the user is about to type.
+    pub email_verification_resend_cooldown_secs: i64,
+    /// How long the restricted session `/oauth/login` hands an unverified
+    /// account (good only for entering the code) stays valid.
+    pub email_verification_session_ttl_secs: i64,
     /// How often the background task sweeps expired entries out of the
     /// TTL'd stores (PKCE challenges, OIDC state, login sessions, ...).
     /// Bounds how long an abandoned flow's leftovers linger.
@@ -70,6 +80,78 @@ pub struct Config {
     /// this process's own (local runs).
     #[serde(default)]
     pub setuid_helper: Option<String>,
+    /// How a verification email reaches a newly registered user. `None`
+    /// means no email is sent (the resend endpoint then does nothing).
+    #[serde(default, skip_serializing)]
+    pub email_handler: Option<EmailHandlerConfig>,
+    /// Login's public origin (`WA_LOGIN_PUBLIC_URL`), where the verification
+    /// link points. Required when `email_handler` is set.
+    #[serde(default)]
+    pub login_public_url: Option<String>,
+    /// Refuse `/oauth/login` for accounts whose email isn't verified yet.
+    #[serde(default)]
+    pub require_verified_email: bool,
+}
+
+/// How a verification email is delivered. An error from any kind is logged
+/// and never fails registration -- the user can ask for a resend.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmailHandlerConfig {
+    /// Renders the templates in `templates/emails/` and sends them
+    /// through this SMTP server.
+    Smtp {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        tls: SmtpTls,
+        #[serde(default)]
+        username: Option<String>,
+        /// Also settable via `WA_EMAIL_SMTP_PASSWORD`, which wins.
+        #[serde(default)]
+        password: Option<SecretString>,
+        /// The `From` address, e.g. `WeaveAuth <no-reply@example.com>`.
+        from: String,
+        #[serde(default = "default_smtp_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// POSTs `{user_id, email, token, verify_url, expires_at}` as JSON to
+    /// this URL; the downstream service sends the email. Same https rule as
+    /// [`ExtraDataHandlerConfig::Webhook`].
+    Webhook {
+        url: String,
+        #[serde(default = "default_webhook_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// Calls a plugin process with the `email_verification` hook.
+    Plugin {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default = "default_plugin_timeout_secs")]
+        timeout_secs: u64,
+        #[serde(default = "default_plugin_startup_timeout_secs")]
+        startup_timeout_secs: u64,
+        /// The user the plugin runs as, see [`default_email_plugin_id`].
+        #[serde(default = "default_email_plugin_id")]
+        uid: u32,
+        #[serde(default = "default_email_plugin_id")]
+        gid: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS (typically port 587).
+    #[default]
+    Starttls,
+    /// TLS from the first byte (typically port 465).
+    Implicit,
+    /// No encryption; only for a local relay or tests.
+    None,
 }
 
 /// Where extra registration fields are forwarded. An error from either kind
@@ -93,7 +175,7 @@ pub enum ExtraDataHandlerConfig {
     },
     /// Runs the executable at `command` as a child process and calls it
     /// over gRPC (see `plugin`).
-    Process {
+    Plugin {
         command: String,
         #[serde(default)]
         args: Vec<String>,
@@ -141,7 +223,7 @@ pub enum LoginClaimsHandlerConfig {
     },
     /// Runs the executable at `command` as a child process and calls it
     /// over gRPC (see `plugin`).
-    Process {
+    Plugin {
         command: String,
         #[serde(default)]
         args: Vec<String>,
@@ -171,6 +253,10 @@ fn default_webhook_timeout_secs() -> u64 {
     10
 }
 
+fn default_smtp_timeout_secs() -> u64 {
+    10
+}
+
 fn default_plugin_timeout_secs() -> u64 {
     5
 }
@@ -192,6 +278,12 @@ fn default_registration_plugin_id() -> u32 {
 /// [`default_registration_plugin_id`].
 fn default_login_claims_plugin_id() -> u32 {
     1002
+}
+
+/// The uid and gid of the image's `wa-email` user; see
+/// [`default_registration_plugin_id`].
+fn default_email_plugin_id() -> u32 {
+    1003
 }
 
 /// Config for a single third-party OIDC login provider. Discovered at
@@ -267,12 +359,18 @@ impl Default for Config {
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
             password_reset_token_ttl_secs: 1_800,
+            email_verification_code_ttl_secs: 900,
+            email_verification_resend_cooldown_secs: 60,
+            email_verification_session_ttl_secs: 1_800,
             expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
             max_bcrypt_cost: bcrypt::DEFAULT_COST,
             extra_data_handler: None,
             login_claims_handler: None,
             setuid_helper: None,
+            email_handler: None,
+            login_public_url: None,
+            require_verified_email: false,
         }
     }
 }
@@ -343,6 +441,13 @@ impl Config {
             }
         }
 
+        if let Ok(password) = env::var("WA_EMAIL_SMTP_PASSWORD")
+            && let Some(EmailHandlerConfig::Smtp { password: slot, .. }) =
+                config.email_handler.as_mut()
+        {
+            *slot = Some(password.into());
+        }
+
         // bcrypt's own hard cap on the cost factor -- not exported by the
         // `bcrypt` crate, so mirrored here. Anything above it would make the
         // configured cap inert (bcrypt would refuse to hash at that cost anyway).
@@ -358,6 +463,23 @@ impl Config {
 
         Ok(config)
     }
+}
+
+/// Rejects SMTP without TLS to a non-loopback host: the verification code and
+/// any SMTP credentials would cross the network in the clear. `tls: none` is
+/// only for a local relay (Mailpit, a sidecar).
+pub(crate) fn require_tls_or_loopback(host: &str, tls: SmtpTls) -> anyhow::Result<()> {
+    let is_loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if tls == SmtpTls::None && !is_loopback {
+        anyhow::bail!(
+            "smtp host {host:?} needs tls: starttls or implicit (tls: none is only allowed for loopback hosts)"
+        );
+    }
+    Ok(())
 }
 
 /// Rejects a plaintext `http://` URL to a non-local host. The outbound calls
@@ -771,17 +893,17 @@ mod tests {
     }
 
     #[test]
-    fn loads_a_process_extra_data_handler_from_the_config_file() {
+    fn loads_a_plugin_extra_data_handler_from_the_config_file() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n",
+                "extra_data_handler:\n  kind: plugin\n  command: /opt/plugins/register\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process {
+                ExtraDataHandlerConfig::Plugin {
                     command,
                     args,
                     env,
@@ -804,7 +926,7 @@ mod tests {
                         "a plugin is given no environment unless the deployer sets one"
                     );
                 }
-                other => unreachable!("only a process handler was configured, got {other:?}"),
+                other => unreachable!("only a plugin handler was configured, got {other:?}"),
             }
             Ok(())
         });
@@ -815,13 +937,13 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "extra_data_handler:\n  kind: process\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n  uid: 2000\n  gid: 2001\n",
+                "extra_data_handler:\n  kind: plugin\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n  uid: 2000\n  gid: 2001\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Process {
+                ExtraDataHandlerConfig::Plugin {
                     args,
                     env,
                     timeout_secs,
@@ -837,7 +959,7 @@ mod tests {
                     );
                     assert_eq!(timeout_secs, 20);
                 }
-                other => unreachable!("only a process handler was configured, got {other:?}"),
+                other => unreachable!("only a plugin handler was configured, got {other:?}"),
             }
             Ok(())
         });
@@ -876,17 +998,17 @@ mod tests {
     }
 
     #[test]
-    fn loads_a_process_login_claims_handler_from_the_config_file() {
+    fn loads_a_plugin_login_claims_handler_from_the_config_file() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "login_claims_handler:\n  kind: process\n  command: /opt/plugins/claims\n",
+                "login_claims_handler:\n  kind: plugin\n  command: /opt/plugins/claims\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
 
             let config = Config::load().unwrap();
             match config.login_claims_handler.expect("handler configured") {
-                LoginClaimsHandlerConfig::Process {
+                LoginClaimsHandlerConfig::Plugin {
                     command,
                     args,
                     env,
@@ -909,7 +1031,7 @@ mod tests {
                         "a plugin is given no environment unless the deployer sets one"
                     );
                 }
-                other => unreachable!("only a process handler was configured, got {other:?}"),
+                other => unreachable!("only a plugin handler was configured, got {other:?}"),
             }
             Ok(())
         });
@@ -962,5 +1084,109 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn defaults_to_no_email_handler_and_no_enforcement() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+
+            let config = Config::load().unwrap();
+            assert!(config.email_handler.is_none());
+            assert!(!config.require_verified_email);
+            assert_eq!(config.email_verification_code_ttl_secs, 900);
+            assert_eq!(config.email_verification_resend_cooldown_secs, 60);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_an_smtp_email_handler_and_lets_the_env_password_win() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "email_handler:\n  kind: smtp\n  host: mail.test\n  port: 465\n  tls: implicit\n  username: u\n  password: from-file\n  from: no-reply@example.com\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_EMAIL_SMTP_PASSWORD", "from-env");
+
+            let config = Config::load().unwrap();
+            match config.email_handler.expect("handler configured") {
+                EmailHandlerConfig::Smtp {
+                    host,
+                    port,
+                    tls,
+                    username,
+                    password,
+                    from,
+                    timeout_secs,
+                } => {
+                    assert_eq!(host, "mail.test");
+                    assert_eq!(port, 465);
+                    assert_eq!(tls, SmtpTls::Implicit);
+                    assert_eq!(username.as_deref(), Some("u"));
+                    assert_eq!(password.unwrap().expose_secret(), "from-env");
+                    assert_eq!(from, "no-reply@example.com");
+                    assert_eq!(timeout_secs, 10);
+                }
+                other => unreachable!("expected smtp, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn loads_a_plugin_email_handler_defaulting_to_the_email_plugin_user() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "email_handler:\n  kind: plugin\n  command: /bin/mailer\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+
+            let config = Config::load().unwrap();
+            match config.email_handler.expect("handler configured") {
+                EmailHandlerConfig::Plugin { uid, gid, .. } => {
+                    assert_eq!((uid, gid), (1003, 1003));
+                }
+                other => unreachable!("expected plugin, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn login_public_url_and_require_verified_email_load_from_the_environment() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+            jail.set_env("WA_REQUIRE_VERIFIED_EMAIL", "true");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.login_public_url.as_deref(),
+                Some("https://login.env.test")
+            );
+            assert!(config.require_verified_email);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn smtp_without_tls_is_only_allowed_for_loopback_hosts() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            assert!(
+                require_tls_or_loopback(host, SmtpTls::None).is_ok(),
+                "{host}"
+            );
+        }
+        let error = require_tls_or_loopback("smtp.example.com", SmtpTls::None).unwrap_err();
+        assert!(error.to_string().contains("smtp.example.com"), "{error}");
+    }
+
+    #[test]
+    fn smtp_with_tls_is_allowed_for_any_host() {
+        assert!(require_tls_or_loopback("smtp.example.com", SmtpTls::Starttls).is_ok());
+        assert!(require_tls_or_loopback("smtp.example.com", SmtpTls::Implicit).is_ok());
     }
 }

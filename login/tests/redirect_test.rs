@@ -282,3 +282,54 @@ async fn unknown_path_is_not_found() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn verify_email_page_has_a_code_form_and_a_resend_form_posting_to_bff() {
+    let app = app(test_config());
+
+    let resp = app
+        .oneshot(
+            Request::get("/verify-email.html?redirect_uri=http%3A%2F%2Fadmin.test%2F%22%3E%3Cb%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(!body.contains("<script"));
+    assert!(body.contains("id=\"verify-form\""));
+    assert!(body.contains("action=\"http://bff.test/verify-email\""));
+    assert!(body.contains("name=\"code\""));
+    // The code is all the user types: no password field, the session cookie carries the rest.
+    assert!(!body.contains("type=\"password\""));
+    assert!(body.contains("id=\"resend-form\""));
+    assert!(body.contains("action=\"http://bff.test/verify-email/resend\""));
+    // redirect_uri is attacker-controllable: it must not break out of its attribute.
+    assert!(!body.contains("<b>"));
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://admin.test/&quot;&gt;&lt;b&gt;\""));
+}
+
+#[tokio::test]
+async fn verify_email_page_reports_each_outcome() {
+    for (status, marker, forms) in [
+        ("invalid", "id=\"verify-invalid\"", true),
+        ("sent", "id=\"verify-sent\"", true),
+        ("session_expired", "id=\"verify-session-expired\"", false),
+        ("", "id=\"verify-intro\"", true),
+    ] {
+        let resp = app(test_config())
+            .oneshot(
+                Request::get(format!("/verify-email.html?status={status}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = body_string(resp).await;
+        assert!(body.contains(marker), "{status}: {body}");
+        assert_eq!(body.contains("id=\"verify-form\""), forms, "{status}");
+    }
+}

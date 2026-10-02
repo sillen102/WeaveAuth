@@ -29,13 +29,15 @@ RUN printf '%s\n' \
         'nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin' \
         'weaveauth:x:1000:1000:weaveauth:/nonexistent:/sbin/nologin' \
         'wa-registration:x:1001:1001:registration plugin:/nonexistent:/sbin/nologin' \
-        'wa-login-claims:x:1002:1002:login claims plugin:/nonexistent:/sbin/nologin' > /etc/passwd.runtime \
+        'wa-login-claims:x:1002:1002:login claims plugin:/nonexistent:/sbin/nologin' \
+        'wa-email:x:1003:1003:email plugin:/nonexistent:/sbin/nologin' > /etc/passwd.runtime \
     && printf '%s\n' \
         'root:x:0:' \
         'nogroup:x:65534:' \
         'weaveauth:x:1000:' \
         'wa-registration:x:1001:' \
-        'wa-login-claims:x:1002:' > /etc/group.runtime
+        'wa-login-claims:x:1002:' \
+        'wa-email:x:1003:' > /etc/group.runtime
 
 # Stage 2: Runtime. No shell and no package manager; backend execs plugin
 # binaries directly, so none is needed.
@@ -50,7 +52,9 @@ COPY --from=builder /app/target/release/weaveauth-launcher /usr/local/bin/weavea
 # carry over from the builder; plugin_privsep_flow.rs checks all three.
 COPY --from=builder /app/target/release/weaveauth-plugin-exec /usr/local/bin/weaveauth-plugin-exec
 COPY --from=builder /app/login/static /app/login/static
-COPY --from=builder /app/login/templates /app/login/templates
+# Deployer-replaceable templates: pages/ (login, register, ...) and emails/. Both services
+# read them from here (baked in at build time as /app/<crate>/../templates).
+COPY --from=builder /app/templates /app/templates
 ENV WA_SETUID_HELPER=/usr/local/bin/weaveauth-plugin-exec
 USER weaveauth
 EXPOSE 1983 8080 8081

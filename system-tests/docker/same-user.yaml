@@ -2,7 +2,7 @@
 # (1000), for plugin_privsep_flow.rs: backend's environment must stay hidden
 # even from this user, and this user must be able to run the setuid helper.
 extra_data_handler:
-  kind: process
+  kind: plugin
   command: /usr/local/bin/probe-plugin
   uid: 1000
   gid: 1000

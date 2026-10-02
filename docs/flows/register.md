@@ -13,9 +13,9 @@ Relevant code:
 - `bff/src/server/api/register.rs` -- browser-facing endpoint, forward + auto-login
 - `bff/src/server/api/complete_login.rs` -- shared PKCE exchange + session cookie
 - `backend/src/server/api/register.rs` -- validation, hashing, user creation
-- `backend/src/extra_data/mod.rs` -- `ExtraDataHandler` trait and payload contract
-- `backend/src/extra_data/webhook.rs` -- HTTP handler
-- `backend/src/extra_data/process.rs` -- adapter onto the generic plugin runtime
+- `backend/src/server/api/register.rs` (`extra_data` module) -- `ExtraDataHandler`
+  trait, webhook handler and the adapter onto the generic plugin runtime
+- `backend/src/server/api/email_verification.rs` -- the verification email sent on success
 - `backend/src/plugin/` -- the plugin runtime and its capabilities ([docs](../plugins.md))
 - `backend/src/crypto.rs` -- argon2 hashing primitives
 
@@ -75,9 +75,14 @@ Order matters here; each step gates the next.
     (`DownstreamServiceFailed`) and **no user is created**. Registration is only
     committed once the handler has accepted the extra data.
 - **`create_user`** performs an atomic check-and-insert -> `409` (`EmailTaken`) if the
-  email was taken in the meantime. `email_verified` is `false`: this app has no
-  verification-email flow of its own, only an OIDC provider confirming an address flips
-  that (see [OIDC](oidc.md)).
+  email was taken in the meantime. `email_verified` is `false` until the address is
+  confirmed, by entering the emailed code ([verify email](verify-email.md)) or by an OIDC provider
+  (see [OIDC](oidc.md)).
+- With an `email_handler` configured, a verification email with a 6-digit code is then sent
+  in a background task. If backend requires verification, bff's auto-login then gets only a
+  verification session and sends the new user to the code page rather than into the app
+  ([verify email](verify-email.md)). A delivery failure is logged and does not fail the registration, and
+  the registration response never waits for the mail server.
 - `201` on success.
 
 Two concurrent requests for the same brand-new email can both pass the pre-check and
@@ -102,7 +107,7 @@ An error from either kind fails the whole registration.
   registration request open.
 - Any transport error or non-2xx response fails the registration.
 
-**`kind: process`** -- runs the executable at `command` as a child process and calls
+**`kind: plugin`** -- runs the executable at `command` as a child process and calls
 its one generic `Invoke` rpc with `hook: "registration"` over gRPC.
 
 - The process is started when `AppState` is built and **waited for**: a missing binary,
@@ -138,8 +143,8 @@ its one generic `Invoke` rpc with `hook: "registration"` over gRPC.
 - **No rate limiting on backend's `/register`** itself. bff's `/register` is limited per
   IP; backend's endpoint, reachable directly by anything on the internal network, is
   not.
-- **No email verification** -- `email_verified` stays `false` for a
-  password-registered account until an OIDC provider confirms the address.
+- **Verification is optional by default** -- `email_verified` stays `false` until the
+  user enters the emailed code, and login only requires it with `require_verified_email`.
 - **Failure reasons don't reach the user.** Every backend rejection becomes
   `next?error=1`, so a taken email and a rejected extra field look identical in the
   browser.

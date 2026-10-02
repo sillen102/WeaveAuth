@@ -51,7 +51,12 @@ revocation failed.
 1. `take_reset_token` hashes the presented token and removes the entry.
    Missing or older than `password_reset_token_ttl_secs` (default 1800) -> 400.
    Single-use: the entry is gone whether or not the rest succeeds.
-2. **Revoke** every refresh token and login session for the user.
+2. **Revoke** every refresh token, login session and email-verification session
+   ([verify email](verify-email.md)) for the user, and clear their email-verification code state
+   (current code, resend cooldown, failure count, lockout). The last two matter when someone
+   registered the address first: the verification session they hold must not outlive the real
+   owner taking the account back, and guesses they burned on purpose to lock the owner out must
+   not carry over.
 3. Hash `new_password` with Argon2 on `spawn_blocking` -- it's deliberately
    CPU-heavy synchronous work and would otherwise stall a tokio worker.
 4. `set_password`. `UserNotFound` -> 400, reported as the same token-shaped

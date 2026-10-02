@@ -34,7 +34,7 @@ const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
 /// logic at all). Re-globbed on every request rather than loaded once, so a
 /// deployer can drop in a new file without restarting the process, matching
 /// how the static assets in `STATIC_DIR` already behave.
-const TEMPLATES_GLOB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/*.html");
+const TEMPLATES_GLOB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../templates/pages/*.html");
 
 /// The login shell -- compiled into the binary rather than served from
 /// `STATIC_DIR`, so a deployer replacing the static dir's contents (to
@@ -98,6 +98,7 @@ pub fn app(config: Config) -> Router {
         .route("/index.html", get(index_page))
         .route("/login.html", get(login_page))
         .route("/register.html", get(register_page))
+        .route("/verify-email.html", get(verify_email_page))
         .nest_service("/static", files.clone())
         .fallback_service(files)
         .with_state(config)
@@ -118,6 +119,9 @@ struct PageQuery {
     redirect_uri: Option<String>,
     error: Option<String>,
     email: Option<String>,
+    /// What bff bounced back with on the verification page: `invalid`, `sent`
+    /// or `session_expired`.
+    status: Option<String>,
 }
 
 async fn login_page(
@@ -134,6 +138,14 @@ async fn register_page(
     Query(query): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
     render_page("register.html", &config, uri.path(), &query)
+}
+
+async fn verify_email_page(
+    State(config): State<Config>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, StatusCode> {
+    render_page("verify-email.html", &config, uri.path(), &query)
 }
 
 /// Renders one of the deployer-replaceable page templates, computing the
@@ -163,6 +175,7 @@ fn render_page(
     ctx.insert("own_url", &own_url);
     ctx.insert("error", &query.error);
     ctx.insert("email", &query.email);
+    ctx.insert("status", &query.status);
 
     let mut tera = Tera::new();
     tera.register_filter("urlencode", urlencode_filter);

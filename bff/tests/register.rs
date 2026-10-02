@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use std::net::SocketAddr;
@@ -57,8 +58,14 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
         )
         .route(
             "/oauth/login",
-            post(|Json(_body): Json<serde_json::Value>| async move {
-                Json(serde_json::json!({"login_session": "stub-session"}))
+            post(|Json(body): Json<serde_json::Value>| async move {
+                // Backend refuses to log in an unverified account when it
+                // requires verification.
+                if body["email"] == "needs-verification" {
+                    return Json(serde_json::json!({"verification_session": "vs-1", "verification_session_ttl_secs": 600}))
+                        .into_response();
+                }
+                Json(serde_json::json!({"login_session": "stub-session"})).into_response()
             }),
         )
         .route(
@@ -142,6 +149,57 @@ async fn registering_immediately_logs_in_and_lands_on_redirect_uri() -> anyhow::
         .get("set-cookie")
         .and_then(|v| v.to_str().ok());
     assert!(set_cookie.is_some_and(|c| c.starts_with("wa_session=") && c.contains("HttpOnly")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn registering_where_backend_requires_verification_lands_on_the_code_page()
+-> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(register_request(
+            "needs-verification",
+            "http://admin.test/",
+            "http://login.test/register.html",
+        )?)
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(
+        loc,
+        Some("http://login.test/verify-email.html?redirect_uri=http%3A%2F%2Fadmin.test%2F")
+    );
+    let cookies: Vec<_> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(cookies.len(), 1, "{cookies:?}");
+    assert!(
+        cookies[0].starts_with("wa_verify_session=vs-1;"),
+        "{cookies:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn refuses_a_next_outside_the_trusted_origins() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(register_request(
+            "alice",
+            "http://admin.test/",
+            "http://evil.test/register.html",
+        )?)
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 

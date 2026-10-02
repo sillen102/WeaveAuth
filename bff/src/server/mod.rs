@@ -9,6 +9,7 @@ mod api;
 pub(crate) mod cookie;
 pub(crate) mod origin_check;
 pub mod router;
+pub(crate) mod verification;
 
 #[derive(Clone)]
 pub(crate) struct AppState {

@@ -1,6 +1,6 @@
 pub(crate) use controller::issue_token;
 pub(crate) use controller::issue_token_doc;
-pub(crate) use login_claims::{LoginClaimsHandler, PLUGIN_NAME, ProcessHandler, WebhookHandler};
+pub(crate) use login_claims::{LoginClaimsHandler, PLUGIN_NAME, PluginHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -387,18 +387,18 @@ mod login_claims {
     /// in any language with a gRPC server; WeaveAuth only needs the contract
     /// in `plugin-sdk/proto` on the way in and a `google.protobuf.Struct` on
     /// the way out.
-    pub(crate) struct ProcessHandler {
+    pub(crate) struct PluginHandler {
         plugin: PluginProcess,
     }
 
-    impl ProcessHandler {
+    impl PluginHandler {
         pub(crate) fn new(plugin: PluginProcess) -> Self {
             Self { plugin }
         }
     }
 
     #[async_trait::async_trait]
-    impl LoginClaimsHandler for ProcessHandler {
+    impl LoginClaimsHandler for PluginHandler {
         async fn fetch(
             &self,
             user_id: Uuid,
@@ -643,6 +643,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            email_verification: crate::server::api::email_verification::EmailVerification::disabled(
+            ),
             password_reset_tokens:
                 crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,

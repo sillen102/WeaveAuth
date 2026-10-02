@@ -11,7 +11,7 @@ pub fn plugin_handler(
     env: HashMap<String, String>,
     timeout_secs: u64,
 ) -> ExtraDataHandlerConfig {
-    ExtraDataHandlerConfig::Process {
+    ExtraDataHandlerConfig::Plugin {
         command: command.to_string(),
         args: vec![],
         env,
@@ -24,7 +24,7 @@ pub fn plugin_handler(
 
 /// A backend `login_claims_handler` running `command`.
 pub fn login_claims_handler(command: &str, timeout_secs: u64) -> LoginClaimsHandlerConfig {
-    LoginClaimsHandlerConfig::Process {
+    LoginClaimsHandlerConfig::Plugin {
         command: command.to_string(),
         args: vec![],
         env: HashMap::new(),

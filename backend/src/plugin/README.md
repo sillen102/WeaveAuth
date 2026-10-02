@@ -30,9 +30,9 @@ status onto its own error type — don't leak it into an HTTP response.
 Wiring a plugin into a second flow is **a new `hook` name**, not a new rpc or a
 new runtime: `PluginProcess::invoke` is generic over every hook, so a flow only
 needs to build the right `PluginRequest` and interpret the right `data` shape
-back. `crate::server::api::register` and `crate::server::api::token` are the
-two callers today, each with its own handler trait
-(`ExtraDataHandler`/`LoginClaimsHandler`) and `Process`/`Webhook`
+back. `crate::server::api::register`, `crate::server::api::token` and
+`crate::server::api::email_verification` are the three callers today, each with its own
+handler trait (`ExtraDataHandler`/`LoginClaimsHandler`/`EmailVerificationHandler`) and `Plugin`/`Webhook`
 implementations living in that endpoint's own file, per the vertical-slice
 rule in `backend/AGENTS.md` -- this module only owns the process/gRPC
 mechanics shared by every hook.
@@ -103,7 +103,7 @@ Invariants worth not breaking:
   enforces it before a call reaches the plugin's own code.
 - **The plugin runs as its configured `uid`/`gid`, never 0.** `start` refuses
   0 and warns when the uid is this process's own. Each hook defaults to its
-  own id (registration 1001, login claims 1002), so plugins can't read
+  own id (registration 1001, login claims 1002, email 1003), so plugins can't read
   WeaveAuth's memory and environment, or each other's.
 - **This process never holds the capabilities that switching takes.** With
   `Config::setuid_helper` set (the image sets `WA_SETUID_HELPER`), `spawn`

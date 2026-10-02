@@ -39,6 +39,13 @@ run = "cargo test --workspace"
 description = "Run cross-service system tests (excludes the Docker-gated ones, see test-docker)"
 run = "cargo test -p weaveauth-system-tests"
 
+[tasks.format]
+description = "Format Rust code with rustfmt and Go code with gofmt"
+run = [
+    "cargo fmt --all",
+    "cd plugin-sdk/go && gofmt -w .",
+]
+
 [tasks.lint]
 description = "Run linters for all services and common code"
 depends = [

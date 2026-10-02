@@ -11,7 +11,10 @@ mod controller {
     use thiserror::Error;
 
     use crate::server::AppState;
-    use crate::server::origin_check::require_trusted_origin;
+    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
+    use crate::server::verification::{
+        redirect_to_verification, with_optional_verification_cookie,
+    };
 
     use super::service::{self, LoginOutcome, LoginServiceError};
 
@@ -37,6 +40,12 @@ mod controller {
         #[error("redirect_uri is not allowed")]
         #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
         InvalidRedirectUri,
+        #[error("next is not a same-origin path or a trusted origin")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "next is not a same-origin path or a trusted origin"
+        )]
+        InvalidNext,
         #[error("token exchange failed")]
         #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
         TokenExchangeFailed,
@@ -76,6 +85,9 @@ mod controller {
             tracing::warn!(%error, "request rejected");
             LoginError::UntrustedOrigin
         })?;
+        if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
+            return Err(LoginError::InvalidNext);
+        }
 
         match service::login(&mut state, &req.email, &req.password, &req.redirect_uri).await? {
             LoginOutcome::Rejected => {
@@ -86,26 +98,43 @@ mod controller {
                 )
                     .into_response())
             }
-            LoginOutcome::Authenticated(cookie) => Ok((
-                StatusCode::SEE_OTHER,
-                [
-                    (header::LOCATION, req.redirect_uri),
-                    (header::SET_COOKIE, cookie),
-                ],
-                Body::empty(),
-            )
-                .into_response()),
+            // Backend withheld the login session until the email is verified.
+            LoginOutcome::VerificationRequired { verification } => Ok(redirect_to_verification(
+                &state.config,
+                &req.next,
+                &req.redirect_uri,
+                &verification,
+            )),
+            // Verification is optional here: logged in, and the code page
+            // stays reachable for a while.
+            LoginOutcome::Authenticated {
+                cookie,
+                verification,
+            } => Ok(with_optional_verification_cookie(
+                (
+                    StatusCode::SEE_OTHER,
+                    [
+                        (header::LOCATION, req.redirect_uri),
+                        (header::SET_COOKIE, cookie),
+                    ],
+                    Body::empty(),
+                )
+                    .into_response(),
+                &state.config,
+                verification.as_ref(),
+            )),
         }
     }
 }
 
 mod service {
     use axum::http::StatusCode;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use thiserror::Error;
 
     use crate::server::AppState;
     use crate::server::api::complete_login::{CompleteLoginServiceError, complete_login};
+    use crate::server::verification::{BackendLoginResponse, VerificationSession};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum LoginServiceError {
@@ -139,14 +168,17 @@ mod service {
         password: &'a str,
     }
 
-    #[derive(Deserialize)]
-    struct LoginSessionResponse {
-        login_session: String,
-    }
-
     pub(crate) enum LoginOutcome {
-        /// `Set-Cookie` header value for the new session.
-        Authenticated(String),
+        Authenticated {
+            /// `Set-Cookie` header value for the new session.
+            cookie: String,
+            /// Set when the account's email isn't verified but verification
+            /// is optional.
+            verification: Option<VerificationSession>,
+        },
+        /// Right credentials, but backend requires a verified email first and
+        /// handed out only this restricted session.
+        VerificationRequired { verification: VerificationSession },
         /// Wrong credentials.
         Rejected,
     }
@@ -192,19 +224,32 @@ mod service {
                 verify_resp.status()
             )));
         }
-        let login_session = verify_resp
-            .json::<LoginSessionResponse>()
+        let sessions = verify_resp
+            .json::<BackendLoginResponse>()
             .await
             .map_err(|error| {
                 LoginServiceError::BackendUnavailable(format!(
                     "login response unreadable: {}",
                     common::error::cause_chain(&error.without_url())
                 ))
-            })?
-            .login_session;
+            })?;
 
-        let cookie = complete_login(state, &login_session, redirect_uri).await?;
-        Ok(LoginOutcome::Authenticated(cookie))
+        let verification = sessions
+            .verification()
+            .map_err(|cause| LoginServiceError::BackendUnavailable(cause.to_string()))?;
+        match (sessions.login_session, verification) {
+            (Some(login_session), verification) => {
+                let cookie = complete_login(state, &login_session, redirect_uri).await?;
+                Ok(LoginOutcome::Authenticated {
+                    cookie,
+                    verification,
+                })
+            }
+            (None, Some(verification)) => Ok(LoginOutcome::VerificationRequired { verification }),
+            (None, None) => Err(LoginServiceError::BackendUnavailable(
+                "login response carries no session".to_string(),
+            )),
+        }
     }
 }
 

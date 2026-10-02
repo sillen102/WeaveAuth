@@ -14,9 +14,13 @@ mod controller {
     use thiserror::Error;
 
     use crate::server::AppState;
-    use crate::server::origin_check::require_trusted_origin;
+    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
 
-    use super::service::{self, RegisterOutcome, RegisterServiceError};
+    use crate::server::verification::{
+        redirect_to_verification, with_optional_verification_cookie,
+    };
+
+    use super::service::{self, AutoLogin, RegisterOutcome, RegisterServiceError};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct RegisterRequest {
@@ -43,6 +47,12 @@ mod controller {
             details = "request did not come from a trusted origin"
         )]
         UntrustedOrigin,
+        #[error("next is not a same-origin path or a trusted origin")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "next is not a same-origin path or a trusted origin"
+        )]
+        InvalidNext,
         #[error("backend returned an unexpected response")]
         #[error_response(
             StatusCode::BAD_GATEWAY,
@@ -93,6 +103,9 @@ mod controller {
             tracing::warn!(%error, "request rejected");
             RegisterError::UntrustedOrigin
         })?;
+        if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
+            return Err(RegisterError::InvalidNext);
+        }
 
         match service::register(&mut state, &req.email, &req.password, req.extra).await? {
             RegisterOutcome::Rejected => {
@@ -109,15 +122,32 @@ mod controller {
                 )
                 .await
                 {
-                    Some(cookie) => (
-                        StatusCode::SEE_OTHER,
-                        [
-                            (header::LOCATION, req.redirect_uri),
-                            (header::SET_COOKIE, cookie),
-                        ],
-                    )
-                        .into_response(),
-                    None => (StatusCode::SEE_OTHER, [(header::LOCATION, req.next)]).into_response(),
+                    AutoLogin::LoggedIn {
+                        cookie,
+                        verification,
+                    } => with_optional_verification_cookie(
+                        (
+                            StatusCode::SEE_OTHER,
+                            [
+                                (header::LOCATION, req.redirect_uri),
+                                (header::SET_COOKIE, cookie),
+                            ],
+                        )
+                            .into_response(),
+                        &state.config,
+                        verification.as_ref(),
+                    ),
+                    // Backend requires a verified email: the new user lands on
+                    // the code page, never in the app.
+                    AutoLogin::VerificationRequired { verification } => redirect_to_verification(
+                        &state.config,
+                        &req.next,
+                        &req.redirect_uri,
+                        &verification,
+                    ),
+                    AutoLogin::Failed => {
+                        (StatusCode::SEE_OTHER, [(header::LOCATION, req.next)]).into_response()
+                    }
                 };
                 Ok(response)
             }
@@ -126,12 +156,13 @@ mod controller {
 }
 
 mod service {
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use std::collections::HashMap;
     use thiserror::Error;
 
     use crate::server::AppState;
     use crate::server::api::complete_login::complete_login;
+    use crate::server::verification::{BackendLoginResponse, VerificationSession};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum RegisterServiceError {
@@ -145,11 +176,6 @@ mod service {
         password: &'a str,
         #[serde(flatten)]
         extra: HashMap<String, String>,
-    }
-
-    #[derive(Deserialize)]
-    struct LoginSessionResponse {
-        login_session: String,
     }
 
     pub(crate) enum RegisterOutcome {
@@ -199,22 +225,36 @@ mod service {
         Ok(RegisterOutcome::Created)
     }
 
+    pub(crate) enum AutoLogin {
+        LoggedIn {
+            /// `Set-Cookie` header value for the new session.
+            cookie: String,
+            verification: Option<VerificationSession>,
+        },
+        /// Backend withheld the login session until the email is verified.
+        VerificationRequired {
+            verification: VerificationSession,
+        },
+        Failed,
+    }
+
     /// Verifies the just-registered credentials against backend's
     /// `/oauth/login`, then drives the same PKCE exchange `start_login` uses.
-    /// `None` on any failure (logged here, since it isn't returned) -- the
-    /// caller falls back to sending the user to the login page instead.
-    /// Returns the `Set-Cookie` header value for the new session.
+    /// A failure is logged here, since it isn't returned -- the caller falls
+    /// back to sending the user to the login page instead.
     pub(crate) async fn auto_login(
         state: &mut AppState,
         email: &str,
         password: &str,
         redirect_uri: &str,
-    ) -> Option<String> {
-        let result = try_auto_login(state, email, password, redirect_uri).await;
-        if let Err(cause) = &result {
-            tracing::warn!(%cause, "auto-login after registration failed");
+    ) -> AutoLogin {
+        match try_auto_login(state, email, password, redirect_uri).await {
+            Ok(outcome) => outcome,
+            Err(cause) => {
+                tracing::warn!(%cause, "auto-login after registration failed");
+                AutoLogin::Failed
+            }
         }
-        result.ok()
     }
 
     async fn try_auto_login(
@@ -222,7 +262,7 @@ mod service {
         email: &str,
         password: &str,
         redirect_uri: &str,
-    ) -> Result<String, String> {
+    ) -> Result<AutoLogin, String> {
         let verify_resp = state
             .http_client
             .post(format!("{}/oauth/login", state.config.backend_url))
@@ -242,20 +282,30 @@ mod service {
         if !verify_resp.status().is_success() {
             return Err(format!("login returned {}", verify_resp.status()));
         }
-        let login_session = verify_resp
-            .json::<LoginSessionResponse>()
+        let sessions = verify_resp
+            .json::<BackendLoginResponse>()
             .await
             .map_err(|error| {
                 format!(
                     "login response unreadable: {}",
                     common::error::cause_chain(&error.without_url())
                 )
-            })?
-            .login_session;
+            })?;
 
-        complete_login(state, &login_session, redirect_uri)
-            .await
-            .map_err(|error| error.to_string())
+        let verification = sessions.verification().map_err(|cause| cause.to_string())?;
+        match (sessions.login_session, verification) {
+            (Some(login_session), verification) => {
+                let cookie = complete_login(state, &login_session, redirect_uri)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(AutoLogin::LoggedIn {
+                    cookie,
+                    verification,
+                })
+            }
+            (None, Some(verification)) => Ok(AutoLogin::VerificationRequired { verification }),
+            (None, None) => Err("login response carries no session".to_string()),
+        }
     }
 }
 

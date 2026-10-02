@@ -1,8 +1,12 @@
 use crate::config::{
-    Config, ExtraDataHandlerConfig, LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig,
+    Config, EmailHandlerConfig, ExtraDataHandlerConfig, LoginClaimsHandlerConfig,
+    OidcProviderConfig, ProfileApiConfig,
 };
 use crate::oidc::{self, OidcClient};
 use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
+use crate::server::api::email_verification::{
+    self, EmailVerification, EmailVerificationHandler, PLUGIN_NAME as EMAIL_PLUGIN_NAME,
+};
 use crate::server::api::register::{self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME};
 use crate::server::api::token::{
     self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
@@ -10,9 +14,10 @@ use crate::server::api::token::{
 use crate::server::router::router;
 use crate::storage::ExpiryMaintenance;
 use crate::storage::in_memory::{
-    InMemoryJwkStorage, InMemoryLoginSessionStorage, InMemoryOidcStateStorage,
-    InMemoryPasswordResetTokenStorage, InMemoryPendingOidcLinkStorage, InMemoryPkceStorage,
-    InMemoryRefreshTokenStorage, InMemoryUserStorage,
+    InMemoryEmailVerificationCodeStorage, InMemoryJwkStorage, InMemoryLoginSessionStorage,
+    InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage, InMemoryPendingOidcLinkStorage,
+    InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
+    InMemoryVerificationSessionStorage,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,6 +51,7 @@ pub(crate) struct AppState {
     pub(crate) max_bcrypt_cost: u32,
     pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
     pub(crate) login_claims_handler: Option<Arc<dyn LoginClaimsHandler>>,
+    pub(crate) email_verification: EmailVerification,
 }
 
 impl AppState {
@@ -58,6 +64,16 @@ impl AppState {
         self.oidc_state.sweep_expired().await;
         self.pending_oidc_links.sweep_expired().await;
         self.password_reset_tokens.sweep_expired().await;
+        self.email_verification.codes.sweep_expired().await;
+        self.email_verification.sessions.sweep_expired().await;
+    }
+
+    /// A fully wired state with default config and no handlers.
+    #[cfg(test)]
+    pub(crate) async fn for_test() -> Self {
+        Self::new(&Config::default())
+            .await
+            .expect("default config boots")
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
@@ -104,6 +120,14 @@ impl AppState {
             config.setuid_helper.as_deref(),
         )
         .await?;
+        if config.email_handler.is_some() && config.login_public_url.is_none() {
+            anyhow::bail!("email_handler is configured but login_public_url is not set");
+        }
+        let email_handler = build_email_handler(
+            config.email_handler.as_ref(),
+            config.setuid_helper.as_deref(),
+        )
+        .await?;
 
         Ok(Self {
             pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
@@ -147,6 +171,20 @@ impl AppState {
             max_bcrypt_cost: config.max_bcrypt_cost,
             extra_data_handler,
             login_claims_handler,
+            email_verification: EmailVerification {
+                codes: InMemoryEmailVerificationCodeStorage::new(
+                    config.email_verification_code_ttl_secs,
+                    config.email_verification_resend_cooldown_secs,
+                ),
+                sessions: InMemoryVerificationSessionStorage::new(
+                    config.email_verification_session_ttl_secs,
+                ),
+                session_ttl_secs: config.email_verification_session_ttl_secs,
+                handler: email_handler,
+                login_public_url: config.login_public_url.clone(),
+                code_ttl_secs: config.email_verification_code_ttl_secs,
+                required: config.require_verified_email,
+            },
         })
     }
 }
@@ -160,7 +198,7 @@ async fn build_extra_data_handler(
         Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
             register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
         ),
-        Some(ExtraDataHandlerConfig::Process {
+        Some(ExtraDataHandlerConfig::Plugin {
             command,
             args,
             env,
@@ -190,7 +228,7 @@ async fn build_extra_data_handler(
                 setuid_helper: setuid_helper.map(PathBuf::from),
             })
             .await?;
-            Arc::new(register::ProcessHandler::new(plugin))
+            Arc::new(register::PluginHandler::new(plugin))
         }
     };
     Ok(Some(handler))
@@ -205,7 +243,7 @@ async fn build_login_claims_handler(
         Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
             token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
         ),
-        Some(LoginClaimsHandlerConfig::Process {
+        Some(LoginClaimsHandlerConfig::Plugin {
             command,
             args,
             env,
@@ -235,10 +273,84 @@ async fn build_login_claims_handler(
                 setuid_helper: setuid_helper.map(PathBuf::from),
             })
             .await?;
-            Arc::new(token::ProcessHandler::new(plugin))
+            Arc::new(token::PluginHandler::new(plugin))
         }
     };
     Ok(Some(handler))
+}
+
+async fn build_email_handler(
+    config: Option<&EmailHandlerConfig>,
+    setuid_helper: Option<&str>,
+) -> anyhow::Result<Option<Arc<dyn EmailVerificationHandler>>> {
+    let handler: Arc<dyn EmailVerificationHandler> = match config {
+        None => return Ok(None),
+        Some(EmailHandlerConfig::Smtp {
+            host,
+            port,
+            tls,
+            username,
+            password,
+            from,
+            timeout_secs,
+        }) => Arc::new(email_verification::SmtpHandler::new(
+            host,
+            *port,
+            *tls,
+            smtp_credentials(username, password)?,
+            from,
+            Duration::from_secs(*timeout_secs),
+            email_verification::TEMPLATES_GLOB,
+        )?),
+        Some(EmailHandlerConfig::Webhook { url, timeout_secs }) => {
+            Arc::new(email_verification::WebhookHandler::new(
+                url.clone(),
+                Duration::from_secs(*timeout_secs),
+            )?)
+        }
+        Some(EmailHandlerConfig::Plugin {
+            command,
+            args,
+            env,
+            timeout_secs,
+            startup_timeout_secs,
+            uid,
+            gid,
+        }) => {
+            // Ambient `WA_PLUGIN_EMAIL_ENV_*` first, then the config file.
+            let mut plugin_env: HashMap<_, _> =
+                forwarded_env(std::env::vars_os(), EMAIL_PLUGIN_NAME)
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                    .collect();
+            plugin_env.extend(env.clone());
+
+            let plugin = PluginProcess::start(PluginConfig {
+                command: command.clone(),
+                args: args.clone(),
+                env: plugin_env,
+                timeout: Duration::from_secs(*timeout_secs),
+                startup_timeout: Duration::from_secs(*startup_timeout_secs),
+                uid: *uid,
+                gid: *gid,
+                setuid_helper: setuid_helper.map(PathBuf::from),
+            })
+            .await?;
+            Arc::new(email_verification::PluginHandler::new(plugin))
+        }
+    };
+    Ok(Some(handler))
+}
+
+fn smtp_credentials(
+    username: &Option<String>,
+    password: &Option<secrecy::SecretString>,
+) -> anyhow::Result<Option<(String, secrecy::SecretString)>> {
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(Some((username.clone(), password.clone()))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("smtp email_handler needs both username and password, or neither"),
+    }
 }
 
 pub async fn app_start(config: &Config) -> anyhow::Result<()> {
@@ -326,6 +438,104 @@ mod tests {
             config.login_claims_handler = Some(login);
         }
         config
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_with_an_email_handler_but_no_login_public_url() {
+        let config = Config {
+            email_handler: Some(EmailHandlerConfig::Webhook {
+                url: "http://localhost:1/email".to_string(),
+                timeout_secs: 1,
+            }),
+            ..Config::default()
+        };
+
+        let error = AppState::new(&config).await.err().expect("startup fails");
+
+        assert!(
+            error.to_string().contains("login_public_url"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starts_with_an_email_handler_and_a_login_public_url() {
+        let config = Config {
+            email_handler: Some(EmailHandlerConfig::Webhook {
+                url: "http://localhost:1/email".to_string(),
+                timeout_secs: 1,
+            }),
+            login_public_url: Some("http://localhost:8081".to_string()),
+            ..Config::default()
+        };
+
+        let state = AppState::new(&config).await.expect("startup succeeds");
+
+        assert!(state.email_verification.handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn starts_with_an_smtp_email_handler_using_the_bundled_templates() {
+        let config = Config {
+            email_handler: Some(EmailHandlerConfig::Smtp {
+                host: "127.0.0.1".to_string(),
+                port: 1025,
+                tls: crate::config::SmtpTls::None,
+                username: Some("u".to_string()),
+                password: Some("p".to_string().into()),
+                from: "no-reply@example.com".to_string(),
+                timeout_secs: 1,
+            }),
+            login_public_url: Some("http://localhost:8081".to_string()),
+            ..Config::default()
+        };
+
+        let state = AppState::new(&config).await.expect("startup succeeds");
+
+        assert!(state.email_verification.handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_missing_email_plugin_command_at_startup() {
+        let config = Config {
+            email_handler: Some(EmailHandlerConfig::Plugin {
+                command: "/nonexistent/mailer".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                timeout_secs: 1,
+                startup_timeout_secs: 1,
+                uid: 1003,
+                gid: 1003,
+            }),
+            login_public_url: Some("http://localhost:8081".to_string()),
+            ..Config::default()
+        };
+
+        assert!(AppState::new(&config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refuses_smtp_credentials_with_only_a_username() {
+        let config = Config {
+            email_handler: Some(EmailHandlerConfig::Smtp {
+                host: "127.0.0.1".to_string(),
+                port: 1025,
+                tls: crate::config::SmtpTls::None,
+                username: Some("u".to_string()),
+                password: None,
+                from: "no-reply@example.com".to_string(),
+                timeout_secs: 1,
+            }),
+            login_public_url: Some("http://localhost:8081".to_string()),
+            ..Config::default()
+        };
+
+        let error = AppState::new(&config).await.err().expect("startup fails");
+
+        assert!(
+            error.to_string().contains("username and password"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

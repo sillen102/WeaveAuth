@@ -5,6 +5,7 @@
 // Also backend's webhook target for both plugin hooks (see backend/config.yaml):
 // POST /hooks/register stores first/last name + phone number per user_id,
 // POST /hooks/login-claims returns them as token claims. In-memory only.
+// POST /hooks/email-verification prints the verification link.
 //
 // Run: cargo run
 // Port: $PORT, default 10001.
@@ -34,12 +35,20 @@ async fn main() {
     let app = Router::new()
         .route("/hooks/register", post(register_hook))
         .route("/hooks/login-claims", post(login_claims_hook))
+        .route("/hooks/email-verification", post(email_verification_hook))
         .fallback(any(handler));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
     println!("downstream-service listening on :{port}");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Email verification webhook: body is `{user_id, email, code, verify_page_url,
+/// expires_at}`. A real service would email the code; this prints it.
+async fn email_verification_hook(Json(body): Json<Value>) -> StatusCode {
+    println!("verification code for {}: {}", body["email"], body["code"]);
+    StatusCode::NO_CONTENT
 }
 
 /// Registration webhook: body is `{user_id, email, fields}`.

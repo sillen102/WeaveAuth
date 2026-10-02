@@ -107,8 +107,9 @@ mod service {
     use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{
-        LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, RevokeOutcome,
-        SetPasswordOutcome, UserStorage,
+        EmailVerificationCodeStorage, LoginSessionStorage, PasswordResetTokenStorage,
+        RefreshTokenStorage, RevokeOutcome, SetPasswordOutcome, UserStorage,
+        VerificationSessionStorage,
     };
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -202,6 +203,22 @@ mod service {
                 "revoking login sessions failed".to_string(),
             ));
         }
+        if state
+            .email_verification
+            .sessions
+            .revoke_all_for_user(user_id)
+            .await
+            == RevokeOutcome::Failed
+        {
+            return Err(PasswordResetConfirmServiceError::UnexpectedError(
+                "revoking verification sessions failed".to_string(),
+            ));
+        }
+        if state.email_verification.codes.clear_user(user_id).await == RevokeOutcome::Failed {
+            return Err(PasswordResetConfirmServiceError::UnexpectedError(
+                "clearing email verification codes failed".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -211,8 +228,10 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
+    use crate::storage::{CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome};
     use crate::storage::{
         LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage,
+        VerificationSessionStorage,
     };
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
@@ -237,6 +256,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
+            email_verification: crate::server::api::email_verification::EmailVerification::disabled(
+            ),
             password_reset_tokens:
                 crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
@@ -350,6 +371,112 @@ mod tests {
             state.login_sessions.take_session(&login_session).await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn confirm_revokes_verification_sessions_too() {
+        // An attacker who registered the victim's address holds a verification
+        // session; after the victim resets the password it must be worthless.
+        let mut state = state();
+        let user = User {
+            email: "alice@example.com".to_string(),
+            password: Some(PasswordHash::Argon2("old-hash".into())),
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let other = state
+            .email_verification
+            .sessions
+            .create_session(Uuid::new_v4())
+            .await;
+        let session = state
+            .email_verification
+            .sessions
+            .create_session(user_id)
+            .await;
+        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+
+        let req = PasswordResetConfirmRequest {
+            token,
+            new_password: "new-password".to_string(),
+        };
+        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        assert_eq!(result, Ok(StatusCode::OK));
+
+        assert_eq!(
+            state
+                .email_verification
+                .sessions
+                .get_session(&session)
+                .await,
+            None
+        );
+        // Someone else's session is untouched.
+        assert!(
+            state
+                .email_verification
+                .sessions
+                .get_session(&other)
+                .await
+                .is_some()
+        );
+    }
+
+    // Someone who squatted the address can burn guesses just before the owner
+    // resets the password; the lockout must not outlive the reset.
+    #[tokio::test]
+    async fn confirm_clears_a_verification_lockout() {
+        let mut state = state();
+        let user = User {
+            email: "alice@example.com".to_string(),
+            password: Some(PasswordHash::Argon2("old-hash".into())),
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        state.email_verification.codes =
+            crate::storage::in_memory::InMemoryEmailVerificationCodeStorage::new(900, 0);
+        let mut code = match state.email_verification.codes.issue_code(user_id).await {
+            IssueCodeOutcome::Issued(code) => code,
+            _ => unreachable!("fresh user"),
+        };
+        for _ in 0..2 {
+            let wrong = if code == "000000" { "000001" } else { "000000" };
+            for _ in 0..5 {
+                let _ = state
+                    .email_verification
+                    .codes
+                    .check_code(user_id, wrong)
+                    .await;
+            }
+            if let IssueCodeOutcome::Issued(next) =
+                state.email_verification.codes.issue_code(user_id).await
+            {
+                code = next;
+            }
+        }
+        assert_eq!(
+            state
+                .email_verification
+                .codes
+                .check_code(user_id, &code)
+                .await,
+            CheckCodeOutcome::Locked
+        );
+        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+
+        let req = PasswordResetConfirmRequest {
+            token,
+            new_password: "new-password".to_string(),
+        };
+        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        assert_eq!(result, Ok(StatusCode::OK));
+
+        assert!(matches!(
+            state.email_verification.codes.issue_code(user_id).await,
+            IssueCodeOutcome::Issued(_)
+        ));
     }
 
     #[tokio::test]
