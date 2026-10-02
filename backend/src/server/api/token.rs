@@ -638,6 +638,7 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
+            jwt_key_rotation_interval_secs: 2_592_000,
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),

@@ -676,6 +676,7 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
+            jwt_key_rotation_interval_secs: 2_592_000,
             oidc_providers: Arc::new(HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
@@ -830,7 +831,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(signing_key.jwk_set()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "keys": [signing_key.jwk()] })),
+            )
             .mount(&server)
             .await;
 
