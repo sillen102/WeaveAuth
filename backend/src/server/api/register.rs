@@ -470,6 +470,9 @@ mod tests {
     use super::controller::*;
     use super::extra_data::{ExtraDataError, ExtraDataHandler};
     use crate::server::AppState;
+    use crate::server::api::email_verification::test_support::{
+        Sent, assert_nothing_sent, install_recorder, next_sent,
+    };
     use crate::storage::UserStorage;
     use crate::storage::in_memory::InMemoryUserStorage;
     use axum::extract::{Json, State};
@@ -550,24 +553,9 @@ mod tests {
         );
     }
 
-    struct Recorder(tokio::sync::mpsc::UnboundedSender<String>);
-
-    #[async_trait::async_trait]
-    impl crate::server::api::email_verification::EmailVerificationHandler for Recorder {
-        async fn send(
-            &self,
-            mail: &crate::server::api::email_verification::VerificationEmail,
-        ) -> Result<(), crate::server::api::email_verification::EmailDeliveryError> {
-            let _ = self.0.send(mail.email.clone());
-            Ok(())
-        }
-    }
-
-    fn state_with_recorder() -> (AppState, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn state_with_recorder() -> (AppState, tokio::sync::mpsc::UnboundedReceiver<Sent>) {
         let mut state = state();
-        state.email_verification.handler = Some(Arc::new(Recorder(tx)));
-        state.email_verification.login_public_url = Some("https://login.test".to_string());
+        let rx = install_recorder(&mut state, false);
         (state, rx)
     }
 
@@ -578,10 +566,18 @@ mod tests {
         let result = register(State(state), ApiJson(req("Alice+x@Example.com", "hunter2"))).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a mail was sent");
-        assert_eq!(sent.as_deref(), Some("alice@example.com"));
+        assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn registering_sends_the_code_even_when_verification_is_required() {
+        let (mut state, mut rx) = state_with_recorder();
+        state.email_verification.required = true;
+
+        let result = register(State(state), ApiJson(req("alice@example.com", "hunter2"))).await;
+
+        assert_eq!(result, Ok(StatusCode::CREATED));
+        assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
     }
 
     #[tokio::test]
@@ -591,8 +587,7 @@ mod tests {
         let result = register(State(state), ApiJson(req("not-an-email", "hunter2"))).await;
 
         assert_eq!(result.err(), Some(RegisterError::InvalidEmail));
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(rx.try_recv().is_err());
+        assert_nothing_sent(&mut rx).await;
     }
 
     #[tokio::test]

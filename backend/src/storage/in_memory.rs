@@ -564,6 +564,15 @@ impl EmailVerificationCodeStorage for InMemoryEmailVerificationCodeStorage {
         CheckCodeOutcome::Wrong
     }
 
+    async fn has_live_code(&self, user_id: Uuid) -> bool {
+        self.users.lock().await.get(&user_id).is_some_and(|user| {
+            user.code.is_some()
+                && user
+                    .last_issued_at
+                    .is_some_and(|issued| (Utc::now() - issued).num_seconds() <= self.ttl_secs)
+        })
+    }
+
     async fn clear_user(&mut self, user_id: Uuid) -> RevokeOutcome {
         self.users.lock().await.remove(&user_id);
         RevokeOutcome::Ok
@@ -1301,6 +1310,26 @@ mod tests {
             storage.check_code(user_id, &code).await,
             CheckCodeOutcome::NoCode
         );
+    }
+
+    #[tokio::test]
+    async fn a_code_is_live_from_issue_until_used_up_or_expired() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        assert!(!storage.has_live_code(user_id).await);
+
+        let code = issued(&mut storage, user_id).await;
+        assert!(storage.has_live_code(user_id).await);
+
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Verified
+        );
+        assert!(!storage.has_live_code(user_id).await);
+
+        let mut expired = InMemoryEmailVerificationCodeStorage::new(-1, 0);
+        let _ = issued(&mut expired, user_id).await;
+        assert!(!expired.has_live_code(user_id).await);
     }
 
     #[tokio::test]

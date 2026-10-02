@@ -350,6 +350,8 @@ pub(crate) enum CheckCodeOutcome {
 pub(crate) trait EmailVerificationCodeStorage {
     async fn issue_code(&mut self, user_id: Uuid) -> IssueCodeOutcome;
     async fn check_code(&mut self, user_id: Uuid, code: &str) -> CheckCodeOutcome;
+    /// Whether `user_id` holds a code that is unexpired and not yet used up.
+    async fn has_live_code(&self, user_id: Uuid) -> bool;
     /// Forgets everything about `user_id`: the current code, the resend
     /// cooldown, the failure count and any lockout. A password reset calls
     /// this, so guesses burned on purpose before the owner took the account

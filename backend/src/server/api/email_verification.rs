@@ -561,31 +561,23 @@ mod delivery {
     }
 }
 
+/// A mail handler that reports every send on a channel, for the tests of
+/// the endpoints that send (register, login, resend).
 #[cfg(test)]
-mod tests {
-    use super::controller::*;
+pub(crate) mod test_support {
     use super::*;
-    use crate::model::user::User;
     use crate::server::AppState;
-    use crate::storage::{
-        CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome, LoginSessionStorage,
-        UserStorage, VerificationSessionStorage,
-    };
-    use axum::extract::State;
-    use axum::http::StatusCode;
-    use common::extract::ApiJson;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
-    use uuid::Uuid;
 
     /// What a handler was asked to send.
     #[derive(Debug)]
-    struct Sent {
-        email: String,
-        code: String,
-        verify_page_url: String,
-        expires_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) struct Sent {
+        pub(crate) email: String,
+        pub(crate) code: String,
+        pub(crate) verify_page_url: String,
+        pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
     }
 
     /// Reports every send on a channel; fails each one when told to.
@@ -611,14 +603,57 @@ mod tests {
         }
     }
 
-    async fn state_with(fail: bool) -> (AppState, mpsc::UnboundedReceiver<Sent>) {
+    /// Points `state` at a recording handler, with no resend cooldown so a
+    /// test never depends on one to block a send.
+    pub(crate) fn install_recorder(
+        state: &mut AppState,
+        fail: bool,
+    ) -> mpsc::UnboundedReceiver<Sent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut state = AppState::for_test().await;
         state.email_verification.handler = Some(Arc::new(Recorder { tx, fail }));
         state.email_verification.login_public_url = Some("https://login.test/".to_string());
         state.email_verification.codes =
             crate::storage::in_memory::InMemoryEmailVerificationCodeStorage::new(900, 0);
         state.email_verification.code_ttl_secs = 900;
+        rx
+    }
+
+    pub(crate) async fn next_sent(rx: &mut mpsc::UnboundedReceiver<Sent>) -> Sent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a mail was sent")
+            .expect("channel open")
+    }
+
+    /// Nothing was sent: gives a background send time to show up first.
+    pub(crate) async fn assert_nothing_sent(rx: &mut mpsc::UnboundedReceiver<Sent>) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rx.try_recv().is_err(), "a mail was sent");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller::*;
+    use super::test_support::{Sent, assert_nothing_sent, install_recorder, next_sent};
+    use super::*;
+    use crate::model::user::User;
+    use crate::server::AppState;
+    use crate::storage::{
+        CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome, LoginSessionStorage,
+        UserStorage, VerificationSessionStorage,
+    };
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use common::extract::ApiJson;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    async fn state_with(fail: bool) -> (AppState, mpsc::UnboundedReceiver<Sent>) {
+        let mut state = AppState::for_test().await;
+        let rx = install_recorder(&mut state, fail);
         (state, rx)
     }
 
@@ -649,19 +684,6 @@ mod tests {
                 unreachable!("no cooldown or lock")
             }
         }
-    }
-
-    async fn next_sent(rx: &mut mpsc::UnboundedReceiver<Sent>) -> Sent {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a mail was sent")
-            .expect("channel open")
-    }
-
-    /// Nothing was sent: gives a background send time to show up first.
-    async fn assert_nothing_sent(rx: &mut mpsc::UnboundedReceiver<Sent>) {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(rx.try_recv().is_err(), "a mail was sent");
     }
 
     fn confirm_req(session: &str, code: &str) -> EmailVerificationConfirmRequest {

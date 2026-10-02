@@ -9,6 +9,7 @@ fn test_config() -> Config {
         port: 8081,
         bff_url: "http://bff.test".into(),
         own_origin: "http://login.test".into(),
+        verify_default_redirect_uri: None,
     }
 }
 
@@ -348,4 +349,42 @@ async fn pages_render_with_defaults_when_the_query_string_is_malformed() {
 
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
     }
+}
+
+async fn get_body(config: Config, path: &str) -> String {
+    let resp = app(config)
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    body_string(resp).await
+}
+
+#[tokio::test]
+async fn verify_email_page_defaults_redirect_uri_to_the_configured_one() {
+    let config = Config {
+        verify_default_redirect_uri: Some("http://app.test/home".into()),
+        ..test_config()
+    };
+
+    let body = get_body(config.clone(), "/verify-email.html").await;
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://app.test/home\""));
+
+    // An explicit redirect_uri still wins.
+    let body = get_body(
+        config,
+        "/verify-email.html?redirect_uri=http%3A%2F%2Fadmin.test%2F",
+    )
+    .await;
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://admin.test/\""));
+}
+
+#[tokio::test]
+async fn the_verify_default_redirect_uri_does_not_apply_to_other_pages() {
+    let config = Config {
+        verify_default_redirect_uri: Some("http://app.test/home".into()),
+        ..test_config()
+    };
+
+    let body = get_body(config, "/login.html").await;
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://login.test/\""));
 }

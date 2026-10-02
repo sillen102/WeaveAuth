@@ -44,6 +44,8 @@ login_claims_handler:
   url: http://localhost:10001/hooks/login-claims
 # Verification email, sent to Mailpit (testing/mailpit/docker-compose.yml; inbox at http://localhost:7025).
 login_public_url: http://localhost:8081
+# Login withholds the session from an unverified account until it enters the emailed code.
+require_verified_email: true
 email_handler:
   kind: smtp
   host: 127.0.0.1

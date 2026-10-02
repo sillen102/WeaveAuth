@@ -35,10 +35,11 @@ exist. What comes back then depends on the account:
 - *Verified:* `{login_session}`, as always.
 - *Unverified, `require_verified_email: true`:* `{verification_session}` and **no
   `login_session`**. Without a `login_session` nothing can call `/oauth/authorize` or
-  `/oauth/token`, so no access token is ever issued. Backend also sends the code email now
-  (subject to the resend cooldown, so a user who has just registered isn't mailed twice).
+  `/oauth/token`, so no access token is ever issued. Backend also sends a code, unless the
+  account already holds a live one (so a user who has just registered isn't mailed twice).
 - *Unverified, verification optional:* both `{login_session, verification_session}`. The user is
-  logged in and may verify whenever they like.
+  logged in and may verify whenever they like. Login sends no email here; offering a "verify my
+  email" button that calls the resend endpoint is up to the deployer.
 
 The `verification_session` is a random 32-byte token held by backend's
 `VerificationSessionStorage`, bound to one user and valid for
@@ -61,7 +62,9 @@ to the `next` page the form came from). Registration's auto-login takes the same
 user lands on the code page and never in the app.
 
 **3. The page.** `verify-email.html` has one field, the code (no password: the cookie already
-proves who is signing in), and a "send a new code" button. It carries `redirect_uri` along.
+proves who is signing in), and a "send a new code" button. It carries `redirect_uri` along. Opened
+without one (the link in the email), it uses login's `WA_VERIFY_DEFAULT_REDIRECT_URI`, else login's
+own origin; backend's allowlist must include whichever applies.
 
 **4. Entering the code (`POST /verify-email`, bff).** Form `{code, redirect_uri, next}`.
 
@@ -104,8 +107,8 @@ default 60). bff bounces to `next?status=sent` in every accepted case.
 
 ## Sending the code
 
-Backend's `send_verification_email`, called by `register`, by login (when verification is
-required) and by the resend endpoint.
+Backend's `send_verification_email`, called by `register` (always), by login (only when
+verification is required and the account has no live code) and by the resend endpoint.
 
 - No `email_handler` configured: nothing happens and no code is issued.
 - A code is issued for the user: 6 random digits, stored only as a sha256 over the user id and

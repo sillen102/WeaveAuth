@@ -47,6 +47,10 @@ pub struct Config {
     pub port: u16,
     pub bff_url: String,
     pub own_origin: String,
+    /// Where the verification page sends the user once the code is right,
+    /// when it was opened without a `redirect_uri` (the link in the email).
+    /// Must be on backend's redirect allowlist. Unset: login's own origin.
+    pub verify_default_redirect_uri: Option<String>,
 }
 
 impl Default for Config {
@@ -55,15 +59,17 @@ impl Default for Config {
             port: 8081,
             bff_url: "http://localhost:8080".to_string(),
             own_origin: "http://localhost:8081".to_string(),
+            verify_default_redirect_uri: None,
         }
     }
 }
 
 impl Config {
-    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` / `WA_LOGIN_PUBLIC_URL` env
-    /// vars, falling back to defaults for anything unset. A value that is set
-    /// but invalid is an error: silently using the defaults would point the
-    /// login page at localhost.
+    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` / `WA_LOGIN_PUBLIC_URL` /
+    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` env vars, falling back to defaults for
+    /// anything unset (an empty `WA_VERIFY_DEFAULT_REDIRECT_URI` counts as
+    /// unset). A value that is set but invalid is an error: silently using the
+    /// defaults would point the login page at localhost.
     pub fn load() -> anyhow::Result<Self> {
         let defaults = Config::default();
 
@@ -75,6 +81,7 @@ impl Config {
                     .map(|k| match k.as_str() {
                         "WA_BFF_URL" => "bff_url".into(),
                         "WA_LOGIN_PUBLIC_URL" => "own_origin".into(),
+                        "WA_VERIFY_DEFAULT_REDIRECT_URI" => "verify_default_redirect_uri".into(),
                         _ => "_ignored".into(),
                     })
                     .ignore(&["_ignored"]),
@@ -86,6 +93,18 @@ impl Config {
             config.port = raw
                 .parse()
                 .map_err(|error| anyhow::anyhow!("invalid WA_LOGIN_PORT {raw:?}: {error}"))?;
+        }
+
+        config.verify_default_redirect_uri = config
+            .verify_default_redirect_uri
+            .filter(|raw| !raw.is_empty());
+        if let Some(raw) = &config.verify_default_redirect_uri {
+            let url = url::Url::parse(raw).map_err(|error| {
+                anyhow::anyhow!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: {error}")
+            })?;
+            if !matches!(url.scheme(), "http" | "https") {
+                anyhow::bail!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: not an http(s) URL");
+            }
         }
 
         Ok(config)
@@ -158,7 +177,11 @@ async fn verify_email_page(
     OriginalUri(uri): OriginalUri,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("verify-email.html", &config, uri.path(), &page_query(query))
+    let mut query = page_query(query);
+    if query.redirect_uri.is_none() {
+        query.redirect_uri = config.verify_default_redirect_uri.clone();
+    }
+    render_page("verify-email.html", &config, uri.path(), &query)
 }
 
 /// Renders one of the deployer-replaceable page templates, computing the
@@ -231,6 +254,7 @@ mod tests {
             let config = Config::load().unwrap();
             assert_eq!(config.port, 8081);
             assert_eq!(config.bff_url, "http://localhost:8080");
+            assert_eq!(config.verify_default_redirect_uri, None);
             Ok(())
         });
     }
@@ -241,13 +265,63 @@ mod tests {
             jail.set_env("WA_LOGIN_PORT", "9999");
             jail.set_env("WA_BFF_URL", "http://bff.env.test");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
+            jail.set_env(
+                "WA_VERIFY_DEFAULT_REDIRECT_URI",
+                "https://app.env.test/home",
+            );
 
             let config = Config::load().unwrap();
+            assert_eq!(
+                config.verify_default_redirect_uri.as_deref(),
+                Some("https://app.env.test/home")
+            );
             assert_eq!(config.port, 9999);
             assert_eq!(config.bff_url, "http://bff.env.test");
             assert_eq!(config.own_origin, "https://login.env.test");
             Ok(())
         });
+    }
+
+    #[test]
+    fn an_empty_verify_default_redirect_uri_counts_as_unset() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.verify_default_redirect_uri, None);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_unparseable_verify_default_redirect_uri_is_an_error() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "/downstream");
+
+            let error = Config::load()
+                .expect_err("a relative URL can't be redirected to once the code is spent");
+            assert!(
+                error.to_string().contains("WA_VERIFY_DEFAULT_REDIRECT_URI"),
+                "unhelpful error: {error}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_verify_default_redirect_uri_must_be_http_or_https() {
+        for value in ["javascript:alert(1)", "mailto:a@example.com"] {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", value);
+
+                let error = Config::load().expect_err("only web URLs can be redirected to");
+                assert!(
+                    error.to_string().contains("WA_VERIFY_DEFAULT_REDIRECT_URI"),
+                    "{value}: unhelpful error: {error}"
+                );
+                Ok(())
+            });
+        }
     }
 
     #[test]

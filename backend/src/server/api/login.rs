@@ -120,7 +120,9 @@ mod service {
     use crate::server::AppState;
     use crate::server::api::email_verification::send_verification_email;
     use crate::server::api::{AuthenticateError, authenticate_password};
-    use crate::storage::{LoginSessionStorage, VerificationSessionStorage};
+    use crate::storage::{
+        EmailVerificationCodeStorage, LoginSessionStorage, VerificationSessionStorage,
+    };
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum LoginServiceError {
@@ -173,7 +175,9 @@ mod service {
             .create_session(user.id)
             .await;
         if state.email_verification.required {
-            drop(send_verification_email(state, user.id, &user.email).await);
+            if !state.email_verification.codes.has_live_code(user.id).await {
+                drop(send_verification_email(state, user.id, &user.email).await);
+            }
             return Ok(LoginOutcome::VerificationRequired {
                 verification_session,
             });
@@ -191,10 +195,13 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
+    use crate::server::api::email_verification::test_support::{
+        Sent, assert_nothing_sent, install_recorder, next_sent,
+    };
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
     };
-    use crate::storage::{UserStorage, VerificationSessionStorage};
+    use crate::storage::{EmailVerificationCodeStorage, UserStorage, VerificationSessionStorage};
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
     use common::extract::ApiJson;
@@ -333,6 +340,38 @@ mod tests {
             state.email_verification.sessions.get_session(&token).await,
             Some(user.id)
         );
+    }
+
+    async fn required_state_with_recorder() -> (AppState, tokio::sync::mpsc::UnboundedReceiver<Sent>)
+    {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.required = true;
+        let rx = install_recorder(&mut state, false);
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn login_sends_a_code_when_the_account_has_no_live_one() {
+        let (state, mut rx) = required_state_with_recorder().await;
+
+        login_as(&state, "hunter2").await.unwrap();
+
+        assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn login_sends_nothing_while_the_account_has_a_live_code() {
+        let (mut state, mut rx) = required_state_with_recorder().await;
+        let user = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .unwrap();
+        let _ = state.email_verification.codes.issue_code(user.id).await;
+
+        login_as(&state, "hunter2").await.unwrap();
+
+        assert_nothing_sent(&mut rx).await;
     }
 
     #[tokio::test]
