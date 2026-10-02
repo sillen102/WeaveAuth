@@ -97,3 +97,18 @@ run = [
     "cargo llvm-cov --workspace --lcov --output-path lcov.info",
     "cargo crap --workspace --lcov lcov.info --exclude '**/tests/**' --exclude '**/main.rs' --exclude '**/build.rs' --min 30 --fail-above",
 ]
+
+[tasks.upgrade-rust]
+description = "Upgrade Cargo workspace dependencies"
+run = "cargo update"
+
+[tasks.upgrade-go]
+description = "Upgrade Go plugin SDK dependencies"
+run = "cd plugin-sdk/go && go get -u ./..."
+
+[tasks.upgrade]
+description = "Upgrade all dependencies (Cargo workspace + Go plugin SDK)"
+depends = [
+    { task = "upgrade-rust" },
+    { task = "upgrade-go" },
+]
