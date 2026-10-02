@@ -366,6 +366,8 @@ pub(crate) trait EmailVerificationCodeStorage {
 /// endpoints. It cannot be turned into tokens, so nothing else is reachable
 /// until the code is entered; entering it yields the real `login_session`.
 pub(crate) trait VerificationSessionStorage {
+    /// How long a session lasts; handed to bff so its cookie lives exactly as long.
+    fn ttl_secs(&self) -> i64;
     async fn create_session(&mut self, user_id: Uuid) -> String;
     /// Not consuming: a wrong code must leave it usable for the next try.
     async fn get_session(&self, token: &str) -> Option<Uuid>;

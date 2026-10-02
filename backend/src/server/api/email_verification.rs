@@ -168,9 +168,6 @@ mod service {
         /// What `/oauth/login` hands an unverified account; see
         /// `VerificationSessionStorage`.
         pub(crate) sessions: InMemoryVerificationSessionStorage,
-        /// How long a verification session lasts; handed to bff so its
-        /// cookie lives exactly as long.
-        pub(crate) session_ttl_secs: i64,
         /// `None`: no email is sent.
         pub(crate) handler: Option<Arc<dyn EmailVerificationHandler>>,
         /// Login's public origin; the email points at its `/verify-email.html`.
@@ -186,7 +183,6 @@ mod service {
             Self {
                 codes: InMemoryEmailVerificationCodeStorage::new(60, 0),
                 sessions: InMemoryVerificationSessionStorage::new(60),
-                session_ttl_secs: 60,
                 handler: None,
                 login_public_url: None,
                 code_ttl_secs: 60,

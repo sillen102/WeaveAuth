@@ -12,8 +12,9 @@ mod controller {
     use thiserror::Error;
 
     use crate::server::AppState;
+    use crate::storage::VerificationSessionStorage;
 
-    use super::service;
+    use super::service::{self, LoginOutcome};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
@@ -21,22 +22,28 @@ mod controller {
         pub(super) password: String,
     }
 
+    /// `login_session` is the single-use proof of this authentication,
+    /// required by `/oauth/authorize`. `verification_session` is only good for
+    /// `/oauth/email-verification/*`, which trade it (plus the emailed code)
+    /// for a `login_session`; `verification_session_ttl_secs` is how long it
+    /// lasts, so a caller's cookie can live exactly as long.
     #[derive(Serialize, JsonSchema)]
-    pub(crate) struct LoginResponse {
-        /// Single-use proof of this authentication, required by `/oauth/authorize`.
-        /// Absent when the deployment requires a verified email and this
-        /// account's isn't yet: the caller gets `verification_session` only.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub(super) login_session: Option<String>,
-        /// Present for an account whose email isn't verified yet. Good only
-        /// for `/oauth/email-verification/*`, which trade it (plus the emailed
-        /// code) for a `login_session`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub(super) verification_session: Option<String>,
-        /// How long `verification_session` lasts, so a caller's cookie can
-        /// live exactly as long.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub(super) verification_session_ttl_secs: Option<i64>,
+    #[serde(untagged)]
+    pub(crate) enum LoginResponse {
+        /// The account's email is verified.
+        Verified { login_session: String },
+        /// Unverified account, but the deployment doesn't require verification.
+        Unverified {
+            login_session: String,
+            verification_session: String,
+            verification_session_ttl_secs: i64,
+        },
+        /// Unverified account and the deployment requires verification: no
+        /// `login_session` until the emailed code is entered.
+        VerificationRequired {
+            verification_session: String,
+            verification_session_ttl_secs: i64,
+        },
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -61,7 +68,6 @@ mod controller {
         }
     }
 
-    // OpenAPI documentation for this route.
     pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("login")
@@ -73,7 +79,10 @@ mod controller {
                  regardless of what order a caller invokes the two endpoints in. An account whose \
                  email isn't verified also gets a verification_session (good only for \
                  /oauth/email-verification/*); when the deployment requires verified emails \
-                 that is all it gets, and the verification email is sent.",
+                 that is all it gets, and the verification email is sent. The body is one of \
+                 {login_session}, {login_session, verification_session, \
+                 verification_session_ttl_secs} or {verification_session, \
+                 verification_session_ttl_secs}.",
             )
     }
 
@@ -82,14 +91,23 @@ mod controller {
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
         let outcome = service::login(&mut state, &req.email, req.password.into()).await?;
-        let verification_session_ttl_secs = outcome
-            .verification_session
-            .as_ref()
-            .map(|_| state.email_verification.session_ttl_secs);
-        Ok(Json(LoginResponse {
-            login_session: outcome.login_session,
-            verification_session: outcome.verification_session,
-            verification_session_ttl_secs,
+        let verification_session_ttl_secs = state.email_verification.sessions.ttl_secs();
+        Ok(Json(match outcome {
+            LoginOutcome::Verified { login_session } => LoginResponse::Verified { login_session },
+            LoginOutcome::Unverified {
+                login_session,
+                verification_session,
+            } => LoginResponse::Unverified {
+                login_session,
+                verification_session,
+                verification_session_ttl_secs,
+            },
+            LoginOutcome::VerificationRequired {
+                verification_session,
+            } => LoginResponse::VerificationRequired {
+                verification_session,
+                verification_session_ttl_secs,
+            },
         }))
     }
 }
@@ -120,9 +138,17 @@ mod service {
         }
     }
 
-    pub(crate) struct LoginOutcome {
-        pub(crate) login_session: Option<String>,
-        pub(crate) verification_session: Option<String>,
+    pub(crate) enum LoginOutcome {
+        Verified {
+            login_session: String,
+        },
+        Unverified {
+            login_session: String,
+            verification_session: String,
+        },
+        VerificationRequired {
+            verification_session: String,
+        },
     }
 
     /// Checks the password. A verified account gets a `login_session`. An
@@ -137,10 +163,7 @@ mod service {
         let user = authenticate_password(state, email, password).await?;
         if user.email_verified {
             let login_session = state.login_sessions.create_session(user.id).await;
-            return Ok(LoginOutcome {
-                login_session: Some(login_session),
-                verification_session: None,
-            });
+            return Ok(LoginOutcome::Verified { login_session });
         }
 
         let verification_session = state
@@ -150,15 +173,14 @@ mod service {
             .await;
         if state.email_verification.required {
             drop(send_verification_email(state, user.id, &user.email).await);
-            return Ok(LoginOutcome {
-                login_session: None,
-                verification_session: Some(verification_session),
+            return Ok(LoginOutcome::VerificationRequired {
+                verification_session,
             });
         }
         let login_session = state.login_sessions.create_session(user.id).await;
-        Ok(LoginOutcome {
-            login_session: Some(login_session),
-            verification_session: Some(verification_session),
+        Ok(LoginOutcome::Unverified {
+            login_session,
+            verification_session,
         })
     }
 }
@@ -259,29 +281,47 @@ mod tests {
 
         let body = login_as(&state, "hunter2").await.unwrap();
 
-        assert!(body.login_session.is_some_and(|s| !s.is_empty()));
-        assert!(body.verification_session.is_none());
+        assert!(
+            matches!(body, LoginResponse::Verified { login_session } if !login_session.is_empty())
+        );
     }
 
     #[tokio::test]
     async fn an_unverified_account_gets_both_sessions_when_verification_is_optional() {
-        let state = state_with_user("alice@example.com", "hunter2").await;
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.sessions =
+            crate::storage::in_memory::InMemoryVerificationSessionStorage::new(4321);
 
         let body = login_as(&state, "hunter2").await.unwrap();
 
-        assert!(body.login_session.is_some());
-        assert!(body.verification_session.is_some());
+        assert!(matches!(
+            body,
+            LoginResponse::Unverified {
+                verification_session_ttl_secs: 4321,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
     async fn requiring_verification_withholds_the_login_session_from_an_unverified_account() {
         let mut state = state_with_user("alice@example.com", "hunter2").await;
         state.email_verification.required = true;
+        // Distinct from the code TTL, so swapping the two would be noticed.
+        state.email_verification.sessions =
+            crate::storage::in_memory::InMemoryVerificationSessionStorage::new(4321);
 
         let body = login_as(&state, "hunter2").await.unwrap();
 
-        assert!(body.login_session.is_none());
-        let token = body.verification_session.expect("a verification session");
+        let (token, ttl) = match body {
+            LoginResponse::VerificationRequired {
+                verification_session,
+                verification_session_ttl_secs,
+            } => Some((verification_session, verification_session_ttl_secs)),
+            _ => None,
+        }
+        .expect("a VerificationRequired response");
+        assert_eq!(ttl, 4321);
         let user = state
             .users
             .get_user_by_email("alice@example.com")
@@ -312,7 +352,48 @@ mod tests {
 
         let body = login_as(&state, "hunter2").await.unwrap();
 
-        assert!(body.login_session.is_some());
+        assert!(matches!(body, LoginResponse::Verified { .. }));
+    }
+
+    #[test]
+    fn responses_serialize_only_their_own_fields() {
+        let keys = |r: LoginResponse| {
+            let mut k: Vec<String> = serde_json::to_value(r)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+
+        assert_eq!(
+            keys(LoginResponse::Verified {
+                login_session: "l".into()
+            }),
+            ["login_session"]
+        );
+        assert_eq!(
+            keys(LoginResponse::Unverified {
+                login_session: "l".into(),
+                verification_session: "v".into(),
+                verification_session_ttl_secs: 1,
+            }),
+            [
+                "login_session",
+                "verification_session",
+                "verification_session_ttl_secs"
+            ]
+        );
+        assert_eq!(
+            keys(LoginResponse::VerificationRequired {
+                verification_session: "v".into(),
+                verification_session_ttl_secs: 1,
+            }),
+            ["verification_session", "verification_session_ttl_secs"]
+        );
     }
 
     #[tokio::test]
@@ -393,7 +474,7 @@ mod tests {
         };
 
         let Json(body) = login(State(state.clone()), Json(req)).await.unwrap();
-        assert!(body.login_session.is_some());
+        assert!(matches!(body, LoginResponse::Unverified { .. }));
 
         let user = state
             .users

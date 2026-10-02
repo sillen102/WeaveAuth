@@ -363,6 +363,10 @@ impl InMemoryVerificationSessionStorage {
 }
 
 impl VerificationSessionStorage for InMemoryVerificationSessionStorage {
+    fn ttl_secs(&self) -> i64 {
+        self.ttl_secs
+    }
+
     async fn create_session(&mut self, user_id: Uuid) -> String {
         let mut token_bytes = [0u8; 32];
         rand::rng().fill(&mut token_bytes);

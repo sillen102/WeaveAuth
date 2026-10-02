@@ -179,7 +179,6 @@ impl AppState {
                 sessions: InMemoryVerificationSessionStorage::new(
                     config.email_verification_session_ttl_secs,
                 ),
-                session_ttl_secs: config.email_verification_session_ttl_secs,
                 handler: email_handler,
                 login_public_url: config.login_public_url.clone(),
                 code_ttl_secs: config.email_verification_code_ttl_secs,
