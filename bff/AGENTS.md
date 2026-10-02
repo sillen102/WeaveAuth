@@ -67,6 +67,11 @@ file. One variant per distinct failure reason, not one per status code --
 status and a human-readable `details` string; several variants may share a status code
 when the reason (the variant name) is what actually disambiguates them.
 
+Take request input with `common::extract::{ApiJson, ApiForm, ApiQuery, ApiPath}`, never
+axum's `Json`/`Form`/`Query`/`Path`: those reject with a plain-text body, while the `Api*`
+wrappers reject with the same JSON `ErrorResponse` (`reason: "InvalidRequest"`) as every
+other error.
+
 `#[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]` (from `common_macros`) generates
 `IntoResponse` (a JSON body via `common::responses::ErrorResponse`). An error enum for an
 undocumented endpoint carries `#[error_response_no_openapi]`, which skips the macro's

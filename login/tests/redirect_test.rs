@@ -333,3 +333,19 @@ async fn verify_email_page_reports_each_outcome() {
         assert_eq!(body.contains("id=\"verify-form\""), forms, "{status}");
     }
 }
+
+#[tokio::test]
+async fn pages_render_with_defaults_when_the_query_string_is_malformed() {
+    for path in ["/login.html", "/register.html", "/verify-email.html"] {
+        let resp = app(test_config())
+            .oneshot(
+                Request::get(format!("{path}?error=a&error=b"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+}

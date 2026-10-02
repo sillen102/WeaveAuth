@@ -53,6 +53,7 @@ native-tls = "0.2"
 tera = "2"
 lettre = { version = "0.11", default-features = false }
 secrecy = "0.10"
+scalar_api_reference = "0.2"
 
 # Build-time protobuf codegen for the plugin contract
 tonic-prost-build = "0.14"

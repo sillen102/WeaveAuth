@@ -225,3 +225,145 @@ async fn register_rejects_extra_fields_over_http_when_no_handler_is_configured()
     let body = body_json(resp).await;
     assert_eq!(body["reason"], "ExtraDataNotSupported");
 }
+
+#[tokio::test]
+async fn oidc_login_takes_the_provider_as_a_query_param() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::get("/oauth/oidc/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unknown = app
+        .oneshot(
+            Request::get("/oauth/oidc/login?provider=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(missing).await["details"], "invalid request");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(unknown).await["details"], "unknown oidc provider");
+}
+
+#[tokio::test]
+async fn oidc_callback_takes_the_provider_as_a_query_param() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::get("/oauth/oidc/callback?code=c&state=s")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unstored_state = app
+        .oneshot(
+            Request::get("/oauth/oidc/callback?provider=nope&code=c&state=s")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(missing).await["details"], "invalid request");
+    assert_eq!(unstored_state.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(unstored_state).await["details"],
+        "invalid or expired oidc state"
+    );
+}
+
+#[tokio::test]
+async fn malformed_input_is_rejected_as_json_on_every_extractor_kind() {
+    let app = app(&test_config()).await.expect("test app builds");
+    let cases = [
+        // Json
+        Request::post("/oauth/login")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+        // Form
+        Request::post("/oauth/token")
+            .header("content-type", "text/plain")
+            .body(Body::from("grant_type=authorization_code"))
+            .unwrap(),
+        // Query
+        Request::get("/oauth/authorize")
+            .body(Body::empty())
+            .unwrap(),
+    ];
+
+    for req in cases {
+        let uri = req.uri().to_string();
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert!(resp.status().is_client_error(), "{uri}: {}", resp.status());
+        assert_eq!(body_json(resp).await["reason"], "InvalidRequest", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn openapi_documents_the_invalid_request_rejection_on_json_routes() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let spec = body_json(resp).await;
+    let responses = &spec["paths"]["/oauth/login"]["post"]["responses"];
+    for status in ["400", "415", "422"] {
+        assert_eq!(
+            responses[status]["description"], "invalid request",
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_keeps_invalid_request_on_endpoints_that_already_document_a_400() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let spec = body_json(resp).await;
+    for (path, method) in [
+        ("/oauth/authorize", "get"),
+        ("/oauth/oidc/callback", "get"),
+        ("/register", "post"),
+        ("/oauth/token", "post"),
+    ] {
+        let response = &spec["paths"][path][method]["responses"]["400"];
+        let examples = &response["content"]["application/json"]["examples"];
+        assert!(
+            examples["InvalidRequest"].is_object(),
+            "{path}: 400 lacks the InvalidRequest example: {response}"
+        );
+    }
+}
+
+/// aide drops spec problems (such as a conflicting inferred response) unless
+/// a handler is registered, so a docs regression would otherwise be silent.
+#[tokio::test]
+async fn openapi_generation_reports_no_errors() {
+    aide::generate::on_error(|err| panic!("openapi generation error: {err}"));
+
+    let _app = app(&test_config()).await.expect("test app builds");
+}

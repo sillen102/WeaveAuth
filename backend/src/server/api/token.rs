@@ -5,8 +5,9 @@ pub(crate) use login_claims::{LoginClaimsHandler, PLUGIN_NAME, PluginHandler, We
 mod controller {
     use aide::transform::TransformOperation;
     use axum::Json;
-    use axum::extract::{Form, State};
+    use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiForm;
     use common::model::token::GrantType;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
@@ -112,7 +113,7 @@ mod controller {
 
     pub(crate) async fn issue_token(
         State(mut state): State<AppState>,
-        Form(req): Form<TokenRequest>,
+        ApiForm(req): ApiForm<TokenRequest>,
     ) -> Result<Json<TokenResponse>, TokenError> {
         let response = match req.grant_type {
             GrantType::AuthorizationCode => {
@@ -580,7 +581,8 @@ mod login_claims {
 mod tests {
     use super::controller::*;
     use axum::Json;
-    use axum::extract::{Form, State};
+    use axum::extract::State;
+    use common::extract::ApiForm;
     use common::model::token::GrantType;
 
     use super::login_claims::{LoginClaimsError, LoginClaimsHandler};
@@ -707,7 +709,7 @@ mod tests {
             .await;
         let req = code_req("code1", verifier, "http://redirect.test");
 
-        let result = issue_token(State(state), Form(req)).await;
+        let result = issue_token(State(state), ApiForm(req)).await;
 
         assert!(result.is_ok());
     }
@@ -728,7 +730,7 @@ mod tests {
             .await;
         let req = code_req("code1", verifier, "http://redirect.test");
 
-        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+        let Json(body) = issue_token(State(state), ApiForm(req)).await.unwrap();
 
         assert_eq!(body.user_id, user_id);
     }
@@ -737,7 +739,7 @@ mod tests {
     async fn rejects_unknown_code() {
         let req = code_req("never-issued", "whatever", "http://redirect.test");
 
-        let result = issue_token(State(state()), Form(req)).await;
+        let result = issue_token(State(state()), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::InvalidCode));
     }
@@ -758,7 +760,7 @@ mod tests {
             .await;
         let req = code_req("code1", verifier, "http://other.test");
 
-        let result = issue_token(State(state), Form(req)).await;
+        let result = issue_token(State(state), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::RedirectUriMismatch));
     }
@@ -778,7 +780,7 @@ mod tests {
             .await;
         let req = code_req("code1", "wrong-verifier", "http://redirect.test");
 
-        let result = issue_token(State(state), Form(req)).await;
+        let result = issue_token(State(state), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::InvalidCodeVerifier));
     }
@@ -798,12 +800,12 @@ mod tests {
             )
             .await;
         let first_req = code_req("code1", verifier, "http://redirect.test");
-        let _ = issue_token(State(state.clone()), Form(first_req))
+        let _ = issue_token(State(state.clone()), ApiForm(first_req))
             .await
             .unwrap();
 
         let second_req = code_req("code1", verifier, "http://redirect.test");
-        let result = issue_token(State(state), Form(second_req)).await;
+        let result = issue_token(State(state), ApiForm(second_req)).await;
 
         assert_eq!(result.err(), Some(TokenError::InvalidCode));
     }
@@ -818,7 +820,7 @@ mod tests {
             refresh_token: None,
         };
 
-        let result = issue_token(State(state()), Form(req)).await;
+        let result = issue_token(State(state()), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::MissingParameters));
     }
@@ -841,7 +843,7 @@ mod tests {
 
         let Json(body) = issue_token(
             State(state),
-            Form(code_req("code1", verifier, "http://redirect.test")),
+            ApiForm(code_req("code1", verifier, "http://redirect.test")),
         )
         .await
         .unwrap();
@@ -878,7 +880,7 @@ mod tests {
             refresh_token: None,
         };
 
-        let result = issue_token(State(state()), Form(req)).await;
+        let result = issue_token(State(state()), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::MissingParameters));
     }
@@ -899,12 +901,12 @@ mod tests {
             .await;
         let Json(first) = issue_token(
             State(state.clone()),
-            Form(code_req("code1", verifier, "http://redirect.test")),
+            ApiForm(code_req("code1", verifier, "http://redirect.test")),
         )
         .await
         .unwrap();
 
-        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token)))
+        let Json(second) = issue_token(State(state), ApiForm(refresh_req(&first.refresh_token)))
             .await
             .unwrap();
 
@@ -918,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_grant_rejects_unknown_refresh_token() {
-        let result = issue_token(State(state()), Form(refresh_req("never-issued"))).await;
+        let result = issue_token(State(state()), ApiForm(refresh_req("never-issued"))).await;
 
         assert_eq!(result.err(), Some(TokenError::InvalidRefreshToken));
     }
@@ -939,7 +941,7 @@ mod tests {
             .await;
         let Json(first) = issue_token(
             State(state.clone()),
-            Form(code_req("code1", verifier, "http://redirect.test")),
+            ApiForm(code_req("code1", verifier, "http://redirect.test")),
         )
         .await
         .unwrap();
@@ -947,7 +949,7 @@ mod tests {
         // Legitimate rotation: first.refresh_token -> second.refresh_token.
         let Json(second) = issue_token(
             State(state.clone()),
-            Form(refresh_req(&first.refresh_token)),
+            ApiForm(refresh_req(&first.refresh_token)),
         )
         .await
         .unwrap();
@@ -955,13 +957,13 @@ mod tests {
         // The original token gets replayed -- reuse detected.
         let replay = issue_token(
             State(state.clone()),
-            Form(refresh_req(&first.refresh_token)),
+            ApiForm(refresh_req(&first.refresh_token)),
         )
         .await;
         assert_eq!(replay.err(), Some(TokenError::InvalidRefreshToken));
 
         // The still-unused sibling from the same family is dead too.
-        let sibling = issue_token(State(state), Form(refresh_req(&second.refresh_token))).await;
+        let sibling = issue_token(State(state), ApiForm(refresh_req(&second.refresh_token))).await;
         assert_eq!(sibling.err(), Some(TokenError::InvalidRefreshToken));
     }
 
@@ -994,7 +996,7 @@ mod tests {
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
 
-        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+        let Json(body) = issue_token(State(state), ApiForm(req)).await.unwrap();
 
         let decoded = decode_claims(&body.access_token);
         assert_eq!(decoded["roles"]["admin"], serde_json::json!(["user-1"]));
@@ -1017,7 +1019,7 @@ mod tests {
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
 
-        let Json(body) = issue_token(State(state), Form(req)).await.unwrap();
+        let Json(body) = issue_token(State(state), ApiForm(req)).await.unwrap();
 
         let decoded = decode_claims(&body.access_token);
         assert_eq!(
@@ -1050,7 +1052,7 @@ mod tests {
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
 
-        let result = issue_token(State(state), Form(req)).await;
+        let result = issue_token(State(state), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::DownstreamServiceFailed));
     }
@@ -1078,7 +1080,7 @@ mod tests {
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
 
-        let result = issue_token(State(state), Form(req)).await;
+        let result = issue_token(State(state), ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(TokenError::ReservedClaimOverridden));
     }
@@ -1104,7 +1106,7 @@ mod tests {
             .await;
         let Json(first) = issue_token(
             State(state.clone()),
-            Form(code_req(
+            ApiForm(code_req(
                 "code1",
                 "correct-verifier",
                 "http://redirect.test",
@@ -1113,7 +1115,7 @@ mod tests {
         .await
         .unwrap();
 
-        let Json(second) = issue_token(State(state), Form(refresh_req(&first.refresh_token)))
+        let Json(second) = issue_token(State(state), ApiForm(refresh_req(&first.refresh_token)))
             .await
             .unwrap();
 

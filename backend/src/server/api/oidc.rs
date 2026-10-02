@@ -8,9 +8,10 @@ pub(crate) use controller::oidc_login_doc;
 mod controller {
     use aide::transform::TransformOperation;
     use axum::Json;
-    use axum::extract::{Path, Query, State};
+    use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::Redirect;
+    use common::extract::{ApiJson, ApiQuery};
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -21,7 +22,13 @@ mod controller {
     use super::service;
 
     #[derive(Deserialize, JsonSchema)]
+    pub(crate) struct OidcLoginQuery {
+        pub(super) provider: String,
+    }
+
+    #[derive(Deserialize, JsonSchema)]
     pub(crate) struct OidcCallbackQuery {
+        pub(super) provider: String,
         pub(super) code: String,
         pub(super) state: String,
     }
@@ -136,7 +143,7 @@ mod controller {
             .summary("Start a third-party OIDC login")
             .description(
                 "Not meant to be called by the browser directly -- bff proxies this \
-                 server-to-server and relays the redirect. `provider` is one of the keys \
+                 server-to-server and relays the redirect. `provider` (query param) is one of the keys \
                  configured under `oidc_providers`, e.g. \"google\".",
             )
     }
@@ -148,8 +155,9 @@ mod controller {
             .description(
                 "Not meant to be called by the provider directly -- backend isn't \
                  internet-exposed, so bff receives the provider's redirect at its own public \
-                 URL and forwards code+state here server-to-server. Returns either an \
-                 Authenticated login_session (same shape as a successful /oauth/login), or a \
+                 URL and forwards provider+code+state (all query params) here \
+                 server-to-server. Returns either an Authenticated login_session (same shape as \
+                 a successful /oauth/login), or a \
                  PasswordConfirmationRequired response if this email matches an existing but \
                  unverified account -- see /oauth/oidc/confirm-link.",
             )
@@ -160,7 +168,7 @@ mod controller {
             .id("oidc_confirm_link")
             .summary("Finish linking an OIDC identity into an unverified account")
             .description(
-                "Call after /oauth/oidc/{provider}/callback returns \
+                "Call after /oauth/oidc/callback returns \
                  PasswordConfirmationRequired, supplying that account's password. On success, \
                  the account is marked email_verified and the identity is linked, exactly as if \
                  the email had already been verified at callback time.",
@@ -169,19 +177,18 @@ mod controller {
 
     pub(crate) async fn oidc_login(
         State(mut state): State<AppState>,
-        Path(provider): Path<String>,
+        ApiQuery(query): ApiQuery<OidcLoginQuery>,
     ) -> Result<Redirect, OidcError> {
-        let auth_url = service::oidc_login(&mut state, provider).await?;
+        let auth_url = service::oidc_login(&mut state, query.provider).await?;
         Ok(Redirect::to(&auth_url))
     }
 
     pub(crate) async fn oidc_callback(
         State(mut state): State<AppState>,
-        Path(provider): Path<String>,
-        Query(query): Query<OidcCallbackQuery>,
+        ApiQuery(query): ApiQuery<OidcCallbackQuery>,
     ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
         let response =
-            service::oidc_callback(&mut state, provider, query.code, query.state).await?;
+            service::oidc_callback(&mut state, query.provider, query.code, query.state).await?;
         Ok(Json(response))
     }
 
@@ -190,7 +197,7 @@ mod controller {
     /// existing account's password.
     pub(crate) async fn oidc_confirm_link(
         State(mut state): State<AppState>,
-        Json(req): Json<OidcConfirmLinkRequest>,
+        ApiJson(req): ApiJson<OidcConfirmLinkRequest>,
     ) -> Result<Json<OidcConfirmLinkResponse>, ConfirmLinkError> {
         let login_session =
             service::oidc_confirm_link(&mut state, &req.pending_link_token, req.password.into())
@@ -649,7 +656,8 @@ mod service {
 mod tests {
     use super::controller::*;
     use axum::Json;
-    use axum::extract::{Path, Query, State};
+    use axum::extract::State;
+    use common::extract::{ApiJson, ApiQuery};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -689,7 +697,13 @@ mod tests {
     async fn login_rejects_unknown_provider() {
         let state = state_with_no_providers().await;
 
-        let result = oidc_login(State(state), Path("google".to_string())).await;
+        let result = oidc_login(
+            State(state),
+            ApiQuery(OidcLoginQuery {
+                provider: "google".to_string(),
+            }),
+        )
+        .await;
 
         assert_eq!(result.err(), Some(OidcError::UnknownProvider));
     }
@@ -698,11 +712,12 @@ mod tests {
     async fn callback_rejects_missing_or_unknown_state() {
         let state = state_with_no_providers().await;
         let query = OidcCallbackQuery {
+            provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "no-such-state".to_string(),
         };
 
-        let result = oidc_callback(State(state), Path("google".to_string()), Query(query)).await;
+        let result = oidc_callback(State(state), ApiQuery(query)).await;
 
         assert_eq!(result.err(), Some(OidcError::InvalidState));
     }
@@ -720,16 +735,12 @@ mod tests {
             )
             .await;
         let query = OidcCallbackQuery {
+            provider: "some-other-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
 
-        let result = oidc_callback(
-            State(state),
-            Path("some-other-provider".to_string()),
-            Query(query),
-        )
-        .await;
+        let result = oidc_callback(State(state), ApiQuery(query)).await;
 
         assert_eq!(result.err(), Some(OidcError::InvalidState));
     }
@@ -747,29 +758,21 @@ mod tests {
             )
             .await;
         let query = OidcCallbackQuery {
+            provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
         // First call consumes the state; provider is unknown here (no real
         // client configured in this test), so it fails past the state check
         // -- what matters is the state entry is gone afterwards.
-        let _ = oidc_callback(
-            State(state.clone()),
-            Path("google".to_string()),
-            Query(query),
-        )
-        .await;
+        let _ = oidc_callback(State(state.clone()), ApiQuery(query)).await;
 
         let replay_query = OidcCallbackQuery {
+            provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
-        let result = oidc_callback(
-            State(state),
-            Path("google".to_string()),
-            Query(replay_query),
-        )
-        .await;
+        let result = oidc_callback(State(state), ApiQuery(replay_query)).await;
 
         assert_eq!(result.err(), Some(OidcError::InvalidState));
     }
@@ -920,16 +923,12 @@ mod tests {
             )
             .await;
         let query = OidcCallbackQuery {
+            provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
 
-        let result = oidc_callback(
-            State(state),
-            Path("test-provider".to_string()),
-            Query(query),
-        )
-        .await;
+        let result = oidc_callback(State(state), ApiQuery(query)).await;
 
         let Json(super::service::OidcCallbackResponse::Authenticated { .. }) =
             result.expect("callback succeeds")
@@ -974,16 +973,13 @@ mod tests {
             )
             .await;
         let query = OidcCallbackQuery {
+            provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: csrf.to_string(),
         };
-        oidc_callback(
-            State(state.clone()),
-            Path("test-provider".to_string()),
-            Query(query),
-        )
-        .await
-        .map(|_| ())
+        oidc_callback(State(state.clone()), ApiQuery(query))
+            .await
+            .map(|_| ())
     }
 
     #[tokio::test]
@@ -1482,16 +1478,12 @@ mod tests {
             )
             .await;
         let query = OidcCallbackQuery {
+            provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
         };
 
-        let result = oidc_callback(
-            State(state),
-            Path("test-provider".to_string()),
-            Query(query),
-        )
-        .await;
+        let result = oidc_callback(State(state), ApiQuery(query)).await;
 
         assert_eq!(result.err(), Some(OidcError::EmailNotVerified));
     }
@@ -1504,7 +1496,7 @@ mod tests {
             password: "whatever".to_string(),
         };
 
-        let result = oidc_confirm_link(State(state), Json(req)).await;
+        let result = oidc_confirm_link(State(state), ApiJson(req)).await;
 
         assert_eq!(result.err(), Some(ConfirmLinkError::InvalidPendingLink));
     }
@@ -1536,7 +1528,7 @@ mod tests {
             pending_link_token: token,
             password: "wrong-password".to_string(),
         };
-        let result = oidc_confirm_link(State(state.clone()), Json(req)).await;
+        let result = oidc_confirm_link(State(state.clone()), ApiJson(req)).await;
 
         assert_eq!(
             result.err(),
@@ -1578,7 +1570,7 @@ mod tests {
             pending_link_token: token.clone(),
             password: "correct-password".to_string(),
         };
-        let Json(body) = oidc_confirm_link(State(state.clone()), Json(req))
+        let Json(body) = oidc_confirm_link(State(state.clone()), ApiJson(req))
             .await
             .unwrap();
         assert!(!body.login_session.is_empty());
@@ -1595,7 +1587,7 @@ mod tests {
             pending_link_token: token,
             password: "correct-password".to_string(),
         };
-        let result = oidc_confirm_link(State(state), Json(replay)).await;
+        let result = oidc_confirm_link(State(state), ApiJson(replay)).await;
         assert_eq!(result.err(), Some(ConfirmLinkError::InvalidPendingLink));
     }
 }

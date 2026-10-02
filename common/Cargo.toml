@@ -11,8 +11,12 @@ axum = { workspace =  true }
 http = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace =  true }
-aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "scalar"] }
-scalar_api_reference = { version = "0.2" }
+aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "axum-form", "scalar"] }
+scalar_api_reference = { workspace =  true }
 schemars = { workspace = true, features = ["chrono04"] }
 chrono = { workspace = true, features = ["serde"] }
 strum = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

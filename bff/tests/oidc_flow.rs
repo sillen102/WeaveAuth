@@ -40,8 +40,8 @@ fn set_cookie_values(resp: &axum::response::Response) -> Vec<String> {
 }
 
 /// Stands in for backend's full oidc + password-login surface:
-/// `/oauth/oidc/google/login` (redirects to a fake provider),
-/// `/oauth/oidc/google/callback` (accepts the code/state bff forwards), plus
+/// `/oauth/oidc/login?provider=google` (redirects to a fake provider),
+/// `/oauth/oidc/callback?provider=google` (accepts the code/state bff forwards), plus
 /// `/oauth/authorize` and `/oauth/token` -- driven the same way a password
 /// login would drive them, once there's a login_session.
 async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
@@ -49,24 +49,27 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
     let addr = listener.local_addr()?;
     let router = Router::new()
         .route(
-            "/oauth/oidc/{provider}/login",
-            get(|axum::extract::Path(provider): axum::extract::Path<String>| async move {
-                if provider != "google" {
-                    return Err(StatusCode::NOT_FOUND);
-                }
-                Ok(axum::response::Redirect::to(
-                    "https://provider.test/consent?state=good-state",
-                ))
-            }),
-        )
-        .route(
-            "/oauth/oidc/{provider}/callback",
+            "/oauth/oidc/login",
             get(
-                |axum::extract::Path(provider): axum::extract::Path<String>,
-                 axum::extract::Query(q): axum::extract::Query<
+                |axum::extract::Query(q): axum::extract::Query<
                     std::collections::HashMap<String, String>,
                 >| async move {
-                    if provider != "google" {
+                    if q.get("provider").map(String::as_str) != Some("google") {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    Ok(axum::response::Redirect::to(
+                        "https://provider.test/consent?state=good-state",
+                    ))
+                },
+            ),
+        )
+        .route(
+            "/oauth/oidc/callback",
+            get(
+                |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    if q.get("provider").map(String::as_str) != Some("google") {
                         return Err(StatusCode::NOT_FOUND);
                     }
                     match (q.get("code").map(String::as_str), q.get("state").map(String::as_str)) {
@@ -188,6 +191,44 @@ async fn oidc_login_rejects_unknown_provider() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A provider name full of URL metacharacters must reach backend as one
+/// intact `provider` query value, on the fixed login path.
+#[tokio::test]
+async fn oidc_login_sends_the_provider_to_backend_as_one_encoded_query_value() -> anyhow::Result<()>
+{
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(None::<String>));
+    let recorder = seen.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let backend = format!("http://{}", listener.local_addr()?);
+    let router = Router::new().route(
+        "/oauth/oidc/login",
+        get(
+            move |axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                *recorder.lock().unwrap() = q.get("provider").cloned();
+                StatusCode::NOT_FOUND
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/a%26b%3Dc%2F..%2Fx/login?redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F")
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(seen.lock().unwrap().as_deref(), Some("a&b=c/../x"));
     Ok(())
 }
 
@@ -552,5 +593,44 @@ async fn oidc_confirm_link_rejects_an_untrusted_origin() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_form_input_is_rejected_as_json() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::post("/oidc/confirm-link")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://login.test")
+                .body(Body::from("password=only-this-field"))?,
+        ))
+        .await?;
+
+    assert!(resp.status().is_client_error());
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["reason"], "InvalidRequest");
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_query_input_is_rejected_as_json() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/login").body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["reason"], "InvalidRequest");
     Ok(())
 }

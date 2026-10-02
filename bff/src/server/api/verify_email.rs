@@ -1,10 +1,10 @@
 pub(crate) use controller::{resend_verification, verify_email};
 
 mod controller {
-    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::{AppendHeaders, IntoResponse, Response};
+    use common::extract::ApiForm;
     use common_macros::ErrorResponses;
     use serde::Deserialize;
     use thiserror::Error;
@@ -122,7 +122,7 @@ mod controller {
     pub(crate) async fn verify_email(
         State(mut state): State<AppState>,
         headers: HeaderMap,
-        Form(req): Form<VerifyEmailRequest>,
+        ApiForm(req): ApiForm<VerifyEmailRequest>,
     ) -> Result<Response, VerifyEmailError> {
         check_request(&state, &headers, &req.next)?;
         let Some(verification_session) = extract_cookie(&headers, VERIFY_COOKIE) else {
@@ -154,7 +154,7 @@ mod controller {
     pub(crate) async fn resend_verification(
         State(state): State<AppState>,
         headers: HeaderMap,
-        Form(req): Form<ResendRequest>,
+        ApiForm(req): ApiForm<ResendRequest>,
     ) -> Result<Response, VerifyEmailError> {
         check_request(&state, &headers, &req.next)?;
         let Some(verification_session) = extract_cookie(&headers, VERIFY_COOKIE) else {

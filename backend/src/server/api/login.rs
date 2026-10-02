@@ -6,6 +6,7 @@ mod controller {
     use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -88,7 +89,7 @@ mod controller {
 
     pub(crate) async fn login(
         State(mut state): State<AppState>,
-        Json(req): Json<LoginRequest>,
+        ApiJson(req): ApiJson<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
         let outcome = service::login(&mut state, &req.email, req.password.into()).await?;
         let verification_session_ttl_secs = state.email_verification.sessions.ttl_secs();
@@ -196,6 +197,7 @@ mod tests {
     use crate::storage::{UserStorage, VerificationSessionStorage};
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
+    use common::extract::ApiJson;
     use std::sync::Arc;
 
     use crate::crypto::ARGON2;
@@ -257,7 +259,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password: password.to_string(),
         };
-        login(State(state.clone()), Json(req))
+        login(State(state.clone()), ApiJson(req))
             .await
             .map(|Json(body)| body)
     }
@@ -404,7 +406,7 @@ mod tests {
             password: "wrong".to_string(),
         };
 
-        let result = login(State(state), Json(req)).await;
+        let result = login(State(state), ApiJson(req)).await;
 
         assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
@@ -417,7 +419,7 @@ mod tests {
             password: "hunter2".to_string(),
         };
 
-        let result = login(State(state), Json(req)).await;
+        let result = login(State(state), ApiJson(req)).await;
 
         assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
@@ -435,7 +437,7 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let result = login(State(state), Json(req)).await;
+        let result = login(State(state), ApiJson(req)).await;
         let elapsed = started.elapsed();
 
         assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
@@ -454,7 +456,7 @@ mod tests {
             password: String::new(),
         };
 
-        let result = login(State(state), Json(req)).await;
+        let result = login(State(state), ApiJson(req)).await;
 
         assert_eq!(result.err(), Some(LoginError::InvalidCredentials));
     }
@@ -473,7 +475,7 @@ mod tests {
             password: "hunter2".to_string(),
         };
 
-        let Json(body) = login(State(state.clone()), Json(req)).await.unwrap();
+        let Json(body) = login(State(state.clone()), ApiJson(req)).await.unwrap();
         assert!(matches!(body, LoginResponse::Unverified { .. }));
 
         let user = state

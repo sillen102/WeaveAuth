@@ -16,6 +16,7 @@
 )]
 
 use axum::Router;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
@@ -124,28 +125,40 @@ struct PageQuery {
     status: Option<String>,
 }
 
+/// A malformed query string (a repeated key, say) renders the page as a plain
+/// first visit rather than failing it.
+fn page_query(query: Result<Query<PageQuery>, QueryRejection>) -> PageQuery {
+    match query {
+        Ok(Query(query)) => query,
+        Err(err) => {
+            tracing::info!(status = %err.status(), "ignoring a malformed query string");
+            PageQuery::default()
+        }
+    }
+}
+
 async fn login_page(
     State(config): State<Config>,
     OriginalUri(uri): OriginalUri,
-    Query(query): Query<PageQuery>,
+    query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("login.html", &config, uri.path(), &query)
+    render_page("login.html", &config, uri.path(), &page_query(query))
 }
 
 async fn register_page(
     State(config): State<Config>,
     OriginalUri(uri): OriginalUri,
-    Query(query): Query<PageQuery>,
+    query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("register.html", &config, uri.path(), &query)
+    render_page("register.html", &config, uri.path(), &page_query(query))
 }
 
 async fn verify_email_page(
     State(config): State<Config>,
     OriginalUri(uri): OriginalUri,
-    Query(query): Query<PageQuery>,
+    query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("verify-email.html", &config, uri.path(), &query)
+    render_page("verify-email.html", &config, uri.path(), &page_query(query))
 }
 
 /// Renders one of the deployer-replaceable page templates, computing the

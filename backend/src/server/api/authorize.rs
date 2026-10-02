@@ -3,9 +3,10 @@ pub(crate) use controller::authorize_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::extract::{Query, State};
+    use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::Redirect;
+    use common::extract::ApiQuery;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -63,7 +64,7 @@ mod controller {
 
     pub(crate) async fn authorize(
         State(mut state): State<AppState>,
-        Query(req): Query<AuthorizeRequest>,
+        ApiQuery(req): ApiQuery<AuthorizeRequest>,
     ) -> Result<Redirect, AuthorizeError> {
         let location = service::authorize(
             &mut state,
@@ -147,8 +148,9 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::extract::{Query, State};
+    use axum::extract::State;
     use axum::response::{IntoResponse, Redirect};
+    use common::extract::ApiQuery;
     use std::sync::Arc;
 
     use super::controller::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
@@ -215,7 +217,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), ApiQuery(req)).await.unwrap();
 
         let location = location_of(redirect);
         assert!(location.starts_with("http://redirect.test?code="));
@@ -232,7 +234,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), ApiQuery(req)).await.unwrap();
 
         assert!(location_of(redirect).ends_with("&state=xyz"));
     }
@@ -248,7 +250,7 @@ mod tests {
             login_session,
         };
 
-        let redirect = authorize(State(state), Query(req)).await.unwrap();
+        let redirect = authorize(State(state), ApiQuery(req)).await.unwrap();
 
         assert!(!location_of(redirect).contains("state="));
     }
@@ -264,7 +266,7 @@ mod tests {
             login_session,
         };
 
-        let result = authorize(State(state), Query(req)).await;
+        let result = authorize(State(state), ApiQuery(req)).await;
 
         assert_eq!(result.err(), Some(InvalidRedirectUri));
     }
@@ -280,7 +282,7 @@ mod tests {
             login_session: "not-a-real-session".to_string(),
         };
 
-        let result = authorize(State(state), Query(req)).await;
+        let result = authorize(State(state), ApiQuery(req)).await;
 
         assert_eq!(result.err(), Some(InvalidLoginSession));
     }
@@ -295,7 +297,9 @@ mod tests {
             state: None,
             login_session: login_session.clone(),
         };
-        let _ = authorize(State(state.clone()), Query(req)).await.unwrap();
+        let _ = authorize(State(state.clone()), ApiQuery(req))
+            .await
+            .unwrap();
 
         let replay_req = AuthorizeRequest {
             redirect_uri: "http://redirect.test".to_string(),
@@ -304,7 +308,7 @@ mod tests {
             state: None,
             login_session,
         };
-        let result = authorize(State(state), Query(replay_req)).await;
+        let result = authorize(State(state), ApiQuery(replay_req)).await;
 
         assert_eq!(result.err(), Some(InvalidLoginSession));
     }
@@ -321,7 +325,9 @@ mod tests {
             login_session,
         };
 
-        let redirect = authorize(State(state.clone()), Query(req)).await.unwrap();
+        let redirect = authorize(State(state.clone()), ApiQuery(req))
+            .await
+            .unwrap();
         let location = location_of(redirect);
         let code = location.split("code=").nth(1).unwrap();
 

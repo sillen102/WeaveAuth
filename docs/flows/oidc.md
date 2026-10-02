@@ -17,7 +17,7 @@ Browser lands here to start login (`redirect_uri` = where to go after
 success, `next` = where to go after failure -- both validated as
 same-origin/trusted before use).
 
-- bff asks backend (server-to-server) for the provider's consent-screen URL.
+- bff asks backend (server-to-server) for the provider's consent-screen URL (`GET /oauth/oidc/login?provider=...`). The provider name travels as a query value, never in the backend URL path, so a crafted name can't steer the request at another backend route; an unknown name is backend's `404`.
 - backend builds that URL via the `oauth2` crate, which generates the
   `state` CSRF token and PKCE verifier internally, and requests `openid`
   plus the provider's configured `scopes` (default `email`, `profile`). Backend stores
@@ -45,7 +45,7 @@ redirects the browser here with `code` + `state`.
   since `state` isn't a secret the attacker lacks, just proof this browser
   started the flow (login-CSRF defense).
 - Forwards `code`/`state` to backend server-to-server
-  (`POST .../oauth/oidc/{provider}/callback`). Backend:
+  (`GET /oauth/oidc/callback?provider=...&code=...&state=...`). Backend:
   - looks up `state` in its own store (`take_state`, single-use) --
     this is the *second*, independent state check, done server-side
     against backend's own record rather than a cookie;

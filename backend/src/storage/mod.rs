@@ -246,8 +246,8 @@ pub(crate) trait RefreshTokenStorage {
     async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
 }
 
-/// What `/oauth/oidc/{provider}/login` stashed for a single in-flight
-/// redirect, so `/oauth/oidc/{provider}/callback` can complete the exchange
+/// What `/oauth/oidc/login` stashed for a single in-flight
+/// redirect, so `/oauth/oidc/callback` can complete the exchange
 /// once the user comes back from the provider.
 #[derive(Debug)]
 pub(crate) struct OidcLoginState {
@@ -256,9 +256,9 @@ pub(crate) struct OidcLoginState {
     pub(crate) nonce: SecretString,
 }
 
-/// A short-lived, single-use record of an in-flight `/oauth/oidc/{provider}/login`
+/// A short-lived, single-use record of an in-flight `/oauth/oidc/login`
 /// redirect: the PKCE verifier and nonce this server generated, so the
-/// `/oauth/oidc/{provider}/callback` handler can complete the exchange and
+/// `/oauth/oidc/callback` handler can complete the exchange and
 /// verify the ID token once the user comes back from the provider. Keyed by
 /// the CSRF state token round-tripped through the provider's redirect.
 pub(crate) trait OidcStateStorage {

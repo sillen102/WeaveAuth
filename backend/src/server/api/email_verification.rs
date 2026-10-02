@@ -15,6 +15,7 @@ mod controller {
     use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -112,7 +113,7 @@ mod controller {
 
     pub(crate) async fn request_email_verification(
         State(mut state): State<AppState>,
-        Json(req): Json<EmailVerificationRequestRequest>,
+        ApiJson(req): ApiJson<EmailVerificationRequestRequest>,
     ) -> Result<StatusCode, EmailVerificationRequestError> {
         service::request_email_verification(&mut state, &req.verification_session).await?;
         Ok(StatusCode::ACCEPTED)
@@ -120,7 +121,7 @@ mod controller {
 
     pub(crate) async fn confirm_email_verification(
         State(mut state): State<AppState>,
-        Json(req): Json<EmailVerificationConfirmRequest>,
+        ApiJson(req): ApiJson<EmailVerificationConfirmRequest>,
     ) -> Result<Json<EmailVerificationConfirmResponse>, EmailVerificationConfirmError> {
         let login_session =
             service::confirm_email_verification(&mut state, &req.verification_session, &req.code)
@@ -570,8 +571,9 @@ mod tests {
         CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome, LoginSessionStorage,
         UserStorage, VerificationSessionStorage,
     };
-    use axum::extract::{Json, State};
+    use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -774,7 +776,7 @@ mod tests {
         let user_id = add_user(&mut state, "alice@example.com", false).await;
         let session = session_for(&mut state, user_id).await;
 
-        let status = request_email_verification(State(state), Json(request_req(&session))).await;
+        let status = request_email_verification(State(state), ApiJson(request_req(&session))).await;
 
         assert_eq!(status, Ok(StatusCode::ACCEPTED));
         assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
@@ -784,7 +786,7 @@ mod tests {
     async fn request_refuses_an_unknown_session_without_sending() {
         let (state, mut rx) = state_with(false).await;
 
-        let result = request_email_verification(State(state), Json(request_req("nope"))).await;
+        let result = request_email_verification(State(state), ApiJson(request_req("nope"))).await;
 
         assert_eq!(result, Err(EmailVerificationRequestError::InvalidSession));
         assert_nothing_sent(&mut rx).await;
@@ -796,7 +798,7 @@ mod tests {
         let user_id = add_user(&mut state, "alice@example.com", true).await;
         let session = session_for(&mut state, user_id).await;
 
-        let status = request_email_verification(State(state), Json(request_req(&session))).await;
+        let status = request_email_verification(State(state), ApiJson(request_req(&session))).await;
 
         assert_eq!(status, Ok(StatusCode::ACCEPTED));
         assert_nothing_sent(&mut rx).await;
@@ -811,7 +813,7 @@ mod tests {
 
         let response = confirm_email_verification(
             State(state.clone()),
-            Json(confirm_req(&session, &format!(" {code} "))),
+            ApiJson(confirm_req(&session, &format!(" {code} "))),
         )
         .await
         .expect("verified");
@@ -845,7 +847,7 @@ mod tests {
         let wrong = if code == "000000" { "000001" } else { "000000" };
 
         let result =
-            confirm_email_verification(State(state.clone()), Json(confirm_req(&session, wrong)))
+            confirm_email_verification(State(state.clone()), ApiJson(confirm_req(&session, wrong)))
                 .await;
 
         assert_eq!(
@@ -877,7 +879,7 @@ mod tests {
         let code = code_for(&mut state, user_id).await;
 
         let result =
-            confirm_email_verification(State(state.clone()), Json(confirm_req("nope", &code)))
+            confirm_email_verification(State(state.clone()), ApiJson(confirm_req("nope", &code)))
                 .await;
 
         assert_eq!(
@@ -905,12 +907,12 @@ mod tests {
         for _ in 0..5 {
             let _ = confirm_email_verification(
                 State(state.clone()),
-                Json(confirm_req(&session, wrong)),
+                ApiJson(confirm_req(&session, wrong)),
             )
             .await;
         }
         let result =
-            confirm_email_verification(State(state.clone()), Json(confirm_req(&session, &code)))
+            confirm_email_verification(State(state.clone()), ApiJson(confirm_req(&session, &code)))
                 .await;
 
         assert_eq!(
@@ -927,9 +929,11 @@ mod tests {
         let user_id = add_user(&mut state, "alice@example.com", true).await;
         let session = session_for(&mut state, user_id).await;
 
-        let result =
-            confirm_email_verification(State(state.clone()), Json(confirm_req(&session, "123456")))
-                .await;
+        let result = confirm_email_verification(
+            State(state.clone()),
+            ApiJson(confirm_req(&session, "123456")),
+        )
+        .await;
 
         assert_eq!(
             result.err(),
@@ -957,7 +961,7 @@ mod tests {
             for _ in 0..5 {
                 let _ = confirm_email_verification(
                     State(state.clone()),
-                    Json(confirm_req(&session, wrong)),
+                    ApiJson(confirm_req(&session, wrong)),
                 )
                 .await;
             }
@@ -969,7 +973,7 @@ mod tests {
         }
 
         let result =
-            confirm_email_verification(State(state.clone()), Json(confirm_req(&session, &code)))
+            confirm_email_verification(State(state.clone()), ApiJson(confirm_req(&session, &code)))
                 .await;
 
         assert_eq!(

@@ -3,10 +3,10 @@ pub(crate) use controller::start_register_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::{IntoResponse, Response};
+    use common::extract::ApiForm;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -97,7 +97,7 @@ mod controller {
     pub(crate) async fn start_register(
         State(mut state): State<AppState>,
         headers: HeaderMap,
-        Form(req): Form<RegisterRequest>,
+        ApiForm(req): ApiForm<RegisterRequest>,
     ) -> Result<Response, RegisterError> {
         require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
             tracing::warn!(%error, "request rejected");
@@ -312,9 +312,9 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
+    use common::extract::ApiForm;
     use std::collections::HashMap;
 
     use crate::config::Config;
@@ -347,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn form_extractor_flattens_extra_fields_alongside_named_ones() {
         use axum::body::Body;
-        use axum::extract::FromRequest;
+        use axum::extract::{Form, FromRequest};
         use axum::http::Request;
 
         let state = state_with_trusted_origins(vec![]);
@@ -391,7 +391,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let result = start_register(State(state), headers, Form(req)).await;
+        let result = start_register(State(state), headers, ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(RegisterError::UntrustedOrigin));
     }

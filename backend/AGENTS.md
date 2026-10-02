@@ -71,6 +71,11 @@ status and a human-readable `details` string; several variants may share a statu
 (see `authorize.rs`'s `InvalidLoginSession` / `InvalidRedirectUri`, both 4xx but distinct
 reasons) since `reason` (the variant name) is what actually disambiguates them for callers.
 
+Take request input with `common::extract::{ApiJson, ApiForm, ApiQuery, ApiPath}`, never
+axum's `Json`/`Form`/`Query`/`Path`: those reject with a plain-text body, while the `Api*`
+wrappers reject with the same JSON `ErrorResponse` (`reason: "InvalidRequest"`) as every
+other error.
+
 `#[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]` (from `common_macros`) generates
 both `IntoResponse` (a JSON body via `common::responses::ErrorResponse`, or an overridden
 `#[error_response_type(...)]`) and `aide::OperationOutput`, so the handler's `Result<T,

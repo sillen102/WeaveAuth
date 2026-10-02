@@ -36,12 +36,9 @@ fn oauth_routes() -> ApiRouter<AppState> {
         .api_route("/oauth/token", post_with(issue_token, issue_token_doc))
         .api_route("/register", post_with(register, register_doc))
         .api_route("/.well-known/jwks.json", get_with(jwks, jwks_doc))
+        .api_route("/oauth/oidc/login", get_with(oidc_login, oidc_login_doc))
         .api_route(
-            "/oauth/oidc/{provider}/login",
-            get_with(oidc_login, oidc_login_doc),
-        )
-        .api_route(
-            "/oauth/oidc/{provider}/callback",
+            "/oauth/oidc/callback",
             get_with(oidc_callback, oidc_callback_doc),
         )
         .api_route(

@@ -1,11 +1,11 @@
 pub(crate) use controller::start_login;
 
 mod controller {
-    use axum::Form;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::{IntoResponse, Response};
+    use common::extract::ApiForm;
     use common_macros::ErrorResponses;
     use serde::Deserialize;
     use thiserror::Error;
@@ -79,7 +79,7 @@ mod controller {
     pub(crate) async fn start_login(
         State(mut state): State<AppState>,
         headers: HeaderMap,
-        Form(req): Form<LoginRequest>,
+        ApiForm(req): ApiForm<LoginRequest>,
     ) -> Result<Response, LoginError> {
         require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
             tracing::warn!(%error, "request rejected");
@@ -256,9 +256,9 @@ mod service {
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::Form;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
+    use common::extract::ApiForm;
 
     use crate::config::Config;
     use crate::server::AppState;
@@ -293,7 +293,7 @@ mod tests {
             next: "http://login.test/".to_string(),
         };
 
-        let result = start_login(State(state), headers, Form(req)).await;
+        let result = start_login(State(state), headers, ApiForm(req)).await;
 
         assert_eq!(result.err(), Some(LoginError::UntrustedOrigin));
     }

@@ -50,7 +50,7 @@ mod service {
     /// Drives the PKCE authorization-code exchange against backend
     /// server-to-server given an already-minted `login_session` -- backend
     /// mints one of these the same way whether it came from a password
-    /// `/oauth/login` or an `/oauth/oidc/{provider}/callback`, so both bff
+    /// `/oauth/login` or an `/oauth/oidc/callback`, so both bff
     /// login paths converge here. Saves the resulting session and returns the
     /// `Set-Cookie` header value for it; the caller builds the actual redirect
     /// response.

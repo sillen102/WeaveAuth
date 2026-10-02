@@ -6,9 +6,9 @@ pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, PluginHandler, Webhoo
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -102,7 +102,7 @@ mod controller {
 
     pub(crate) async fn register(
         State(mut state): State<AppState>,
-        Json(req): Json<RegisterRequest>,
+        ApiJson(req): ApiJson<RegisterRequest>,
     ) -> Result<StatusCode, RegisterError> {
         service::register(&mut state, req.email, req.password.into(), req.extra).await?;
         Ok(StatusCode::CREATED)
@@ -474,6 +474,7 @@ mod tests {
     use crate::storage::in_memory::InMemoryUserStorage;
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -574,7 +575,7 @@ mod tests {
     async fn registering_sends_a_verification_email_to_the_normalized_address() {
         let (state, mut rx) = state_with_recorder();
 
-        let result = register(State(state), Json(req("Alice+x@Example.com", "hunter2"))).await;
+        let result = register(State(state), ApiJson(req("Alice+x@Example.com", "hunter2"))).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -587,7 +588,7 @@ mod tests {
     async fn a_rejected_registration_sends_no_verification_email() {
         let (state, mut rx) = state_with_recorder();
 
-        let result = register(State(state), Json(req("not-an-email", "hunter2"))).await;
+        let result = register(State(state), ApiJson(req("not-an-email", "hunter2"))).await;
 
         assert_eq!(result.err(), Some(RegisterError::InvalidEmail));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -600,7 +601,7 @@ mod tests {
 
         let result = register(
             State(state.clone()),
-            Json(req("alice@example.com", "hunter2")),
+            ApiJson(req("alice@example.com", "hunter2")),
         )
         .await;
 
@@ -611,7 +612,7 @@ mod tests {
     async fn rejects_an_invalid_email() {
         let state = state();
 
-        let result = register(State(state), Json(req("not-an-email", "hunter2"))).await;
+        let result = register(State(state), ApiJson(req("not-an-email", "hunter2"))).await;
 
         assert_eq!(result, Err(RegisterError::InvalidEmail));
     }
@@ -622,8 +623,8 @@ mod tests {
         let first = req("alice@example.com", "hunter2");
         let second = req("alice@example.com", "different-password");
 
-        let first_result = register(State(state.clone()), Json(first)).await;
-        let second_result = register(State(state), Json(second)).await;
+        let first_result = register(State(state.clone()), ApiJson(first)).await;
+        let second_result = register(State(state), ApiJson(second)).await;
 
         assert_eq!(first_result, Ok(StatusCode::CREATED));
         assert_eq!(second_result, Err(RegisterError::EmailTaken));
@@ -635,7 +636,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Err(RegisterError::ExtraDataNotSupported));
     }
@@ -667,7 +668,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
     }
@@ -679,7 +680,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
-        let result = register(State(state.clone()), Json(req)).await;
+        let result = register(State(state.clone()), ApiJson(req)).await;
 
         assert_eq!(result, Err(RegisterError::DownstreamServiceFailed));
         assert!(
@@ -718,7 +719,7 @@ mod tests {
 
         let first = register(
             State(state.clone()),
-            Json(req("alice@example.com", "hunter2")),
+            ApiJson(req("alice@example.com", "hunter2")),
         )
         .await;
         assert_eq!(first, Ok(StatusCode::CREATED));
@@ -732,7 +733,7 @@ mod tests {
         second_req
             .extra
             .insert("company".to_string(), "Acme".to_string());
-        let second = register(State(state), Json(second_req)).await;
+        let second = register(State(state), ApiJson(second_req)).await;
 
         assert_eq!(second, Err(RegisterError::EmailTaken));
         assert_eq!(
@@ -755,7 +756,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
-        let result = register(State(state.clone()), Json(req)).await;
+        let result = register(State(state.clone()), ApiJson(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
         assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -777,7 +778,7 @@ mod tests {
             req.extra.insert(format!("field{i}"), "value".to_string());
         }
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
     }
@@ -789,7 +790,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("k".repeat(4096), "v".repeat(4096));
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
     }
@@ -803,7 +804,7 @@ mod tests {
             req.extra.insert(format!("field{i}"), "value".to_string());
         }
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Err(RegisterError::ExtraDataTooLarge));
     }
@@ -815,7 +816,7 @@ mod tests {
         let mut req = req("alice@example.com", "hunter2");
         req.extra.insert("company".to_string(), "x".repeat(4097));
 
-        let result = register(State(state), Json(req)).await;
+        let result = register(State(state), ApiJson(req)).await;
 
         assert_eq!(result, Err(RegisterError::ExtraDataTooLarge));
     }

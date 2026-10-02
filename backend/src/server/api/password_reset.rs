@@ -5,9 +5,9 @@ pub(crate) use controller::request_password_reset_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
-    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use common_macros::ErrorResponses;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -83,7 +83,7 @@ mod controller {
 
     pub(crate) async fn request_password_reset(
         State(mut state): State<AppState>,
-        Json(req): Json<PasswordResetRequestRequest>,
+        ApiJson(req): ApiJson<PasswordResetRequestRequest>,
     ) -> StatusCode {
         service::request_password_reset(&mut state, &req.email).await;
         StatusCode::ACCEPTED
@@ -91,7 +91,7 @@ mod controller {
 
     pub(crate) async fn confirm_password_reset(
         State(mut state): State<AppState>,
-        Json(req): Json<PasswordResetConfirmRequest>,
+        ApiJson(req): ApiJson<PasswordResetConfirmRequest>,
     ) -> Result<StatusCode, PasswordResetConfirmError> {
         service::confirm_password_reset(&mut state, &req.token, req.new_password.into()).await?;
         Ok(StatusCode::OK)
@@ -233,8 +233,9 @@ mod tests {
         LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage,
         VerificationSessionStorage,
     };
-    use axum::extract::{Json, State};
+    use axum::extract::State;
     use axum::http::StatusCode;
+    use common::extract::ApiJson;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -278,7 +279,7 @@ mod tests {
         let req = PasswordResetRequestRequest {
             email: "alice@example.com".to_string(),
         };
-        let status = request_password_reset(State(state.clone()), Json(req)).await;
+        let status = request_password_reset(State(state.clone()), ApiJson(req)).await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(state.password_reset_tokens.token_count().await, 1);
@@ -293,7 +294,7 @@ mod tests {
             email: "nobody@example.com".to_string(),
         };
 
-        let status = request_password_reset(State(state), Json(req)).await;
+        let status = request_password_reset(State(state), ApiJson(req)).await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
     }
@@ -314,7 +315,7 @@ mod tests {
             token: token.clone(),
             new_password: "new-password".to_string(),
         };
-        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
         assert_eq!(result, Ok(StatusCode::OK));
 
         let updated = state.users.get_user_by_id(user_id).await.unwrap();
@@ -325,7 +326,7 @@ mod tests {
             token,
             new_password: "another-password".to_string(),
         };
-        let replay_result = confirm_password_reset(State(state), Json(replay)).await;
+        let replay_result = confirm_password_reset(State(state), ApiJson(replay)).await;
         assert_eq!(
             replay_result,
             Err(PasswordResetConfirmError::InvalidOrExpiredToken)
@@ -357,7 +358,7 @@ mod tests {
             token,
             new_password: "new-password".to_string(),
         };
-        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
         assert_eq!(result, Ok(StatusCode::OK));
 
         assert_eq!(
@@ -401,7 +402,7 @@ mod tests {
             token,
             new_password: "new-password".to_string(),
         };
-        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
         assert_eq!(result, Ok(StatusCode::OK));
 
         assert_eq!(
@@ -470,7 +471,7 @@ mod tests {
             token,
             new_password: "new-password".to_string(),
         };
-        let result = confirm_password_reset(State(state.clone()), Json(req)).await;
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
         assert_eq!(result, Ok(StatusCode::OK));
 
         assert!(matches!(
@@ -502,7 +503,7 @@ mod tests {
         let req = PasswordResetRequestRequest {
             email: "alice@example.com".to_string(),
         };
-        request_password_reset(State(state.clone()), Json(req)).await;
+        request_password_reset(State(state.clone()), ApiJson(req)).await;
 
         assert_eq!(
             state
@@ -522,7 +523,7 @@ mod tests {
             new_password: "new-password".to_string(),
         };
 
-        let result = confirm_password_reset(State(state), Json(req)).await;
+        let result = confirm_password_reset(State(state), ApiJson(req)).await;
 
         assert_eq!(
             result.err(),

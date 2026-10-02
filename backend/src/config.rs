@@ -19,7 +19,7 @@ pub struct Config {
     /// How long a refresh token stays redeemable before it must be re-issued
     /// via a fresh login.
     pub refresh_token_ttl_secs: i64,
-    /// How long a state entry for an in-flight `/oauth/oidc/{provider}/login`
+    /// How long a state entry for an in-flight `/oauth/oidc/login`
     /// redirect stays valid while the user is off at the provider's consent
     /// screen.
     pub oidc_state_ttl_secs: i64,
@@ -49,7 +49,7 @@ pub struct Config {
     /// Bounds how long an abandoned flow's leftovers linger.
     pub expiry_sweep_interval_secs: u64,
     /// Third-party OIDC login providers, keyed by a short name used in the
-    /// route path (e.g. "google" for `/oauth/oidc/google/login`). Empty by
+    /// `provider` query param (e.g. "google" for `/oauth/oidc/login?provider=google`). Empty by
     /// default -- third-party login is a no-op unless a provider is
     /// configured here.
     ///
