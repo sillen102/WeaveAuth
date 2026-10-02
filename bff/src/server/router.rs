@@ -7,6 +7,7 @@ use crate::server::api::{
     oidc::start_oidc_login,
     proxy::proxy_router,
     register::{start_register, start_register_doc},
+    verify_email::{resend_verification, verify_email},
 };
 use aide::axum::ApiRouter;
 use aide::axum::routing::post_with;
@@ -47,6 +48,8 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
         .route("/oidc/{provider}/login", get(start_oidc_login))
         .route("/oidc/{provider}/callback", get(oidc_callback))
         .route("/oidc/confirm-link", post(oidc_confirm_link))
+        .route("/verify-email", post(verify_email))
+        .route("/verify-email/resend", post(resend_verification))
         .layer(GovernorLayer::new(auth_governor.clone()))
         .with_state(state.clone());
 

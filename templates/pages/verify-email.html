@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WeaveAuth - Verify email</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="page-content">
+  <main class="card">
+    <h1>Verify your email</h1>
+    {% if status == "session_expired" %}
+    <p class="error" id="verify-session-expired">This verification has expired. Please sign in again to get a new code.</p>
+    <p class="secondary">
+      <a id="login-link" href="login.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-get="login.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-target="#page" hx-select="#page-content" hx-push-url="true">Sign in</a>
+    </p>
+    {% else %}
+    {% if status == "invalid" %}
+    <p class="error" id="verify-invalid">That code is wrong or has expired. Check it and try again, or ask for a new one below.</p>
+    {% elif status == "sent" %}
+    <p id="verify-sent">If a code can be sent, it is on its way. New codes can only be sent every so often, so give it a moment.</p>
+    {% else %}
+    <p id="verify-intro">We emailed you a 6-digit code. Enter it to finish signing in.</p>
+    {% endif %}
+    <form id="verify-form" method="post" action="{{ bff_url | safe }}/verify-email">
+      <div>
+        <label for="code">Verification code</label>
+        <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+      </div>
+      <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+      <input type="hidden" name="next" value="{{ own_url }}">
+      <button class="btn" type="submit">Verify email</button>
+    </form>
+    <div class="divider"><span>no code?</span></div>
+    <form id="resend-form" method="post" action="{{ bff_url | safe }}/verify-email/resend">
+      <input type="hidden" name="next" value="{{ own_url }}">
+      <button class="btn" type="submit">Send a new code</button>
+    </form>
+    {% endif %}
+  </main>
+  </div>
+</body>
+</html>

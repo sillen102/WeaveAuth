@@ -141,6 +141,17 @@ pub(crate) trait UserStorage {
         user_id: Uuid,
         password_hash: PasswordHash,
     ) -> SetPasswordOutcome;
+    /// Sets `email_verified` (and `email_verified_by_code`) on `user_id`.
+    /// CALLER MUST have proven control of the address by checking an
+    /// `EmailVerificationCodeStorage` code.
+    async fn mark_email_verified_by_code(&mut self, user_id: Uuid) -> MarkVerifiedOutcome;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum MarkVerifiedOutcome {
+    Ok,
+    UserNotFound,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -302,6 +313,72 @@ pub(crate) trait PasswordResetTokenStorage {
     /// existed and hasn't expired. Single-use, same rationale as
     /// `PendingOidcLinkStorage::take_pending_link`.
     async fn take_reset_token(&mut self, token: &str) -> Option<Uuid>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum IssueCodeOutcome {
+    /// The new 6-digit code; any earlier one for the user is gone.
+    Issued(String),
+    /// A code was issued too recently; nothing changed.
+    CoolingDown,
+    /// Too many wrong guesses lately; no code is issued until the lock ends.
+    Locked,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum CheckCodeOutcome {
+    /// Right code; it is consumed.
+    Verified,
+    Wrong,
+    /// No code was issued, or it expired.
+    NoCode,
+    /// This wrong guess used up the allowed attempts; the code is gone (and,
+    /// after enough of them in a row, the user is locked out for a while).
+    TooManyAttempts,
+    /// Locked out after too many wrong guesses; even the right code fails.
+    Locked,
+}
+
+/// A short-lived 6-digit code proving whoever enters it controls the inbox
+/// the verification email went to. Six digits are guessable, so a code only
+/// survives a few wrong attempts, issuing is rate-limited per user, and
+/// enough wrong guesses in total lock the user out for a while. The
+/// rate limit and the lock outlive any single code: they are kept per user,
+/// not per code, so deleting a spent code never resets them.
+pub(crate) trait EmailVerificationCodeStorage {
+    async fn issue_code(&mut self, user_id: Uuid) -> IssueCodeOutcome;
+    async fn check_code(&mut self, user_id: Uuid, code: &str) -> CheckCodeOutcome;
+    /// Forgets everything about `user_id`: the current code, the resend
+    /// cooldown, the failure count and any lockout. A password reset calls
+    /// this, so guesses burned on purpose before the owner took the account
+    /// back don't keep them from verifying.
+    ///
+    /// Returns `RevokeOutcome::Failed` if clearing failed -- implementations
+    /// MUST NOT swallow such a failure and report `Ok`.
+    async fn clear_user(&mut self, user_id: Uuid) -> RevokeOutcome;
+}
+
+/// What `/oauth/login` hands an account whose email isn't verified yet
+/// instead of (when verification is required) or next to a `login_session`:
+/// proof the password was right, good only for the email-verification
+/// endpoints. It cannot be turned into tokens, so nothing else is reachable
+/// until the code is entered; entering it yields the real `login_session`.
+pub(crate) trait VerificationSessionStorage {
+    /// How long a session lasts; handed to bff so its cookie lives exactly as long.
+    fn ttl_secs(&self) -> i64;
+    async fn create_session(&mut self, user_id: Uuid) -> String;
+    /// Not consuming: a wrong code must leave it usable for the next try.
+    async fn get_session(&self, token: &str) -> Option<Uuid>;
+    async fn delete_session(&mut self, token: &str);
+    /// Ends every verification session of `user_id`. A password reset calls
+    /// this: whoever held one before the reset (the account may have been
+    /// squatted) must not be able to turn it into a login afterwards.
+    ///
+    /// Returns `RevokeOutcome::Failed` if the revocation itself failed --
+    /// implementations MUST NOT swallow such a failure and report `Ok`.
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
 }
 
 /// Periodic upkeep for storage backends that accumulate single-use, TTL'd

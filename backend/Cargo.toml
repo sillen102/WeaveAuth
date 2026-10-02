@@ -43,6 +43,8 @@ hyper-util = { workspace = true, features = ["tokio"] }
 async-trait = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 url = { workspace = true }
+tera = { workspace = true, features = ["glob_fs"] }
+lettre = { workspace = true, features = ["builder", "smtp-transport", "tokio1", "tokio1-native-tls", "hostname"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }

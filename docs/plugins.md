@@ -70,6 +70,20 @@ release. A plugin only has to handle the hooks it's wired into; return
 - An unset `data` field in the response is treated as no extra claims, not an
   error.
 
+### `hook: "email_verification"`
+
+- Called after a user registers, and again on every resend request, when
+  `email_handler` is `kind: plugin`. `user_id` and `email` identify the
+  account; `data` carries `code` (the 6-digit code to put in the mail),
+  `verify_page_url` (login's `/verify-email.html`, where it is entered) and
+  `expires_at` (RFC 3339, UTC). The call runs in a background task, so a slow
+  plugin never delays the user's request.
+- **Return `OK` once the email is sent or queued.** Any other status is logged
+  as a failed delivery; it does not fail the registration, and the user can ask
+  for a new code.
+- The plugin's user defaults to `1003` (`wa-email`) and its environment comes
+  from `WA_PLUGIN_EMAIL_ENV_<NAME>`.
+
 ## Running
 
 WeaveAuth spawns the plugin with one end of a connected unix socket as its
@@ -304,7 +318,7 @@ go build -o register .
 
 ```yaml
 extra_data_handler:
-  kind: process
+  kind: plugin
   command: /plugins/register
   args: []                 # optional
   env:                     # the plugin's ENTIRE environment
@@ -315,12 +329,18 @@ extra_data_handler:
   gid: 1001                # default 1001, never 0
 
 login_claims_handler:
-  kind: process
+  kind: plugin
   command: /plugins/login-claims
   timeout_secs: 5
   startup_timeout_secs: 10
   uid: 1002                # default 1002 (the image's wa-login-claims)
   gid: 1002
+
+email_handler:
+  kind: plugin
+  command: /plugins/mailer
+  uid: 1003                # default 1003 (the image's wa-email)
+  gid: 1003
 ```
 
 The plugin is always spawned as `uid`/`gid`, and each hook defaults to its own
@@ -386,7 +406,8 @@ for anything that isn't secret.
 Any variable in **WeaveAuth's own environment** named
 `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` is forwarded to that plugin as `<NAME>`, with
 the prefix stripped. The plugin behind `extra_data_handler` is `REGISTRATION`,
-and the one behind `login_claims_handler` is `LOGIN_CLAIMS`:
+the one behind `login_claims_handler` is `LOGIN_CLAIMS` and the one behind
+`email_handler` is `EMAIL`:
 
 ```bash
 WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL=postgres://plugin:secret@db/appdata

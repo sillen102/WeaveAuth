@@ -26,7 +26,7 @@ Cargo workspace (`backend/` + `bff/` + `login/`), three binaries:
   loads `login.html` by default and switches between it and `register.html` via HTMx,
   keeping the URL's query string (`redirect_uri`, etc.) intact across the swap.
   `login.html`/`register.html` are Tera templates rendered per-request from
-  `login/templates/` — no build step, so a deployer can drop in reskinned versions of
+  `templates/pages/` — no build step, so a deployer can drop in reskinned versions of
   those files without touching the shell that wires them together. Per
   `login/AGENTS.md`, these templates must stay plain HTML/CSS with **no `<script>` or
   client-side logic at all** — every dynamic value (`redirect_uri`, the form's
@@ -88,18 +88,21 @@ a user sign in via Google/LinkedIn/Apple etc. instead of a password; bff proxies
 (see its own `/oidc/{provider}/*` routes below) since backend isn't internet-exposed.
 Accounts are linked across providers, and to a password account, **by email** — sign in
 with Google today, LinkedIn tomorrow, same account, as long as the email matches. Each
-`User` has an `email_verified` flag: `false` for a plain password registration (this app
-sends no verification email), `true` once an OIDC provider has confirmed it.
+`User` has an `email_verified` flag: `false` for a plain password registration until the
+user enters the emailed 6-digit code, `true` once an OIDC provider has confirmed the
+address too. The user also records *how* it was verified (`email_verified_by_code`).
 
 The linking decision (`UserStorage::resolve_oidc_login`) never merges an OIDC identity
-into an account whose email isn't already verified — an unverified account could belong
-to an attacker who pre-registered a victim's email with a password of their own choosing;
-merging into it on email match alone would hand that attacker a login path into the real
-owner's account. So:
+into an account whose email isn't verified *by the provider* — an unverified account could
+belong to an attacker who pre-registered a victim's email with a password of their own
+choosing, and even a code-verified one has a password somebody chose, who may not be the
+mailbox's owner. Merging into it on email match alone would hand that attacker a login
+path into the real owner's account. So:
 
-- New email, or the matching account is already verified → the identity links
-  immediately, no extra step.
-- Matching account exists but `email_verified: false` → backend returns
+- New email, or the matching account has no password or was verified by an OIDC provider →
+  the identity links immediately, no extra step.
+- Matching account exists but is unverified, or was verified only by the emailed code →
+  backend returns
   `password_confirmation_required` instead of a session. The caller must submit that
   account's *current* password to `POST /oauth/oidc/confirm-link`; only on success does
   the account become `email_verified: true` and the identity link. (There's no email
@@ -122,11 +125,13 @@ bucket):
 |--------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GET    | `/docs`, `/docs/scalar.js`, `/openapi.json` | OpenAPI schema and Scalar UI for the documented routes. Only mounted when `WA_DOCS_ENABLED` is true (`404` otherwise); rate-limited in its own bucket, separate from the auth and proxy buckets                                                                                                                                                                                       |
 | GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                                                                                                               |
-| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                      |
+| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; an unverified email when backend requires verification → no session cookie, a restricted `wa_verify_session` cookie and 303 → login's `verify-email.html` (when verification is optional the user is logged in and gets that cookie too); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                                                                                                               |
+| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; if backend requires a verified email, no session cookie but a restricted `wa_verify_session` cookie and 303 → login's `verify-email.html`; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                      |
 | GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; `404` for an unknown provider                                                                                                                                                                                                                                  |
 | GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend; on success finishes the login like `/login` would; if backend reports `password_confirmation_required`, 303 → `next?email=...` instead, with `pending_link_token` in a short-lived `wa_oidc_pending_link_token` cookie, never in the URL (the login page's own prompt, not an error); failure → 303 → `next?error=1` (`next?error=consent_required` if backend refused because a required permission was declined); `400` if the flow cookies are missing/expired |
 | POST   | `/oidc/confirm-link`         | Form `{password, redirect_uri, next}`; `pending_link_token` is read from the `wa_oidc_pending_link_token` cookie, not the form. Forwards to backend's `/oauth/oidc/confirm-link`; on success finishes the login like `/login` does, 303 → `redirect_uri` with session cookie set; wrong password or a dead/expired token → 303 → `next?error=link_failed` (the token is single-use on backend regardless of outcome, so there's nothing to retry); `400` if `redirect_uri` isn't allowlisted; `403` if `Origin`/`Referer` isn't in `trusted_origins` |
+| POST   | `/verify-email`              | Form `{code, redirect_uri, next}`. Needs the `wa_verify_session` cookie `/login` set (it is only sent to this path). Sends the 6-digit code to backend's `/oauth/email-verification/confirm`; on success finishes the login with the session backend released, sets `wa_session` and 303 → `redirect_uri`; wrong/expired code → 303 → `next?status=invalid`; missing/unknown verification session → 303 → `next?status=session_expired`; `400` if `next` isn't a same-origin path or trusted origin or `redirect_uri` isn't allowlisted; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted |
+| POST   | `/verify-email/resend`       | Form `{next}`, same cookie. Asks backend for a new code; 303 → `next?status=sent` (also when nothing was sent because the account is verified or inside the resend cooldown) or `next?status=session_expired`; same `400`/`403`/`429` as above |
 | *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session or the refresh token is rejected, `502` if backend is unreachable or fails (5xx / bad body) during a token refresh, `404` if no route matches, `429` if the proxy bucket is exhausted                                                                                                                                                                                                                         |
 
 login routes:
@@ -135,8 +140,9 @@ login routes:
 |--------|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GET    | `/`              | Login shell (`login/src/index.html`, compiled into the binary) — loads `login.html` via HTMx                                                            |
 | GET    | `/index.html`    | Same shell, for anyone linking there directly                                                                                                           |
-| GET    | `/login.html`    | Login page, server-rendered from `login/templates/login.html` — also renders the OIDC password-confirm prompt when `?email=...` is present |
-| GET    | `/register.html` | Registration page, server-rendered from `login/templates/register.html`                                                                                 |
+| GET    | `/login.html`    | Login page, server-rendered from `templates/pages/login.html` — also renders the OIDC password-confirm prompt when `?email=...` is present |
+| GET    | `/register.html` | Registration page, server-rendered from `templates/pages/register.html`                                                                                 |
+| GET    | `/verify-email.html` | Email verification page, server-rendered from `templates/pages/verify-email.html` — a form for the 6-digit code and one to request a new code; `?status=invalid\|sent\|session_expired` shows the outcome; `?redirect_uri=` is where the user was headed |
 | GET    | `/static/*`      | Static assets (`login/static/`) — stylesheet, vendored `htmx.min.js`                                                                                    |
 
 Backend routes:
@@ -144,13 +150,17 @@ Backend routes:
 | Method | Path                              | Returns                                                                                                                                                                                                                                                                                                                                                                   |
 |--------|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GET    | `/health`                         | `ok`                                                                                                                                                                                                                                                                                                                                                                      |
-| POST   | `/oauth/login`                    | Verifies email/password (Argon2) against `UserStorage`; `{ login_session }` on success, `401` otherwise                                                                                                                                                                                                                                                                   |
-| POST   | `/register`                       | Hashes the password (Argon2) and saves a new user (`email_verified: false`); `201`, or `409` if the email is taken                                                                                                                                                                                                                                                        |
+| POST   | `/oauth/login`                    | Verifies email/password (Argon2) against `UserStorage`; `{ login_session }` for a verified account, `401` otherwise. An unverified account also gets a `verification_session` (and its `verification_session_ttl_secs`): `{ login_session, verification_session }` when verification is optional, `{ verification_session }` only when `require_verified_email` is set (which also sends the code)                                                                                                                                                                                                                                                                   |
+| POST   | `/register`                       | Hashes the password (Argon2) and saves a new user (`email_verified: false`), then sends the verification email if an `email_handler` is configured; `201`, or `409` if the email is taken                                                                                                                                                                                                                                                        |
 | GET    | `/oauth/authorize`                | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400`                                                                                                                                                                                                                     |
 | POST   | `/oauth/token`                    | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`, JWT carries `email`/`email_verified`                                                                                                                                                                                                |
 | GET    | `/oauth/oidc/{provider}/login`    | Not for the browser directly -- bff proxies this. Redirects to the provider's consent screen; `404` for an unknown `provider`                                                                                                                                                                                                                                             |
 | GET    | `/oauth/oidc/{provider}/callback` | Not for the provider directly -- bff forwards `code`+`state` here server-to-server. Resolves the OIDC identity to a user by verified email (see `UserStorage::resolve_oidc_login`); `{status: "authenticated", login_session}` on success, or `{status: "password_confirmation_required", pending_link_token, email}` if a matching account exists but isn't verified yet |
+| POST   | `/oauth/email-verification/request` | `{verification_session}` (what `/oauth/login` returned for an unverified account; `401` otherwise). Sends a fresh 6-digit code in the background; `202`, also when the email is already verified or a code was sent within the resend cooldown (then nothing is sent) |
+| POST   | `/oauth/email-verification/confirm` | `{verification_session, code}`. Marks the email verified, ends the verification session and returns `{ login_session }` (the one the login withheld); `400` if the code is wrong, expired, or used up by 5 wrong attempts (the session stays usable); `401` for an unknown/expired session |
 | POST   | `/oauth/oidc/confirm-link`        | `{pending_link_token, password}`. Verifies the password against the account named in the pending link; on success marks it `email_verified` and links the identity, `{ login_session }`; `401` on wrong password, `400` if the token is invalid/expired                                                                                                                   |
+| POST   | `/oauth/password-reset/request`   | `{email}`. Always `202`, whether or not the address matches an account (no enumeration); issues a single-use reset token for a matching account. The token is never in the response or logged, and there is no email delivery for it yet (see [docs/flows/password-reset.md](docs/flows/password-reset.md)) |
+| POST   | `/oauth/password-reset/confirm`   | `{token, new_password}`. Sets the new password and revokes everything the old credentials could use: every refresh token, login session and email-verification session of the account, and its email-verification code state (cooldown, failure count, lockout), so someone who squatted the address can't keep a verification session or a lockout across the reset. `200`, or `400` if the token is unknown, expired or already used |
 
 ## Prerequisites
 
@@ -222,15 +232,15 @@ redirect_uri_allowlist:
 
 backend's `extra_data_handler` is YAML-only too. It decides what happens to fields a
 register request carries beyond `email`/`password`: `kind: webhook` POSTs them to a URL,
-`kind: process` runs an executable the deployer mounts and calls it over gRPC. A plugin
+`kind: plugin` runs an executable the deployer mounts and calls it over gRPC. A plugin
 is an ordinary binary, so it uses ordinary libraries and keeps its own connection pools
 — and it is **not sandboxed**: each plugin runs as its own user (`uid`/`gid`, defaults
-1001 and 1002), but mounting one is still equivalent to shipping application code.
+1001, 1002 and 1003), but mounting one is still equivalent to shipping application code.
 See **[docs/plugins.md](docs/plugins.md)**.
 
 ```yaml
 extra_data_handler:
-  kind: process
+  kind: plugin
   command: /plugins/register
   env:
     LOG_LEVEL: info
@@ -244,7 +254,7 @@ generated at startup that its SDK checks.
 backend's `login_claims_handler` is the same shape, wired into a different flow: it's
 called on every token mint (both `authorization_code` and `refresh_token` grants) and its
 output is merged into the issued JWT as extra claims. Same two kinds — `kind: webhook`
-POSTs `{user_id, email}` and expects a JSON object of claims back, `kind: process` calls the
+POSTs `{user_id, email}` and expects a JSON object of claims back, `kind: plugin` calls the
 plugin's one generic rpc with `hook: "login_claims"` and expects a `google.protobuf.Struct`
 back (so claim values can nest, e.g. `roles: {"admin": ["user-1", "user-2"]}`). An error from
 either kind fails
@@ -253,9 +263,44 @@ A claim name the handler returns that collides with a reserved one (`sub`, `emai
 `email_verified`, `iat`, `exp`) also fails the request, so a plugin/webhook can't spoof
 identity claims.
 
+backend's `email_handler` delivers the verification email sent when a user registers (and
+on login when verification is required and on a resend request). It contains a short-lived
+6-digit code and the address of login's `/verify-email.html`, where the user types it in; the
+login that triggered it handed out a restricted verification session for exactly that.
+Exactly one of three kinds, and it needs `login_public_url` (`WA_LOGIN_PUBLIC_URL`):
+
+- `kind: smtp` renders the templates in `templates/emails/`
+  (`verify-email.subject.txt`, `verify-email.txt`, `verify-email.html`, Tera syntax with
+  `email`, `code`, `verify_page_url`, `expires_at`) and sends them through `host`/`port`.
+  `tls` is `starttls` (default), `implicit` or `none` (`none` is refused for anything but a loopback host); `username`/`password` are optional
+  (password better as `WA_EMAIL_SMTP_PASSWORD`). To use your own wording, replace those files
+  in the image's `/app/templates/emails` (the login pages are in `/app/templates/pages`). Templates are read at startup, and a missing one stops backend
+  from booting. Locally: `docker compose -f testing/mailpit/docker-compose.yml up -d`, then
+  read the mail at http://localhost:7025.
+- `kind: webhook` POSTs `{user_id, email, code, verify_page_url, expires_at}` (`expires_at` is RFC 3339, UTC) to a URL (https
+  unless loopback) so a downstream service can send the email itself.
+- `kind: plugin` calls a plugin with `hook: "email_verification"`
+  (see [docs/plugins.md](docs/plugins.md); `WA_PLUGIN_EMAIL_ENV_<NAME>`, default user `wa-email` 1003).
+
+The mail is sent in the background and a failed delivery is only logged, so it never delays
+or fails the registration; the user can request a new code (at most one per
+`email_verification_resend_cooldown_secs`). `require_verified_email: true`
+(`WA_REQUIRE_VERIFIED_EMAIL`) makes `/oauth/login` withhold the login session from accounts
+whose email isn't verified: they get only the verification session until they enter the code. See [docs/flows/verify-email.md](docs/flows/verify-email.md).
+
+```yaml
+login_public_url: https://login.example.com
+email_handler:
+  kind: smtp
+  host: smtp.example.com
+  port: 587
+  username: apikey
+  from: WeaveAuth <no-reply@example.com>
+```
+
 ```yaml
 login_claims_handler:
-  kind: process
+  kind: plugin
   command: /plugins/login-claims
   env:
     LOG_LEVEL: info
@@ -367,7 +412,7 @@ A `.env` file in the working directory or any parent directory is loaded first. 
 | `WA_BFF_PORT`                | bff                 | `8080`                                                  | bff listen port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `WA_BACKEND_URL`             | bff                 | `http://localhost:1983`                                 | Backend base URL the bff exchanges codes against                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `WA_BFF_URL`                 | bff, login          | `http://localhost:8080`                                 | Public base URL of the bff, used by login to redirect into it                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `WA_LOGIN_PUBLIC_URL`        | login, bff, backend | `http://localhost:8081`                                 | Login page's own public origin. login uses it as the `redirect_uri` fallback and to build `own_url`/`next` — pinned in config rather than trusted from `Host`/`X-Forwarded-Proto`. bff defaults `WA_TRUSTED_ORIGINS` from it, and backend defaults `WA_REDIRECT_URI_ALLOWLIST` from it (with a trailing `/` appended) — both only when that var isn't set explicitly. When all three run in the same container (`weaveauth-launcher`), setting just this one is enough. Not bff's or backend's own URL. |
+| `WA_LOGIN_PUBLIC_URL`        | login, bff, backend | `http://localhost:8081`                                 | Login page's own public origin. login uses it as the `redirect_uri` fallback and to build `own_url`/`next` — pinned in config rather than trusted from `Host`/`X-Forwarded-Proto`. backend also puts it in the verification email (the page where the code is entered), and refuses to start without it when `email_handler` is set. bff defaults `WA_TRUSTED_ORIGINS` from it, and backend defaults `WA_REDIRECT_URI_ALLOWLIST` from it (with a trailing `/` appended) — both only when that var isn't set explicitly. When all three run in the same container (`weaveauth-launcher`), setting just this one is enough. Not bff's or backend's own URL. |
 | `WA_REDIRECT_URI_ALLOWLIST`  | backend             | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/` | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`. Exact string match, hence the trailing slash — matches login's own default `redirect_uri`                                                                                                                                                                                                                                                                 |
 | `WA_TRUSTED_ORIGINS`         | bff                 | `WA_LOGIN_PUBLIC_URL`, else `http://localhost:8081`     | Comma-separated origins allowed to POST to `/login`/`/register` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF")                                                                                                                                                                                                                                                     |
 | `WA_SESSION_COOKIE_NAME`     | bff                 | `wa_session`                                            | Name of the HttpOnly session cookie set after login                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -377,8 +422,13 @@ A `.env` file in the working directory or any parent directory is loaded first. 
 | `WA_RATE_LIMIT_WINDOW_SECS`  | bff                 | `60`                                                    | Approximate window the burst size applies over; replenishes at `max_attempts / window_secs` per second                                                                                                                                                                                                                                                                                                                                                                                             |
 | `WA_DOCS_ENABLED`            | bff                 | `false`                                                 | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off by default — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                              |
 | `WA_MAX_BCRYPT_COST`         | backend             | `12`                                                    | Highest bcrypt cost factor accepted when verifying an imported legacy-user password hash — caps how long a single login can tie up a blocking-pool thread                                                                                                                                                                                                                                                                                                                                        |
+| `WA_EMAIL_SMTP_PASSWORD`     | backend             | *(unset)*                                               | Password for an `email_handler` of `kind: smtp`; wins over `password` in `config.yaml` |
+| `WA_EMAIL_VERIFICATION_CODE_TTL_SECS` | backend    | `900`                                                   | How long an emailed verification code stays valid (it also dies after 5 wrong attempts) |
+| `WA_EMAIL_VERIFICATION_RESEND_COOLDOWN_SECS` | backend | `60`                                               | Minimum time between two verification emails to the same user |
+| `WA_REQUIRE_VERIFIED_EMAIL`  | backend             | `false`                                                 | Withhold the login session from accounts whose email isn't verified; they get a restricted verification session and the code-entry page |
+| `WA_EMAIL_VERIFICATION_SESSION_TTL_SECS` | backend | `1800`                                              | How long that verification session lasts |
 | `WA_SETUID_HELPER`           | backend             | *(unset; the image sets it)*                            | `weaveauth-plugin-exec`, the binary plugins are started through. It alone holds `CAP_SETUID`/`CAP_SETGID` and switches to each plugin's `uid`/`gid`, refusing 0. Unset, backend switches users itself, which needs `CAP_SETUID`/`CAP_SETGID` (or root), unless `uid`/`gid` are its own (local runs) |
-| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | Forwarded to the named plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else |
+| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>` | backend             | *(unset)*                                               | `<PLUGIN>` is `REGISTRATION`, `LOGIN_CLAIMS` or `EMAIL`. Forwarded to that plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else |
 
 ## Testing
 
@@ -412,12 +462,12 @@ members):
 
 Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim-trixie` builder compiles
 the three services plus `weaveauth-launcher` and `weaveauth-plugin-exec`. The `gcr.io/distroless/cc-debian13`
-runtime (no shell) copies them plus `/app/login/static` and `/app/login/templates`, and
+runtime (no shell) copies them plus `/app/login/static` and `/app/templates` (`pages/` for the login pages, `emails/` for the emails), and
 runs `weaveauth-launcher`, which starts all three and exits when any one of them does.
 Everything runs as `weaveauth` (1000) with no capabilities. The exception is
 `weaveauth-plugin-exec` (`WA_SETUID_HELPER`), which has `CAP_SETUID`/`CAP_SETGID` as file
 capabilities, so plugins can run as their own users (`wa-registration` 1001,
-`wa-login-claims` 1002). A deployment without plugins needs no capabilities. With
+`wa-login-claims` 1002, `wa-email` 1003). A deployment without plugins needs no capabilities. With
 plugins, `capabilities.drop: [ALL]` (the Kubernetes restricted Pod Security Standard),
 `--cap-drop SETUID`/`SETGID` or `no-new-privileges` stop them from starting, and backend
 then refuses to boot; see [docs/plugins.md](docs/plugins.md#deploying). The launcher

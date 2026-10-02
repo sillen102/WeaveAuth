@@ -2,10 +2,11 @@ use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::{PasswordHash, User};
 use crate::storage::{
-    CreateUserOutcome, ExpiryMaintenance, JwkStorage, LoginSessionStorage, OidcLinkOutcome,
+    CheckCodeOutcome, CreateUserOutcome, EmailVerificationCodeStorage, ExpiryMaintenance,
+    IssueCodeOutcome, JwkStorage, LoginSessionStorage, MarkVerifiedOutcome, OidcLinkOutcome,
     OidcLoginState, OidcStateStorage, PasswordResetTokenStorage, PendingOidcLink,
     PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, RevokeOutcome,
-    SetPasswordOutcome, UserStorage, VerifiedEmail,
+    SetPasswordOutcome, UserStorage, VerificationSessionStorage, VerifiedEmail,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -111,7 +112,10 @@ impl UserStorage for InMemoryUserStorage {
 
         let existing = inner.users.values().find(|u| u.email == email).cloned();
         let user = match existing {
-            Some(existing) if !existing.email_verified => {
+            // An address verified only by an emailed code isn't vouched for by
+            // the provider: whoever registered it chose the password, and may
+            // not be the mailbox's owner who just signed in with the provider.
+            Some(existing) if !existing.email_verified || existing.email_verified_by_code => {
                 return OidcLinkOutcome::RequiresPasswordConfirmation {
                     existing_user_id: existing.id,
                 };
@@ -124,6 +128,7 @@ impl UserStorage for InMemoryUserStorage {
                     email: email.to_string(),
                     password: None,
                     email_verified: true,
+                    email_verified_by_code: false,
                     created_at: now,
                     updated_at: now,
                 };
@@ -146,6 +151,7 @@ impl UserStorage for InMemoryUserStorage {
 
         let user = inner.users.get_mut(&user_id)?;
         user.email_verified = true;
+        user.email_verified_by_code = false;
         let user = user.clone();
 
         inner
@@ -166,6 +172,19 @@ impl UserStorage for InMemoryUserStorage {
         user.password = Some(password_hash);
         user.updated_at = Utc::now();
         SetPasswordOutcome::Ok
+    }
+
+    async fn mark_email_verified_by_code(&mut self, user_id: Uuid) -> MarkVerifiedOutcome {
+        let mut inner = self.inner.lock().await;
+        let Some(user) = inner.users.get_mut(&user_id) else {
+            return MarkVerifiedOutcome::UserNotFound;
+        };
+        if !user.email_verified {
+            user.email_verified = true;
+            user.email_verified_by_code = true;
+            user.updated_at = Utc::now();
+        }
+        MarkVerifiedOutcome::Ok
     }
 }
 
@@ -323,6 +342,240 @@ impl PasswordResetTokenStorage for InMemoryPasswordResetTokenStorage {
             return None;
         }
         Some(user_id)
+    }
+}
+
+type VerificationSessionEntries = HashMap<String, (Uuid, DateTime<Utc>)>;
+
+#[derive(Clone)]
+pub(crate) struct InMemoryVerificationSessionStorage {
+    sessions: Arc<Mutex<VerificationSessionEntries>>,
+    ttl_secs: i64,
+}
+
+impl InMemoryVerificationSessionStorage {
+    pub fn new(ttl_secs: i64) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
+        }
+    }
+}
+
+impl VerificationSessionStorage for InMemoryVerificationSessionStorage {
+    fn ttl_secs(&self) -> i64 {
+        self.ttl_secs
+    }
+
+    async fn create_session(&mut self, user_id: Uuid) -> String {
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill(&mut token_bytes);
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
+        self.sessions
+            .lock()
+            .await
+            .insert(token.clone(), (user_id, Utc::now()));
+        token
+    }
+
+    async fn get_session(&self, token: &str) -> Option<Uuid> {
+        let (user_id, issued_at) = *self.sessions.lock().await.get(token)?;
+        ((Utc::now() - issued_at).num_seconds() <= self.ttl_secs).then_some(user_id)
+    }
+
+    async fn delete_session(&mut self, token: &str) {
+        self.sessions.lock().await.remove(token);
+    }
+
+    async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome {
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, (owner, _)| *owner != user_id);
+        RevokeOutcome::Ok
+    }
+}
+
+impl ExpiryMaintenance for InMemoryVerificationSessionStorage {
+    async fn sweep_expired(&mut self) {
+        let ttl_secs = self.ttl_secs;
+        let now = Utc::now();
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, (_, issued_at)| (now - *issued_at).num_seconds() <= ttl_secs);
+    }
+}
+
+/// Wrong guesses a single code survives; the next one deletes it.
+const MAX_CODE_ATTEMPTS: u32 = 5;
+/// Wrong guesses (across codes, since the last success) before the user is
+/// locked out. The count is kept as long as the user's record is: dropping it
+/// after an hour without a new code (see the sweep) resets it too.
+const MAX_FAILED_ATTEMPTS: u32 = 10;
+/// How long that lock lasts.
+const LOCKOUT_SECS: i64 = 3_600;
+
+/// The current code, stored as sha256(user id || code) rather than the code
+/// itself, like the other single-use secrets here.
+struct CodeEntry {
+    hash: String,
+    attempts: u32,
+}
+
+/// Everything known about one user's codes. It outlives the code itself: the
+/// resend cooldown and the failure count must survive a code being used up,
+/// or the "5 guesses, resend, 5 more guesses" loop would never be limited.
+#[derive(Default)]
+struct UserCodes {
+    code: Option<CodeEntry>,
+    last_issued_at: Option<DateTime<Utc>>,
+    /// Wrong guesses since the last success or lock; reaching
+    /// `MAX_FAILED_ATTEMPTS` starts a lockout.
+    failed_attempts: u32,
+    locked_until: Option<DateTime<Utc>>,
+}
+
+impl UserCodes {
+    /// Whether this record still has to be kept: a lock in force, a code or
+    /// cooldown that hasn't run out, or failures that still count towards a
+    /// lock. Anything else is the sweep's to drop.
+    fn still_needed(&self, now: DateTime<Utc>, ttl: i64, cooldown: i64, lockout: i64) -> bool {
+        let age = self
+            .last_issued_at
+            .map(|issued| (now - issued).num_seconds());
+        self.locked_until.is_some_and(|until| until > now)
+            || age.is_some_and(|age| {
+                age <= ttl || age < cooldown || (self.failed_attempts > 0 && age <= lockout)
+            })
+    }
+
+    /// Whether a lock is in force. An elapsed one is cleared, with the
+    /// failure count.
+    fn locked(&mut self, now: DateTime<Utc>) -> bool {
+        match self.locked_until {
+            Some(until) if until > now => true,
+            Some(_) => {
+                self.locked_until = None;
+                self.failed_attempts = 0;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct InMemoryEmailVerificationCodeStorage {
+    users: Arc<Mutex<HashMap<Uuid, UserCodes>>>,
+    ttl_secs: i64,
+    cooldown_secs: i64,
+    lockout_secs: i64,
+}
+
+impl InMemoryEmailVerificationCodeStorage {
+    pub fn new(ttl_secs: i64, cooldown_secs: i64) -> Self {
+        Self {
+            users: Arc::new(Mutex::new(HashMap::new())),
+            ttl_secs,
+            cooldown_secs,
+            lockout_secs: LOCKOUT_SECS,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lockout_secs(mut self, lockout_secs: i64) -> Self {
+        self.lockout_secs = lockout_secs;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.users.lock().await.len()
+    }
+}
+
+fn hash_code(user_id: Uuid, code: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(user_id.as_bytes());
+    digest.update(code.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+impl EmailVerificationCodeStorage for InMemoryEmailVerificationCodeStorage {
+    async fn issue_code(&mut self, user_id: Uuid) -> IssueCodeOutcome {
+        let mut users = self.users.lock().await;
+        let user = users.entry(user_id).or_default();
+        let now = Utc::now();
+        if user.locked(now) {
+            return IssueCodeOutcome::Locked;
+        }
+        if user
+            .last_issued_at
+            .is_some_and(|issued| (now - issued).num_seconds() < self.cooldown_secs)
+        {
+            return IssueCodeOutcome::CoolingDown;
+        }
+
+        let code = format!("{:06}", rand::rng().random_range(0..1_000_000u32));
+        user.code = Some(CodeEntry {
+            hash: hash_code(user_id, &code),
+            attempts: 0,
+        });
+        user.last_issued_at = Some(now);
+        IssueCodeOutcome::Issued(code)
+    }
+
+    async fn check_code(&mut self, user_id: Uuid, code: &str) -> CheckCodeOutcome {
+        let mut users = self.users.lock().await;
+        let Some(user) = users.get_mut(&user_id) else {
+            return CheckCodeOutcome::NoCode;
+        };
+        let now = Utc::now();
+        if user.locked(now) {
+            return CheckCodeOutcome::Locked;
+        }
+        if user
+            .last_issued_at
+            .is_none_or(|issued| (now - issued).num_seconds() > self.ttl_secs)
+        {
+            user.code = None;
+        }
+        let Some(entry) = user.code.as_mut() else {
+            return CheckCodeOutcome::NoCode;
+        };
+
+        if entry.hash == hash_code(user_id, code) {
+            user.code = None;
+            user.failed_attempts = 0;
+            return CheckCodeOutcome::Verified;
+        }
+        entry.attempts += 1;
+        user.failed_attempts += 1;
+        if user.failed_attempts >= MAX_FAILED_ATTEMPTS {
+            user.code = None;
+            user.locked_until = Some(now + chrono::Duration::seconds(self.lockout_secs));
+            return CheckCodeOutcome::TooManyAttempts;
+        }
+        if entry.attempts >= MAX_CODE_ATTEMPTS {
+            user.code = None;
+            return CheckCodeOutcome::TooManyAttempts;
+        }
+        CheckCodeOutcome::Wrong
+    }
+
+    async fn clear_user(&mut self, user_id: Uuid) -> RevokeOutcome {
+        self.users.lock().await.remove(&user_id);
+        RevokeOutcome::Ok
+    }
+}
+
+impl ExpiryMaintenance for InMemoryEmailVerificationCodeStorage {
+    async fn sweep_expired(&mut self) {
+        let now = Utc::now();
+        self.users.lock().await.retain(|_, user| {
+            user.still_needed(now, self.ttl_secs, self.cooldown_secs, self.lockout_secs)
+        });
     }
 }
 
@@ -596,15 +849,19 @@ mod tests {
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::{PasswordHash, User};
     use crate::storage::in_memory::{
-        InMemoryLoginSessionStorage, InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
+        InMemoryEmailVerificationCodeStorage, InMemoryLoginSessionStorage,
+        InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
         InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
-        InMemoryUserStorage,
+        InMemoryUserStorage, InMemoryVerificationSessionStorage, UserCodes,
     };
     use crate::storage::{
-        CreateUserOutcome, ExpiryMaintenance, LoginSessionStorage, OidcLinkOutcome,
+        CheckCodeOutcome, CreateUserOutcome, EmailVerificationCodeStorage, ExpiryMaintenance,
+        IssueCodeOutcome, LoginSessionStorage, MarkVerifiedOutcome, OidcLinkOutcome,
         OidcStateStorage, PasswordResetTokenStorage, PendingOidcLinkStorage, PkceStorage,
-        RefreshTokenOutcome, RefreshTokenStorage, SetPasswordOutcome, UserStorage, VerifiedEmail,
+        RefreshTokenOutcome, RefreshTokenStorage, RevokeOutcome, SetPasswordOutcome, UserStorage,
+        VerificationSessionStorage, VerifiedEmail,
     };
+    use chrono::Utc;
     use secrecy::ExposeSecret;
     use uuid::Uuid;
 
@@ -855,6 +1112,457 @@ mod tests {
             .await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_email_verified_by_code_sets_both_flags() {
+        let mut storage = InMemoryUserStorage::new();
+        let user = User::default();
+        let user_id = user.id;
+        let _ = storage.create_user(user).await;
+
+        assert_eq!(
+            storage.mark_email_verified_by_code(user_id).await,
+            MarkVerifiedOutcome::Ok
+        );
+
+        let user = storage.get_user_by_id(user_id).await.unwrap();
+        assert!(user.email_verified);
+        assert!(user.email_verified_by_code);
+    }
+
+    #[tokio::test]
+    async fn mark_email_verified_by_code_reports_an_unknown_user() {
+        let mut storage = InMemoryUserStorage::new();
+
+        assert_eq!(
+            storage.mark_email_verified_by_code(Uuid::new_v4()).await,
+            MarkVerifiedOutcome::UserNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_email_verified_by_code_does_not_downgrade_a_provider_verified_account() {
+        let mut storage = InMemoryUserStorage::new();
+        let user = User {
+            email_verified: true,
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = storage.create_user(user).await;
+
+        let _ = storage.mark_email_verified_by_code(user_id).await;
+
+        assert!(
+            !storage
+                .get_user_by_id(user_id)
+                .await
+                .unwrap()
+                .email_verified_by_code
+        );
+    }
+
+    // The account-takeover guard: an attacker registers the victim's address
+    // with their own password; if the victim later confirms the emailed code,
+    // a Google sign-in must still ask for the account's password.
+    #[tokio::test]
+    async fn oidc_login_into_a_code_verified_password_account_still_requires_the_password() {
+        let mut storage = InMemoryUserStorage::new();
+        let squatter = User {
+            email: "victim@example.com".to_string(),
+            password: Some(PasswordHash::Argon2("attackers-hash".into())),
+            ..User::default()
+        };
+        let squatter_id = squatter.id;
+        let _ = storage.create_user(squatter).await;
+        let _ = storage.mark_email_verified_by_code(squatter_id).await;
+
+        let outcome = storage
+            .resolve_oidc_login(
+                "google",
+                "victims-sub",
+                &verified("victim@example.com"),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } if existing_user_id == squatter_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirming_the_password_for_an_oidc_link_clears_the_code_verified_flag() {
+        let mut storage = InMemoryUserStorage::new();
+        let user = User::default();
+        let user_id = user.id;
+        let _ = storage.create_user(user).await;
+        let _ = storage.mark_email_verified_by_code(user_id).await;
+
+        let linked = storage
+            .link_verified_oidc_identity(user_id, "google", "sub")
+            .await
+            .unwrap();
+
+        assert!(linked.email_verified);
+        assert!(!linked.email_verified_by_code);
+    }
+
+    fn codes() -> InMemoryEmailVerificationCodeStorage {
+        InMemoryEmailVerificationCodeStorage::new(60, 0)
+    }
+
+    async fn issued(storage: &mut InMemoryEmailVerificationCodeStorage, user_id: Uuid) -> String {
+        match storage.issue_code(user_id).await {
+            IssueCodeOutcome::Issued(code) => code,
+            IssueCodeOutcome::CoolingDown | IssueCodeOutcome::Locked => {
+                unreachable!("no cooldown or lock in these tests")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_code_is_six_digits_and_works_once() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Verified
+        );
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::NoCode
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_only_works_for_the_user_it_was_issued_to() {
+        let mut storage = codes();
+        let code = issued(&mut storage, Uuid::new_v4()).await;
+
+        assert_eq!(
+            storage.check_code(Uuid::new_v4(), &code).await,
+            CheckCodeOutcome::NoCode
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_is_rejected_and_the_right_one_still_works() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+        let wrong = if code == "000000" { "000001" } else { "000000" };
+
+        assert_eq!(
+            storage.check_code(user_id, wrong).await,
+            CheckCodeOutcome::Wrong
+        );
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fifth_wrong_guess_destroys_the_code() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+        let wrong = if code == "000000" { "000001" } else { "000000" };
+
+        for _ in 0..4 {
+            assert_eq!(
+                storage.check_code(user_id, wrong).await,
+                CheckCodeOutcome::Wrong
+            );
+        }
+        assert_eq!(
+            storage.check_code(user_id, wrong).await,
+            CheckCodeOutcome::TooManyAttempts
+        );
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::NoCode
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_code_is_rejected() {
+        let mut storage = InMemoryEmailVerificationCodeStorage::new(-1, 0);
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::NoCode
+        );
+    }
+
+    #[tokio::test]
+    async fn issuing_again_within_the_cooldown_changes_nothing() {
+        let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+
+        assert_eq!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::CoolingDown
+        );
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn issuing_after_the_cooldown_supersedes_the_old_code() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let first = issued(&mut storage, user_id).await;
+        let mut second = issued(&mut storage, user_id).await;
+        while second == first {
+            second = issued(&mut storage, user_id).await;
+        }
+
+        assert_ne!(
+            storage.check_code(user_id, &first).await,
+            CheckCodeOutcome::Verified
+        );
+        assert_eq!(
+            storage.check_code(user_id, &second).await,
+            CheckCodeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verification_session_resolves_to_its_user_until_deleted() {
+        let mut storage = InMemoryVerificationSessionStorage::new(60);
+        let user_id = Uuid::new_v4();
+        let token = storage.create_session(user_id).await;
+
+        assert_eq!(storage.get_session(&token).await, Some(user_id));
+        assert_eq!(storage.get_session(&token).await, Some(user_id));
+        storage.delete_session(&token).await;
+        assert_eq!(storage.get_session(&token).await, None);
+        assert_eq!(storage.get_session("unknown").await, None);
+    }
+
+    #[tokio::test]
+    async fn an_expired_verification_session_does_not_resolve_and_is_swept() {
+        let mut storage = InMemoryVerificationSessionStorage::new(-1);
+        let token = storage.create_session(Uuid::new_v4()).await;
+
+        assert_eq!(storage.get_session(&token).await, None);
+        storage.sweep_expired().await;
+        assert!(storage.sessions.lock().await.is_empty());
+    }
+
+    // Guessing 5 times, then asking for a resend, must not hand out a fresh
+    // code at once: the cooldown outlives the spent code.
+    #[tokio::test]
+    async fn the_cooldown_still_applies_after_a_code_is_used_up_by_wrong_guesses() {
+        let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+        let wrong = if code == "000000" { "000001" } else { "000000" };
+        for _ in 0..5 {
+            let _ = storage.check_code(user_id, wrong).await;
+        }
+
+        assert_eq!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::CoolingDown
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cooldown_still_applies_after_a_successful_check() {
+        let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
+        let user_id = Uuid::new_v4();
+        let code = issued(&mut storage, user_id).await;
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Verified
+        );
+
+        assert_eq!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::CoolingDown
+        );
+    }
+
+    // 10 wrong guesses across codes lock the user out: no further guesses
+    // count (not even the right code) and no new code is issued.
+    #[tokio::test]
+    async fn ten_wrong_guesses_across_codes_lock_the_user_out() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let mut code = issued(&mut storage, user_id).await;
+        for round in 0..2 {
+            let wrong = if code == "000000" { "000001" } else { "000000" };
+            for _ in 0..5 {
+                let _ = storage.check_code(user_id, wrong).await;
+            }
+            if round == 0 {
+                code = issued(&mut storage, user_id).await;
+            }
+        }
+
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::Locked
+        );
+        assert_eq!(storage.issue_code(user_id).await, IssueCodeOutcome::Locked);
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_failure_count() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        for _ in 0..3 {
+            let code = issued(&mut storage, user_id).await;
+            let wrong = if code == "000000" { "000001" } else { "000000" };
+            for _ in 0..4 {
+                let _ = storage.check_code(user_id, wrong).await;
+            }
+            assert_eq!(
+                storage.check_code(user_id, &code).await,
+                CheckCodeOutcome::Verified
+            );
+        }
+
+        // 12 wrong guesses in total, but never 10 in a row: not locked.
+        assert!(matches!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::Issued(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_lock_ends_and_the_user_can_ask_for_a_code_again() {
+        let mut storage = codes().with_lockout_secs(0);
+        let user_id = Uuid::new_v4();
+        let mut code = issued(&mut storage, user_id).await;
+        for _ in 0..2 {
+            let wrong = if code == "000000" { "000001" } else { "000000" };
+            for _ in 0..5 {
+                let _ = storage.check_code(user_id, wrong).await;
+            }
+            if let IssueCodeOutcome::Issued(next) = storage.issue_code(user_id).await {
+                code = next;
+            }
+        }
+
+        assert!(matches!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::Issued(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_user_removes_the_lock_the_cooldown_and_the_code() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut code = issued(&mut storage, user_id).await;
+        let other_code = issued(&mut storage, other).await;
+        for _ in 0..2 {
+            let wrong = if code == "000000" { "000001" } else { "000000" };
+            for _ in 0..5 {
+                let _ = storage.check_code(user_id, wrong).await;
+            }
+            if let IssueCodeOutcome::Issued(next) = storage.issue_code(user_id).await {
+                code = next;
+            }
+        }
+        assert_eq!(storage.issue_code(user_id).await, IssueCodeOutcome::Locked);
+
+        assert_eq!(storage.clear_user(user_id).await, RevokeOutcome::Ok);
+
+        assert_eq!(
+            storage.check_code(user_id, &code).await,
+            CheckCodeOutcome::NoCode
+        );
+        assert!(matches!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::Issued(_)
+        ));
+        // Another user's code is untouched.
+        assert_eq!(
+            storage.check_code(other, &other_code).await,
+            CheckCodeOutcome::Verified
+        );
+    }
+
+    // The sweep must not forget a lock (or the failures counting towards one)
+    // just because the code that caused it expired.
+    #[test]
+    fn the_sweep_keeps_locks_and_recent_failures_but_drops_the_rest() {
+        let now = Utc::now();
+        let long_ago = Some(now - chrono::Duration::hours(10));
+        let (ttl, cooldown, lockout) = (900, 60, 3_600);
+        let user = |failed_attempts, locked_until| UserCodes {
+            code: None,
+            last_issued_at: long_ago,
+            failed_attempts,
+            locked_until,
+        };
+
+        assert!(
+            user(10, Some(now + chrono::Duration::hours(1)))
+                .still_needed(now, ttl, cooldown, lockout)
+        );
+        assert!(
+            !user(10, Some(now - chrono::Duration::seconds(1)))
+                .still_needed(now, ttl, cooldown, lockout)
+        );
+        assert!(!user(0, None).still_needed(now, ttl, cooldown, lockout));
+
+        let recent = UserCodes {
+            code: None,
+            last_issued_at: Some(now - chrono::Duration::minutes(30)),
+            failed_attempts: 3,
+            locked_until: None,
+        };
+        assert!(recent.still_needed(now, ttl, cooldown, lockout));
+        let recent_without_failures = UserCodes {
+            failed_attempts: 0,
+            ..recent
+        };
+        assert!(!recent_without_failures.still_needed(now, ttl, cooldown, lockout));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_users_verification_sessions_leaves_other_users_alone() {
+        let mut storage = InMemoryVerificationSessionStorage::new(60);
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let alice_one = storage.create_session(alice).await;
+        let alice_two = storage.create_session(alice).await;
+        let bob_one = storage.create_session(bob).await;
+
+        assert_eq!(storage.revoke_all_for_user(alice).await, RevokeOutcome::Ok);
+
+        assert_eq!(storage.get_session(&alice_one).await, None);
+        assert_eq!(storage.get_session(&alice_two).await, None);
+        assert_eq!(storage.get_session(&bob_one).await, Some(bob));
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_only_expired_codes() {
+        let mut expired = InMemoryEmailVerificationCodeStorage::new(-1, 0);
+        let _ = expired.issue_code(Uuid::new_v4()).await;
+        expired.sweep_expired().await;
+        assert_eq!(expired.entry_count().await, 0);
+
+        let mut live = codes();
+        let _ = live.issue_code(Uuid::new_v4()).await;
+        live.sweep_expired().await;
+        assert_eq!(live.entry_count().await, 1);
     }
 
     #[tokio::test]

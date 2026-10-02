@@ -1,6 +1,9 @@
 use crate::server::AppState;
 use crate::server::api::{
-    authorize::authorize, authorize::authorize_doc, health::health, jwks::jwks, jwks::jwks_doc,
+    authorize::authorize, authorize::authorize_doc, email_verification::confirm_email_verification,
+    email_verification::confirm_email_verification_doc,
+    email_verification::request_email_verification,
+    email_verification::request_email_verification_doc, health::health, jwks::jwks, jwks::jwks_doc,
     login::login, login::login_doc, oidc::oidc_callback, oidc::oidc_callback_doc,
     oidc::oidc_confirm_link, oidc::oidc_confirm_link_doc, oidc::oidc_login, oidc::oidc_login_doc,
     password_reset::confirm_password_reset, password_reset::confirm_password_reset_doc,
@@ -52,5 +55,13 @@ fn oauth_routes() -> ApiRouter<AppState> {
         .api_route(
             "/oauth/password-reset/confirm",
             post_with(confirm_password_reset, confirm_password_reset_doc),
+        )
+        .api_route(
+            "/oauth/email-verification/request",
+            post_with(request_email_verification, request_email_verification_doc),
+        )
+        .api_route(
+            "/oauth/email-verification/confirm",
+            post_with(confirm_email_verification, confirm_email_verification_doc),
         )
 }

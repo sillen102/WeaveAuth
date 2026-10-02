@@ -12,8 +12,9 @@ mod controller {
     use thiserror::Error;
 
     use crate::server::AppState;
+    use crate::storage::VerificationSessionStorage;
 
-    use super::service;
+    use super::service::{self, LoginOutcome};
 
     #[derive(Deserialize, JsonSchema)]
     pub(crate) struct LoginRequest {
@@ -21,10 +22,28 @@ mod controller {
         pub(super) password: String,
     }
 
+    /// `login_session` is the single-use proof of this authentication,
+    /// required by `/oauth/authorize`. `verification_session` is only good for
+    /// `/oauth/email-verification/*`, which trade it (plus the emailed code)
+    /// for a `login_session`; `verification_session_ttl_secs` is how long it
+    /// lasts, so a caller's cookie can live exactly as long.
     #[derive(Serialize, JsonSchema)]
-    pub(crate) struct LoginResponse {
-        /// Single-use proof of this authentication, required by `/oauth/authorize`.
-        pub(super) login_session: String,
+    #[serde(untagged)]
+    pub(crate) enum LoginResponse {
+        /// The account's email is verified.
+        Verified { login_session: String },
+        /// Unverified account, but the deployment doesn't require verification.
+        Unverified {
+            login_session: String,
+            verification_session: String,
+            verification_session_ttl_secs: i64,
+        },
+        /// Unverified account and the deployment requires verification: no
+        /// `login_session` until the emailed code is entered.
+        VerificationRequired {
+            verification_session: String,
+            verification_session_ttl_secs: i64,
+        },
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -49,7 +68,6 @@ mod controller {
         }
     }
 
-    // OpenAPI documentation for this route.
     pub(crate) fn login_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("login")
@@ -58,7 +76,13 @@ mod controller {
                 "Checks email/password against stored users and, on success, returns a \
                  short-lived login_session token that /oauth/authorize requires before it will \
                  issue a code -- this is what makes authentication happen before authorization \
-                 regardless of what order a caller invokes the two endpoints in",
+                 regardless of what order a caller invokes the two endpoints in. An account whose \
+                 email isn't verified also gets a verification_session (good only for \
+                 /oauth/email-verification/*); when the deployment requires verified emails \
+                 that is all it gets, and the verification email is sent. The body is one of \
+                 {login_session}, {login_session, verification_session, \
+                 verification_session_ttl_secs} or {verification_session, \
+                 verification_session_ttl_secs}.",
             )
     }
 
@@ -66,8 +90,25 @@ mod controller {
         State(mut state): State<AppState>,
         Json(req): Json<LoginRequest>,
     ) -> Result<Json<LoginResponse>, LoginError> {
-        let login_session = service::login(&mut state, &req.email, req.password.into()).await?;
-        Ok(Json(LoginResponse { login_session }))
+        let outcome = service::login(&mut state, &req.email, req.password.into()).await?;
+        let verification_session_ttl_secs = state.email_verification.sessions.ttl_secs();
+        Ok(Json(match outcome {
+            LoginOutcome::Verified { login_session } => LoginResponse::Verified { login_session },
+            LoginOutcome::Unverified {
+                login_session,
+                verification_session,
+            } => LoginResponse::Unverified {
+                login_session,
+                verification_session,
+                verification_session_ttl_secs,
+            },
+            LoginOutcome::VerificationRequired {
+                verification_session,
+            } => LoginResponse::VerificationRequired {
+                verification_session,
+                verification_session_ttl_secs,
+            },
+        }))
     }
 }
 
@@ -75,25 +116,10 @@ mod service {
     use secrecy::SecretString;
     use thiserror::Error;
 
-    use crate::crypto;
-    use crate::model::email::normalize_email;
-    use crate::model::user::PasswordHash;
     use crate::server::AppState;
-    use crate::storage::{LoginSessionStorage, UserStorage};
-
-    /// A valid Argon2 hash of a fixed, made-up password -- verified against on the
-    /// "unknown email" path so it costs the same as the real hash-and-compare
-    /// below, instead of returning instantly. Without this, an attacker can
-    /// enumerate registered emails purely from response timing (a known email
-    /// with a wrong password pays for a full Argon2 hash before failing; an
-    /// unknown one previously failed immediately).
-    ///
-    /// A fixed literal, not computed at startup: hashing is fallible in
-    /// principle (clippy denies the `expect()` that would be needed to unwrap
-    /// it), and there's no benefit to hashing a constant input at runtime --
-    /// it always produces a hash with the same cost, whether computed once
-    /// at build time or once at first request.
-    const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$+asaoNd4judQBozzpttaCQ$WFrspw+VJ+HAPOXqRwravZFYap0GT3yyfgRf5ZVv6qc";
+    use crate::server::api::email_verification::send_verification_email;
+    use crate::server::api::{AuthenticateError, authenticate_password};
+    use crate::storage::{LoginSessionStorage, VerificationSessionStorage};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum LoginServiceError {
@@ -103,34 +129,59 @@ mod service {
         UnexpectedError(String),
     }
 
+    impl From<AuthenticateError> for LoginServiceError {
+        fn from(err: AuthenticateError) -> Self {
+            match err {
+                AuthenticateError::InvalidCredentials => Self::InvalidCredentials,
+                AuthenticateError::Unexpected(cause) => Self::UnexpectedError(cause),
+            }
+        }
+    }
+
+    pub(crate) enum LoginOutcome {
+        Verified {
+            login_session: String,
+        },
+        Unverified {
+            login_session: String,
+            verification_session: String,
+        },
+        VerificationRequired {
+            verification_session: String,
+        },
+    }
+
+    /// Checks the password. A verified account gets a `login_session`. An
+    /// unverified one also gets a `verification_session`, and when the
+    /// deployment requires verification *only* that (plus the code email), so
+    /// it can't reach anything until the code is entered.
     pub(crate) async fn login(
         state: &mut AppState,
         email: &str,
         password: SecretString,
-    ) -> Result<String, LoginServiceError> {
-        let user = state.users.get_user_by_email(&normalize_email(email)).await;
-
-        // Hash even for an unknown email (DUMMY_PASSWORD_HASH) so timing can't enumerate registered emails.
-        let hash = user
-            .as_ref()
-            .and_then(|u| u.password.clone())
-            .unwrap_or_else(|| PasswordHash::Argon2(DUMMY_PASSWORD_HASH.into()));
-        match crypto::verify_password(hash, password.clone(), state.max_bcrypt_cost).await {
-            Ok(crypto::PasswordVerifyOutcome::Verified) => {}
-            Ok(crypto::PasswordVerifyOutcome::NotVerified) => {
-                return Err(LoginServiceError::InvalidCredentials);
-            }
-            Err(error) => return Err(LoginServiceError::UnexpectedError(error.to_string())),
+    ) -> Result<LoginOutcome, LoginServiceError> {
+        let user = authenticate_password(state, email, password).await?;
+        if user.email_verified {
+            let login_session = state.login_sessions.create_session(user.id).await;
+            return Ok(LoginOutcome::Verified { login_session });
         }
 
-        let user = user.ok_or(LoginServiceError::InvalidCredentials)?;
-
-        if matches!(user.password, Some(PasswordHash::Bcrypt(_))) {
-            crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
+        let verification_session = state
+            .email_verification
+            .sessions
+            .create_session(user.id)
+            .await;
+        if state.email_verification.required {
+            drop(send_verification_email(state, user.id, &user.email).await);
+            return Ok(LoginOutcome::VerificationRequired {
+                verification_session,
+            });
         }
-
         let login_session = state.login_sessions.create_session(user.id).await;
-        Ok(login_session)
+        Ok(LoginOutcome::Unverified {
+            login_session,
+            verification_session,
+        })
     }
 }
 
@@ -139,10 +190,10 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
-    use crate::storage::UserStorage;
     use crate::storage::in_memory::{
         InMemoryLoginSessionStorage, InMemoryPkceStorage, InMemoryUserStorage,
     };
+    use crate::storage::{UserStorage, VerificationSessionStorage};
     use argon2::PasswordHasher;
     use axum::extract::{Json, State};
     use std::sync::Arc;
@@ -183,6 +234,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: std::sync::Arc::new(openidconnect::reqwest::Client::new()),
+            email_verification: crate::server::api::email_verification::EmailVerification::disabled(
+            ),
             password_reset_tokens:
                 crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
@@ -199,17 +252,148 @@ mod tests {
         state_with_user_password(email, PasswordHash::Argon2(hash.into())).await
     }
 
-    #[tokio::test]
-    async fn accepts_correct_credentials_and_returns_a_login_session() {
-        let state = state_with_user("alice@example.com", "hunter2").await;
+    async fn login_as(state: &AppState, password: &str) -> Result<LoginResponse, LoginError> {
         let req = LoginRequest {
             email: "alice@example.com".to_string(),
-            password: "hunter2".to_string(),
+            password: password.to_string(),
+        };
+        login(State(state.clone()), Json(req))
+            .await
+            .map(|Json(body)| body)
+    }
+
+    async fn verify_alice(state: &mut AppState) {
+        let user = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.users.mark_email_verified_by_code(user.id).await,
+            crate::storage::MarkVerifiedOutcome::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_account_gets_a_login_session_only() {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        verify_alice(&mut state).await;
+
+        let body = login_as(&state, "hunter2").await.unwrap();
+
+        assert!(
+            matches!(body, LoginResponse::Verified { login_session } if !login_session.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unverified_account_gets_both_sessions_when_verification_is_optional() {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.sessions =
+            crate::storage::in_memory::InMemoryVerificationSessionStorage::new(4321);
+
+        let body = login_as(&state, "hunter2").await.unwrap();
+
+        assert!(matches!(
+            body,
+            LoginResponse::Unverified {
+                verification_session_ttl_secs: 4321,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn requiring_verification_withholds_the_login_session_from_an_unverified_account() {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.required = true;
+        // Distinct from the code TTL, so swapping the two would be noticed.
+        state.email_verification.sessions =
+            crate::storage::in_memory::InMemoryVerificationSessionStorage::new(4321);
+
+        let body = login_as(&state, "hunter2").await.unwrap();
+
+        let (token, ttl) = match body {
+            LoginResponse::VerificationRequired {
+                verification_session,
+                verification_session_ttl_secs,
+            } => Some((verification_session, verification_session_ttl_secs)),
+            _ => None,
+        }
+        .expect("a VerificationRequired response");
+        assert_eq!(ttl, 4321);
+        let user = state
+            .users
+            .get_user_by_email("alice@example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.email_verification.sessions.get_session(&token).await,
+            Some(user.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn requiring_verification_does_not_reveal_unverified_accounts_to_a_wrong_password() {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.required = true;
+
+        assert_eq!(
+            login_as(&state, "wrong").await.err(),
+            Some(LoginError::InvalidCredentials)
+        );
+    }
+
+    #[tokio::test]
+    async fn requiring_verification_lets_a_verified_account_in() {
+        let mut state = state_with_user("alice@example.com", "hunter2").await;
+        state.email_verification.required = true;
+        verify_alice(&mut state).await;
+
+        let body = login_as(&state, "hunter2").await.unwrap();
+
+        assert!(matches!(body, LoginResponse::Verified { .. }));
+    }
+
+    #[test]
+    fn responses_serialize_only_their_own_fields() {
+        let keys = |r: LoginResponse| {
+            let mut k: Vec<String> = serde_json::to_value(r)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
         };
 
-        let Json(body) = login(State(state), Json(req)).await.unwrap();
-
-        assert!(!body.login_session.is_empty());
+        assert_eq!(
+            keys(LoginResponse::Verified {
+                login_session: "l".into()
+            }),
+            ["login_session"]
+        );
+        assert_eq!(
+            keys(LoginResponse::Unverified {
+                login_session: "l".into(),
+                verification_session: "v".into(),
+                verification_session_ttl_secs: 1,
+            }),
+            [
+                "login_session",
+                "verification_session",
+                "verification_session_ttl_secs"
+            ]
+        );
+        assert_eq!(
+            keys(LoginResponse::VerificationRequired {
+                verification_session: "v".into(),
+                verification_session_ttl_secs: 1,
+            }),
+            ["verification_session", "verification_session_ttl_secs"]
+        );
     }
 
     #[tokio::test]
@@ -290,7 +474,7 @@ mod tests {
         };
 
         let Json(body) = login(State(state.clone()), Json(req)).await.unwrap();
-        assert!(!body.login_session.is_empty());
+        assert!(matches!(body, LoginResponse::Unverified { .. }));
 
         let user = state
             .users

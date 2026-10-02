@@ -675,6 +675,8 @@ mod tests {
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
             oidc_http_client: Arc::new(openidconnect::reqwest::Client::new()),
+            email_verification: crate::server::api::email_verification::EmailVerification::disabled(
+            ),
             password_reset_tokens:
                 crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
             max_bcrypt_cost: 12,
