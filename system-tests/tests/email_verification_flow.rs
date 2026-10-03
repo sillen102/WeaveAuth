@@ -82,8 +82,12 @@ async fn assert_full_flow(backend_url: &str, delivered_code: impl AsyncFnOnce() 
         .expect("a verification session");
 
     let code = delivered_code().await;
-    assert_eq!(code.len(), 6);
-    let wrong = if code == "000000" { "000001" } else { "000000" };
+    assert_eq!(code.len(), 9);
+    let wrong = if code == "000000000" {
+        "000000001"
+    } else {
+        "000000000"
+    };
     assert_eq!(
         confirm(backend_url, session, wrong).await.0,
         reqwest::StatusCode::BAD_REQUEST
@@ -201,13 +205,16 @@ async fn a_failing_handler_does_not_fail_registration_and_resend_respects_the_co
         .as_str()
         .expect("a verification session")
         .to_string();
-    let (status, _) = post(
+    let (status, body) = post(
         &backend_url,
         "/oauth/email-verification/request",
         serde_json::json!({"verification_session": session}),
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "cooling_down");
+    let retry_after = body["retry_after_secs"].as_i64().expect("seconds to wait");
+    assert!((1..=60).contains(&retry_after), "{body}");
     let (status, _) = post(
         &backend_url,
         "/oauth/email-verification/request",

@@ -55,6 +55,7 @@ module outside the Cargo workspace, built by its own mise tasks.
       then the handler fn last (it's the assembly of everything declared above it).
     - `service`: error enum first, then the public entry fn, then private helpers below
       it in call order.
+- Model outcomes with different data as an enum with one variant per case, not a struct with `Option` fields that are only set in some cases (applies to response bodies, service outcomes and storage results alike).
 - Avoid functions that return `bool` for a success/failure outcome; return `Result<T, MyError>` with an error enum instead, so callers can match on and log the actual failure reason.
 - Async: use `async/await` with `tokio` runtime for IO-bound operations.
 - Logging: use `tracing` for structured logging; avoid logging sensitive information.

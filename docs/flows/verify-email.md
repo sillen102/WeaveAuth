@@ -1,7 +1,7 @@
 # Email verification flow
 
 A password registration creates an account with `email_verified: false`. When backend
-has an `email_handler`, registering also emails the address a 6-digit code. The user
+has an `email_handler`, registering also emails the address a 9-digit code. The user
 types it on login's `verify-email.html`; that marks the account verified
 (`email_verified: true` in every token issued afterwards). Verification spans all three
 web services: `backend` (codes, sessions, delivery, state), `bff` (browser-facing POSTs,
@@ -52,14 +52,15 @@ squatted the address before the real owner took the account back can't use a ses
 time afterwards, and can't have burned guesses just before the reset to lock the owner out.
 
 **2. bff keeps it in a narrow cookie.** bff puts it in `wa_verify_session`: `HttpOnly`,
-`Max-Age` = the lifetime backend reported, `Path=/verify-email` (so the browser only sends it to `/verify-email` and
-`/verify-email/resend`), and cross-site capable (`SameSite=None; Secure` on https) because the
-form that posts it lives on login's origin, like the OIDC pending-link cookie. The proxy only
-looks at `wa_session`, so with just this cookie **every proxied route answers `401`**: that is
-how the user stays boxed in. When verification is required bff sets no `wa_session` at all and
-answers `303` to login's `verify-email.html?redirect_uri=<where they were going>` (placed next
-to the `next` page the form came from). Registration's auto-login takes the same path, so a new
-user lands on the code page and never in the app.
+`Max-Age` = the lifetime backend reported, `Path=/verify-email` (so the browser only sends it
+to `/verify-email` and `/verify-email/resend`), and cross-site capable (`SameSite=None; Secure`
+on https) because the form that posts it lives on login's origin, like the OIDC pending-link
+cookie. The proxy only looks at `wa_session`, so with just this cookie **every proxied route
+answers `401`**: that is how the user stays boxed in. When verification is required bff sets no
+`wa_session` at all and answers `303` to login's
+`verify-email.html?redirect_uri=<where they were going>` (placed next to the `next` page the form
+came from). Registration's auto-login takes the same path, so a new user lands on the code page
+and never in the app.
 
 **3. The page.** `verify-email.html` has one field, the code (no password: the cookie already
 proves who is signing in), and a "send a new code" button. It carries `redirect_uri` along. Opened
@@ -75,15 +76,16 @@ own origin; backend's allowlist must include whichever applies.
 - Otherwise bff sends `{verification_session, code}` to backend's
   `POST /oauth/email-verification/confirm`. Backend finds the user for the session (`401` if
   unknown/expired -> `session_expired`, cookie cleared) and checks the code. A wrong, expired
-  or used-up code is `400` -> `next?status=invalid`, and the session stays. Guessing is
-  limited three ways, all kept **per user** and surviving a code being used up (otherwise "5 wrong
-  guesses, resend, 5 more" would never be limited):
-  - a code survives **5 wrong attempts**; the fifth deletes it;
-  - a new code can't be issued within the resend cooldown of the last one, however the last one
-    ended (spent by wrong guesses, used, or expired);
-  - **10 wrong guesses in a row** across codes lock the user out for an hour: even the right code
-    fails and no new code is issued or mailed until the lock ends. A right code resets the count,
-    and so does a password reset.
+  code is `400` -> `next?status=invalid`, and the session stays; a code deleted by its fifth
+  wrong attempt is `400` with reason `CodeUsedUp` -> `next?status=code_used_up` ("ask for a new
+  one"). Guessing is limited per user (see [Guessing limits and the
+  lockout](#guessing-limits-and-the-lockout)). While the user is locked out, backend answers
+  `423` instead of `400`, with `{status: "locked", retry_after_secs}` or
+  `{status: "locked_until_reset"}` -> bff clears `wa_verify_session` and bounces to
+  `next?status=locked&retry_after=<secs>` or `next?status=locked_until_reset`. The page shows no
+  forms. For `locked` it offers a "Sign in" link (a lock outlasts the verification session); for
+  `locked_until_reset` signing in can't help, so it only says to reset the password (see Known
+  gaps).
 - A right code marks the email verified (`email_verified_by_code`), **deletes the verification
   session** and returns the `login_session` the login withheld. If the account is *already*
   verified, the code isn't checked and **no login session is given**: the session is deleted and
@@ -94,9 +96,30 @@ own origin; backend's allowlist must include whichever applies.
   the code once. A `redirect_uri` backend doesn't allowlist fails the login as usual (`400`).
 
 **5. Resend (`POST /verify-email/resend`, bff).** Form `{next}`, same cookie and checks ->
-backend's `POST /oauth/email-verification/request`, which answers `202` and sends only when the
-account is unverified and outside the cooldown (`email_verification_resend_cooldown_secs`,
-default 60). bff bounces to `next?status=sent` in every accepted case.
+backend's `POST /oauth/email-verification/request`, which sends only when the account is
+unverified, outside the cooldown (`email_verification_resend_cooldown_secs`, default 60) and not
+locked out, and says which happened:
+- sent: `202 {status: "sent", expires_in_secs}` -> bff bounces to
+  `next?status=sent&expires_in=<secs>` and the page says how long the code is valid;
+- inside the cooldown: `202 {status: "cooling_down", retry_after_secs}` -> bff bounces to
+  `next?status=cooling_down&retry_after=<secs>`;
+- locked out after wrong guesses: `202 {status: "locked", retry_after_secs}` -> bff bounces to
+  `next?status=locked&retry_after=<secs>` and clears `wa_verify_session` (the lock outlasts the
+  session, which is useless meanwhile). The page shows no forms, since even the right code is
+  rejected until the lock ends, only a "Sign in" link;
+- locked out five times: `202 {status: "locked_until_reset"}` -> bff clears the cookie and
+  bounces to `next?status=locked_until_reset`;
+- account already verified or session unknown: `401` -> `session_expired`;
+- no email handler configured: `503` -> bff answers `502`.
+
+The page tells the user how long to wait, in seconds under two minutes and in minutes (rounded
+up) from there: for `cooling_down` until "Send a new code" will work, for `locked` until signing
+in again will. A `cooling_down` wait under two minutes counts down on the page
+(`login/static/countdown.js`, loaded only for that status, the page's one script) and shows "You
+can ask for another one now" at zero. Without JavaScript the page shows the starting number as
+plain text. The server doesn't send the page again, so the count runs from when the page loaded
+(the browser's clock doesn't matter; the only drift is the time between backend working out the
+wait and the page loading, which the rounding up covers).
 
 **Other cases**
 - OIDC accounts are already verified and never see any of this.
@@ -105,19 +128,59 @@ default 60). bff bounces to `next?status=sent` in every accepted case.
 - The verification session expiring (or the cookie vanishing) is harmless: signing in again
   issues a new one.
 
+## Guessing limits and the lockout
+
+**What it protects.** A verified email is a claim of owning that inbox, and OIDC login matches
+accounts by verified email. Someone who registers with a victim's address knows the password
+(they chose it), so they can always get a verification session; the code is the only thing
+between them and a verified account they could later use against the victim's own OIDC login. A
+9-digit code is a 1-in-10^9 guess, so the limits below are about making online guessing hopeless,
+not merely slow.
+
+**The limits.** All live in `UserCodes` (`storage/in_memory.rs`), kept **per user** rather than
+per code, IP or session: a code being used up doesn't reset them, rotating IPs doesn't get round
+bff's per-IP rate limit, and signing in again for a fresh verification session doesn't help.
+
+- A code survives **5 wrong attempts**; the fifth deletes it (`code_used_up`).
+- A new code isn't issued within the **resend cooldown** of the last one (default 60s), however
+  the last one ended. Without it, "5 guesses, resend, 5 more" would run unchecked.
+- **10 wrong guesses in a row** (across codes) **lock the user out**:
+  - Even the right code is refused, without being compared. If it were accepted, the lock would
+    only slow guessing: the attacker could keep going until the right guess got in.
+  - No new code is issued or mailed, so the lock can't be used to flood the inbox either.
+  - Each lock starts a fresh count for the next one.
+
+**Escalation.** A lock is remembered for a day after it ends, and each lock that starts while
+the previous one is remembered lasts twice as long: 1h, 2h, 4h, 8h, 16h. The lock after the fifth
+lasts **until a password reset**. A day without a lock forgets the escalation; a right code resets
+both the count and the escalation.
+
+**How a lock ends.** It runs out, or a password reset clears all of the user's code state (the
+only way out of the last lock). The reset link goes to the inbox, so whoever squatted the address
+can't lift a lock that way. (Reset emails aren't delivered yet: see Known gaps.)
+
+**Who can trigger it.** Guessing needs a verification session, which needs the account's
+password, so nobody can lock a stranger out; at worst a squatter locks their own account. The
+reset clears a squatter's lock and failure count before the real owner takes over.
+
+**What it adds up to.** An attacker who paces themselves to never reach the reset lock gets about
+50 guesses per 55 hours (the five locks plus the day it takes to forget them), roughly 8,000 a
+year: under 1-in-100,000 odds of hitting one address's code in a year.
+
 ## Sending the code
 
 Backend's `send_verification_email`, called by `register` (always), by login (only when
 verification is required and the account has no live code) and by the resend endpoint.
 
 - No `email_handler` configured: nothing happens and no code is issued.
-- A code is issued for the user: 6 random digits, stored only as a sha256 over the user id and
+- A code is issued for the user: 9 random digits, stored only as a sha256 over the user id and
   the code, valid for `email_verification_code_ttl_secs` (default 900). A new code replaces the
   old one. A second code is **not** issued within `email_verification_resend_cooldown_secs` of the
   last one, so resend can't flood an inbox or keep replacing the code the user is typing.
 - The handler gets `{user_id, email, code, verify_page_url, expires_at}` (`expires_at` is RFC
   3339, UTC) and runs in a **background task**, so neither registration, login nor the resend
-  response waits for SMTP or the plugin, and response time can't show which requests send mail:
+  response waits for SMTP or the plugin. For registration and login, response time can't show
+  which requests send mail (the resend response says outright whether it sent):
   - `smtp` renders `templates/emails/verify-email.{subject.txt,txt,html}` and sends a multipart
     message. Templates load at startup; a missing one fails boot. `tls: none` is refused for a
     non-loopback host, because the code and any credentials would cross the network in the clear.
@@ -149,6 +212,10 @@ victim's own verification into a shared account. Confirming the password in
 - The `wa_verify_session` cookie must reach bff from the login page's form. It is cross-site
   capable on https; on plain http, login and bff have to be same-site (as in local dev).
 - There is no rate limit on backend's endpoints themselves, only on bff's per IP; the per-user
-  limits are the 5-attempt cap, the resend cooldown and the hour-long lockout after 10 wrong
+  limits are the 5-attempt cap, the resend cooldown and the escalating lockout after 10 wrong
   guesses (constants in `storage/in_memory.rs`, not configurable yet).
 - A completed password reset does not verify the address yet (see `TODO.md`).
+- Password reset has no email delivery yet ([password-reset](password-reset.md)), so a user in
+  the lock that lasts until a reset has no way out until it does, short of a backend restart (the
+  lock lives in memory). The hard-lock page tells them to reset their password; once reset emails
+  exist it should link to the reset page.
