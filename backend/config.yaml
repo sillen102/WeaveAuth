@@ -12,6 +12,9 @@ pkce_code_ttl_secs: 300
 # in this file.
 oidc_providers:
   google:
+    # How login pages name it; defaults to the key with its first letter
+    # capitalized ("Google").
+    # display_name: Google
     client_id: set-in-.env
     client_secret: set-in-.env
     issuer: https://accounts.google.com

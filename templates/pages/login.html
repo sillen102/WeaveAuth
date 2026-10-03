@@ -11,11 +11,21 @@
   {% if email %}
   <main class="card">
     <h1>Confirm it's you</h1>
-    <p>
-      An account already exists for <strong>{{ email }}</strong> but its email
-      isn't verified yet. Enter that account's password to link your Google
-      sign-in to it.
+    {% if not has_password and not linked_providers %}
+    <p id="no-link-option">
+      An account already exists for <strong>{{ email }}</strong>, but this sign-in can't be
+      linked to it here. Sign in to that account the way you usually do.
     </p>
+    {% else %}
+    <p>
+      An account already exists for <strong>{{ email }}</strong>.
+      {% if has_password and linked_providers %}Enter its password or continue with a sign-in you already use for it
+      {%- elif has_password %}Enter its password
+      {%- else %}Continue with a sign-in you already use for it
+      {%- endif %} to link {% if provider %}your {{ provider }} sign-in{% else %}this sign-in{% endif %} to it.
+    </p>
+    {% endif %}
+    {% if has_password %}
     <form id="confirm-link-form" method="post" action="{{ bff_url | safe }}/oidc/confirm-link">
       <div>
         <label for="password">Password</label>
@@ -25,15 +35,22 @@
       <input type="hidden" name="next" value="{{ own_url }}">
       <button class="btn" type="submit">Confirm and link account</button>
     </form>
+    {% endif %}
+    {% if has_password and linked_providers %}<div class="divider"><span>or</span></div>{% endif %}
+    {% for linked in linked_providers %}
+    <a class="btn" href="{{ bff_url | safe }}/oidc/{{ linked.key | urlencode | safe }}/login?redirect_uri={{ redirect_uri | urlencode | safe }}&next={{ own_url | urlencode | safe }}&confirm_link=true">
+      Continue with {{ linked.name }}
+    </a>
+    {% endfor %}
   </main>
   {% else %}
   <main class="card">
     <h1>WeaveAuth</h1>
     <p>Sign in with your account to continue.</p>
     {% if error == "consent_required" %}
-    <p class="error">This app needs a permission you didn't grant. Please try Sign in with Google again and allow all of the requested permissions.</p>
+    <p class="error">This app needs a permission you didn't grant. Please sign in again and allow all of the requested permissions.</p>
     {% elif error == "link_failed" %}
-    <p class="error">That didn't work -- please try Sign in with Google again.</p>
+    <p class="error">That didn't work -- please sign in again.</p>
     {% elif error %}
     <p class="error">Incorrect email or password.</p>
     {% else %}

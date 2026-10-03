@@ -4959,9 +4959,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "common",
  "figment",
  "percent-encoding",
+ "reqwest 0.13.5",
  "serde",
+ "serde_json",
  "tera",
  "tokio",
  "tower",

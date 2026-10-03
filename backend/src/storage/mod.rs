@@ -78,16 +78,19 @@ impl VerifiedEmail {
 
 #[derive(Debug)]
 pub(crate) enum OidcLinkOutcome {
-    /// Either a brand-new user, an already-linked identity, or a link into an
-    /// account whose email was *already* verified -- no further proof needed.
+    /// An already-linked identity, or a brand-new user created for it.
     Resolved(User),
-    /// An account with this email exists but isn't verified yet -- it could
-    /// belong to someone who merely typed this address into a registration
-    /// form with no proof of ownership (possibly an attacker squatting a
-    /// victim's address ahead of time). Linking this OIDC identity to it
-    /// requires the caller to first prove control of *that* account (its
-    /// password) via `UserStorage::link_verified_oidc_identity`.
-    RequiresPasswordConfirmation { existing_user_id: Uuid },
+    /// An account with this email exists but this identity isn't linked to
+    /// it. The provider only proves mailbox access, not that its user is the
+    /// account's owner (the account may have been registered by a squatter,
+    /// or the provider may vouch for an address it shouldn't), so linking
+    /// waits until the caller proves control of the account with one of
+    /// these: its password, or a sign-in through one of `linked_providers`.
+    RequiresLinkConfirmation {
+        existing_user_id: Uuid,
+        has_password: bool,
+        linked_providers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -107,34 +110,25 @@ pub(crate) trait UserStorage {
     async fn create_user(&mut self, user: User) -> CreateUserOutcome;
     async fn get_user_by_email(&self, email: &str) -> Option<User>;
     async fn get_user_by_id(&self, id: Uuid) -> Option<User>;
-    /// Resolves an OIDC login to a user, without ever silently merging into
-    /// an unverified account:
+    /// Resolves an OIDC login to a user, without ever silently linking a new
+    /// identity into an existing account:
     ///
     /// 1. If `(provider, subject)` is already linked to a user, returns it.
-    /// 2. Otherwise, if a user with `email` already exists and is
-    ///    `email_verified`, links `(provider, subject)` to that user and
-    ///    returns it -- this is what lets the same person sign in via Google
-    ///    today and LinkedIn tomorrow and land on one account.
-    /// 3. Otherwise, if a user with `email` exists but *isn't* verified,
-    ///    returns `RequiresPasswordConfirmation` instead of linking --
-    ///    nothing is mutated.
-    /// 4. Otherwise, creates a new, `email_verified: true` user with `email`
+    /// 2. Otherwise, if a user with `email` already exists, returns
+    ///    `RequiresLinkConfirmation` -- nothing is mutated.
+    /// 3. Otherwise, creates a new, `email_verified: true` user with `email`
     ///    and links `(provider, subject)` to it.
     ///
     /// The whole resolution happens under one lock acquisition, so two
     /// concurrent logins for the same new identity can't create two separate
     /// accounts.
     ///
-    /// `new_user_id` is the id case 4 gives the created user, chosen by the
+    /// `new_user_id` is the id case 3 gives the created user, chosen by the
     /// caller so it can tell a downstream service about the user before the
-    /// user exists. Unused for cases 1-3.
+    /// user exists. Unused for cases 1-2.
     ///
-    /// `email` is a [`VerifiedEmail`], not a bare string, specifically so
-    /// case 2 above -- merging into an *already-verified* account -- can't
-    /// be reached with an unconfirmed claim by accident: an attacker who can
-    /// produce any identity with a name-matching email would otherwise be
-    /// able to attach themselves to a victim's verified account. Constructing
-    /// a `VerifiedEmail` forces the call site to name its actual proof (see
+    /// `email` is a [`VerifiedEmail`], not a bare string, so case 3 can't
+    /// create an account for an address the provider never confirmed (see
     /// `VerifiedEmail::new`).
     async fn resolve_oidc_login(
         &mut self,
@@ -147,11 +141,10 @@ pub(crate) trait UserStorage {
     /// `None` if `user_id` no longer exists.
     ///
     /// CALLER MUST have already independently proven the OIDC-authenticated
-    /// person controls this specific account -- e.g. by checking its
-    /// password -- before calling this for a `user_id` that came out of
-    /// `OidcLinkOutcome::RequiresPasswordConfirmation`. This is the only
-    /// path that turns an *unverified* account's email into a verified one,
-    /// so skipping that proof is exactly the account-takeover vector
+    /// person controls this specific account -- its password, or a sign-in
+    /// through an identity already linked to it -- before calling this for a
+    /// `user_id` that came out of `OidcLinkOutcome::RequiresLinkConfirmation`.
+    /// Skipping that proof is exactly the account-takeover vector
     /// `resolve_oidc_login` refuses to do on its own.
     async fn link_verified_oidc_identity(
         &mut self,
@@ -167,10 +160,11 @@ pub(crate) trait UserStorage {
         user_id: Uuid,
         password_hash: PasswordHash,
     ) -> SetPasswordOutcome;
-    /// Sets `email_verified` (and `email_verified_by_code`) on `user_id`.
-    /// CALLER MUST have proven control of the address by checking an
-    /// `EmailVerificationCodeStorage` code.
-    async fn mark_email_verified_by_code(&mut self, user_id: Uuid) -> MarkVerifiedOutcome;
+    /// Sets `email_verified` on `user_id`. CALLER MUST have proven control of
+    /// the address by checking an `EmailVerificationCodeStorage` code.
+    async fn mark_email_verified(&mut self, user_id: Uuid) -> MarkVerifiedOutcome;
+    /// The user `(provider, subject)` is linked to.
+    async fn oidc_identity_owner(&self, provider: &str, subject: &str) -> Option<Uuid>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -300,7 +294,7 @@ pub(crate) trait OidcStateStorage {
 }
 
 /// The provider identity waiting to be linked, and which existing
-/// (unverified) account it's asking to link to -- see `PendingOidcLinkStorage`.
+/// account it's asking to link to -- see `PendingOidcLinkStorage`.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingOidcLink {
     pub(crate) provider: String,
@@ -308,12 +302,13 @@ pub(crate) struct PendingOidcLink {
     pub(crate) existing_user_id: Uuid,
 }
 
-/// A short-lived, single-use record of an OIDC identity waiting on password
+/// A short-lived, single-use record of an OIDC identity waiting on link
 /// confirmation (see `UserStorage::resolve_oidc_login`'s
-/// `RequiresPasswordConfirmation` case): the provider identity that was just
-/// authenticated, and which existing (unverified) account it's asking to
-/// link to. `/oauth/oidc/confirm-link` consumes it once the caller has
-/// supplied that account's correct password.
+/// `RequiresLinkConfirmation` case): the provider identity that was just
+/// authenticated, and which existing account it's asking to link to.
+/// Consumed by `/oauth/oidc/confirm-link` (the account's password) or by
+/// `/oauth/oidc/callback` (a sign-in through an identity already linked to
+/// that account).
 pub(crate) trait PendingOidcLinkStorage {
     async fn save_pending_link(
         &mut self,

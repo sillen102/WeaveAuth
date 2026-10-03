@@ -1,5 +1,6 @@
 pub(crate) use controller::oidc_callback;
 pub(crate) use controller::oidc_confirm_link;
+pub(crate) use controller::oidc_providers;
 pub(crate) use controller::start_oidc_login;
 
 mod controller {
@@ -18,9 +19,10 @@ mod controller {
     };
     use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
 
-    use super::service::{self, ConfirmLinkOutcome, OidcCallbackOutcome};
+    use super::service::{self, CallbackPurpose, ConfirmLinkOutcome, OidcCallbackOutcome};
     use super::service::{
         OidcCallbackServiceError, OidcConfirmLinkServiceError, OidcLoginServiceError,
+        OidcProvidersServiceError,
     };
 
     #[derive(Deserialize)]
@@ -31,6 +33,12 @@ mod controller {
         /// checked with `is_safe_redirect_target` before use -- see
         /// `OidcLoginError::InvalidNext`.
         pub(super) next: String,
+        /// Set by the login page's "Continue with" links: this sign-in confirms
+        /// the pending link in `pending_link_cookie`. Without it a
+        /// leftover pending link is dropped, so a later ordinary sign-in in
+        /// the same browser can't confirm a link nobody meant to.
+        #[serde(default)]
+        pub(super) confirm_link: bool,
     }
 
     #[derive(Deserialize)]
@@ -51,6 +59,17 @@ mod controller {
         /// Where to bounce the browser back to if confirmation fails. Checked
         /// with `is_safe_redirect_target` -- see `OidcConfirmLinkError::InvalidNext`.
         pub(super) next: String,
+    }
+
+    #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
+    #[error_response_no_openapi]
+    pub(crate) enum OidcProvidersError {
+        #[error("backend returned an unexpected response")]
+        #[error_response(
+            StatusCode::BAD_GATEWAY,
+            details = "backend returned an unexpected response"
+        )]
+        BackendUnavailable,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -116,6 +135,13 @@ mod controller {
         InvalidNext,
     }
 
+    impl From<OidcProvidersServiceError> for OidcProvidersError {
+        fn from(err: OidcProvidersServiceError) -> Self {
+            tracing::warn!(%err, "oidc providers lookup failed");
+            OidcProvidersError::BackendUnavailable
+        }
+    }
+
     impl From<OidcLoginServiceError> for OidcLoginError {
         fn from(err: OidcLoginServiceError) -> Self {
             if let OidcLoginServiceError::BackendUnavailable(_) = &err {
@@ -149,17 +175,41 @@ mod controller {
     const REDIRECT_URI_COOKIE: &str = "wa_oidc_redirect_uri";
     const NEXT_COOKIE: &str = "wa_oidc_next";
     const STATE_COOKIE: &str = "wa_oidc_state";
-    /// Carries `pending_link_token` from `oidc_callback` to `oidc_confirm_link`
-    /// instead of the URL -- it's half a credential (paired with the account
-    /// password), and a URL leaks into browser history, Referer headers, and
-    /// access logs in a way a short-lived HttpOnly cookie doesn't.
+    /// Name and path of the cookie that carries `pending_link_token` from
+    /// `oidc_callback` to whatever confirms
+    /// the link: `oidc_confirm_link` (paired with the account password) or a
+    /// later `oidc_callback` started with `confirm_link` (paired with a sign-in
+    /// through a provider already linked to the account). It's half a
+    /// credential, so it stays out of the URL, which leaks into browser
+    /// history, Referer headers, and access logs in a way a short-lived
+    /// HttpOnly cookie doesn't.
     ///
     /// `oidc_confirm_link` is reached by the login page's own form POSTing
     /// to this service, which is cross-site whenever login and bff aren't
     /// deployed same-site -- so this is the one flow cookie built with
     /// `build_cross_site_cookie` (`SameSite=None`) instead of `build_cookie`
     /// (`SameSite=Lax`), which browsers withhold from a cross-site POST.
-    const PENDING_LINK_TOKEN_COOKIE: &str = "wa_oidc_pending_link_token";
+    ///
+    /// Over HTTPS it's named `__Host-...`, which browsers only accept from
+    /// this host with `Secure` and `Path=/`, so a sibling subdomain can't
+    /// plant one; the prefix can't be used without `Secure` (plain-http dev),
+    /// where it keeps the plain name scoped to `FLOW_COOKIE_PATH`.
+    fn pending_link_cookie(secure: bool) -> (&'static str, &'static str) {
+        if secure {
+            ("__Host-wa_oidc_pending_link_token", "/")
+        } else {
+            ("wa_oidc_pending_link_token", FLOW_COOKIE_PATH)
+        }
+    }
+
+    /// Backend's `/oauth/oidc/providers`, relayed as-is: the configured
+    /// providers and their display names, for a login page to offer.
+    pub(crate) async fn oidc_providers(
+        State(state): State<AppState>,
+    ) -> Result<Response, OidcProvidersError> {
+        let body = service::fetch_oidc_providers(&state).await?;
+        Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+    }
 
     /// Starts a third-party OIDC login. `redirect_uri`/`next` are stashed in
     /// short-lived cookies scoped to `/oidc` so `oidc_callback` -- reached via
@@ -206,11 +256,15 @@ mod controller {
                     OidcLoginError::BackendUnavailable
                 })
         };
-        let cookies = [
+        let mut cookies = vec![
             cookie_header(&redirect_uri_cookie)?,
             cookie_header(&next_cookie)?,
             cookie_header(&state_cookie)?,
         ];
+        if !req.confirm_link {
+            let (name, path) = pending_link_cookie(secure);
+            cookies.push(cookie_header(&clear_cookie(name, path, secure))?);
+        }
 
         Ok((
             StatusCode::SEE_OTHER,
@@ -228,6 +282,11 @@ mod controller {
     /// the way bounces to `next` with `?error=1`, same as a failed password
     /// login -- except a missing/expired flow cookie, which has no known-safe
     /// destination to bounce to.
+    ///
+    /// A `pending_link_cookie` still present (only when the flow was
+    /// started with `confirm_link`) is forwarded to backend, making this
+    /// sign-in the confirmation of that pending link; it's cleared on every
+    /// path but a new link-confirmation prompt, which replaces it.
     pub(crate) async fn oidc_callback(
         State(mut state): State<AppState>,
         ApiPath(provider): ApiPath<String>,
@@ -235,6 +294,7 @@ mod controller {
         headers: HeaderMap,
     ) -> Result<Response, OidcCallbackError> {
         let secure = state.config.secure_cookies();
+        let (pending_link_cookie_name, pending_link_cookie_path) = pending_link_cookie(secure);
         let clear_flow_cookies = [
             (
                 header::SET_COOKIE,
@@ -247,6 +307,10 @@ mod controller {
             (
                 header::SET_COOKIE,
                 clear_cookie(STATE_COOKIE, FLOW_COOKIE_PATH, secure),
+            ),
+            (
+                header::SET_COOKIE,
+                clear_cookie(pending_link_cookie_name, pending_link_cookie_path, secure),
             ),
         ];
 
@@ -296,38 +360,65 @@ mod controller {
             return Ok(with_cleared_cookies(OidcCallbackError::StateMismatch));
         }
 
-        match service::complete_oidc_callback(&mut state, &provider, code, req_state, &redirect_uri)
-            .await
+        let purpose = match extract_cookie(&headers, pending_link_cookie_name) {
+            Some(pending_link_token) => CallbackPurpose::ConfirmLink { pending_link_token },
+            None => CallbackPurpose::SignIn,
+        };
+        match service::complete_oidc_callback(
+            &mut state,
+            &provider,
+            code,
+            req_state,
+            &purpose,
+            &redirect_uri,
+        )
+        .await
         {
             Err(OidcCallbackServiceError::ConsentRequired) => {
                 tracing::info!("oidc callback refused: required permission not granted");
                 Ok(error_redirect_with(&next, "consent_required"))
             }
+            Err(OidcCallbackServiceError::LinkNotConfirmed) => {
+                tracing::info!("oidc sign-in did not confirm the pending link");
+                Ok(error_redirect_with(&next, "link_failed"))
+            }
             Err(error) => {
                 tracing::warn!(%error, "oidc callback failed");
                 Ok(error_redirect(&next))
             }
-            Ok(OidcCallbackOutcome::PasswordConfirmationRequired {
+            Ok(OidcCallbackOutcome::LinkConfirmationRequired {
                 pending_link_token,
                 email,
+                has_password,
+                linked_providers,
             }) => {
-                // `email` (not sensitive, and also what the login page gates
-                // the confirm-link form on) goes on the URL, but
-                // `pending_link_token` (half a credential) goes in a
-                // short-lived cookie instead -- see PENDING_LINK_TOKEN_COOKIE.
+                // What the login page renders the confirm-link choices from
+                // (not sensitive) goes on the URL, but `pending_link_token`
+                // (half a credential) goes in a short-lived cookie instead --
+                // see pending_link_cookie.
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query.append_pair("email", &email);
+                query.append_pair("provider", &provider);
+                query.append_pair("has_password", &has_password.to_string());
+                if !linked_providers.is_empty() {
+                    query.append_pair("linked_providers", &linked_providers.join(","));
+                }
                 let sep = if next.contains('?') { '&' } else { '?' };
-                let location = format!(
-                    "{next}{sep}email={}",
-                    url::form_urlencoded::byte_serialize(email.as_bytes()).collect::<String>(),
-                );
+                let location = format!("{next}{sep}{}", query.finish());
                 let pending_link_cookie = build_cross_site_cookie(
-                    PENDING_LINK_TOKEN_COOKIE,
+                    pending_link_cookie_name,
                     &pending_link_token,
-                    FLOW_COOKIE_PATH,
+                    pending_link_cookie_path,
                     FLOW_COOKIE_TTL_SECS,
                     secure,
                 );
-                let mut set_cookies = clear_flow_cookies.to_vec();
+                // Every flow cookie but the pending link, which is replaced instead.
+                let pending_link_prefix = format!("{pending_link_cookie_name}=");
+                let mut set_cookies: Vec<_> = clear_flow_cookies
+                    .iter()
+                    .filter(|(_, cookie)| !cookie.starts_with(&pending_link_prefix))
+                    .cloned()
+                    .collect();
                 set_cookies.push((header::SET_COOKIE, pending_link_cookie));
                 Ok((
                     StatusCode::SEE_OTHER,
@@ -351,9 +442,9 @@ mod controller {
         }
     }
 
-    /// Finishes an OIDC login that `oidc_callback` flagged as needing
-    /// password confirmation, once the caller has resupplied the existing
-    /// account's password. Mirrors `start_login` (trusted-origin check,
+    /// Finishes an OIDC login that `oidc_callback` flagged as needing link
+    /// confirmation, once the caller has supplied the existing account's
+    /// password. Mirrors `start_login` (trusted-origin check,
     /// session cookie, redirect to `redirect_uri`).
     pub(crate) async fn oidc_confirm_link(
         State(mut state): State<AppState>,
@@ -370,13 +461,11 @@ mod controller {
 
         // Single-use regardless of outcome, so it's cleared on every path
         // below rather than only on success.
+        let secure = state.config.secure_cookies();
+        let (pending_link_cookie_name, pending_link_cookie_path) = pending_link_cookie(secure);
         let clear_pending_link_cookie = (
             header::SET_COOKIE,
-            clear_cookie(
-                PENDING_LINK_TOKEN_COOKIE,
-                FLOW_COOKIE_PATH,
-                state.config.secure_cookies(),
-            ),
+            clear_cookie(pending_link_cookie_name, pending_link_cookie_path, secure),
         );
 
         // `req.next` is already validated above, so both a missing/expired
@@ -396,7 +485,7 @@ mod controller {
                 .into_response()
         };
 
-        let Some(pending_link_token) = extract_cookie(&headers, PENDING_LINK_TOKEN_COOKIE) else {
+        let Some(pending_link_token) = extract_cookie(&headers, pending_link_cookie_name) else {
             return Ok(link_failed_redirect());
         };
 
@@ -441,12 +530,22 @@ mod service {
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
+    pub(crate) enum OidcProvidersServiceError {
+        #[error("backend returned an unexpected response: {0}")]
+        BackendUnavailable(String),
+    }
+
+    #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum OidcCallbackServiceError {
         #[error("unknown oidc provider or exchange failed: {0}")]
         ExchangeFailed(String),
         /// The user declined a permission this deployment requires (backend `403`).
         #[error("a required permission was not granted at the oidc provider")]
         ConsentRequired,
+        /// The sign-in meant to confirm a pending link isn't linked to that
+        /// account, or the pending link is gone (backend `409`).
+        #[error("the sign-in did not confirm the pending oidc link")]
+        LinkNotConfirmed,
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -483,9 +582,11 @@ mod service {
         Authenticated {
             login_session: String,
         },
-        PasswordConfirmationRequired {
+        LinkConfirmationRequired {
             pending_link_token: String,
             email: String,
+            has_password: bool,
+            linked_providers: Vec<String>,
         },
     }
 
@@ -498,6 +599,34 @@ mod service {
     #[derive(Deserialize)]
     struct LoginSessionResponse {
         login_session: String,
+    }
+
+    pub(crate) async fn fetch_oidc_providers(
+        state: &AppState,
+    ) -> Result<axum::body::Bytes, OidcProvidersServiceError> {
+        let resp = state
+            .http_client
+            .get(format!("{}/oauth/oidc/providers", state.config.backend_url))
+            .send()
+            .await
+            .map_err(|error| {
+                OidcProvidersServiceError::BackendUnavailable(format!(
+                    "providers request failed: {}",
+                    common::error::cause_chain(&error.without_url())
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(OidcProvidersServiceError::BackendUnavailable(format!(
+                "providers returned {}",
+                resp.status()
+            )));
+        }
+        resp.bytes().await.map_err(|error| {
+            OidcProvidersServiceError::BackendUnavailable(format!(
+                "providers response unreadable: {}",
+                common::error::cause_chain(&error.without_url())
+            ))
+        })
     }
 
     pub(crate) struct StartedOidcLogin {
@@ -565,15 +694,26 @@ mod service {
         })
     }
 
+    /// What a callback sign-in is for.
+    pub(crate) enum CallbackPurpose {
+        SignIn,
+        /// Confirms the pending link the browser carries a cookie for.
+        ConfirmLink {
+            pending_link_token: String,
+        },
+    }
+
     pub(crate) enum OidcCallbackOutcome {
         Authenticated {
             cookie: String,
         },
-        /// Not a failure -- the login page renders a "confirm your password
-        /// to link this account" form for this case.
-        PasswordConfirmationRequired {
+        /// Not a failure -- the login page lets the user confirm the link with
+        /// the account's password (if it has one) or one of its linked providers.
+        LinkConfirmationRequired {
             pending_link_token: String,
             email: String,
+            has_password: bool,
+            linked_providers: Vec<String>,
         },
     }
 
@@ -585,38 +725,52 @@ mod service {
         provider: &str,
         code: &str,
         req_state: &str,
+        purpose: &CallbackPurpose,
         redirect_uri: &str,
     ) -> Result<OidcCallbackOutcome, OidcCallbackServiceError> {
-        let callback_response = fetch_callback_response(state, provider, code, req_state).await?;
+        let callback_response =
+            fetch_callback_response(state, provider, code, req_state, purpose).await?;
 
         match callback_response {
             OidcCallbackResponse::Authenticated { login_session } => {
                 let cookie = complete_login(state, &login_session, redirect_uri).await?;
                 Ok(OidcCallbackOutcome::Authenticated { cookie })
             }
-            OidcCallbackResponse::PasswordConfirmationRequired {
+            OidcCallbackResponse::LinkConfirmationRequired {
                 pending_link_token,
                 email,
-            } => Ok(OidcCallbackOutcome::PasswordConfirmationRequired {
+                has_password,
+                linked_providers,
+            } => Ok(OidcCallbackOutcome::LinkConfirmationRequired {
                 pending_link_token,
                 email,
+                has_password,
+                linked_providers,
             }),
         }
     }
 
     /// Hands `code`/`state` to backend and parses its response. Every
     /// failure (network, non-2xx, bad body) is `ExchangeFailed` except a
-    /// `403`, which backend uses for a declined permission.
+    /// `403` (declined permission) and a `409` (pending link not confirmed).
     async fn fetch_callback_response(
         state: &AppState,
         provider: &str,
         code: &str,
         req_state: &str,
+        purpose: &CallbackPurpose,
     ) -> Result<OidcCallbackResponse, OidcCallbackServiceError> {
+        let mut query = vec![("provider", provider), ("code", code), ("state", req_state)];
+        match purpose {
+            CallbackPurpose::ConfirmLink { pending_link_token } => {
+                query.push(("pending_link_token", pending_link_token));
+            }
+            CallbackPurpose::SignIn => {}
+        }
         let resp = state
             .http_client
             .get(format!("{}/oauth/oidc/callback", state.config.backend_url))
-            .query(&[("provider", provider), ("code", code), ("state", req_state)])
+            .query(&query)
             .send()
             .await
             .map_err(|error| {
@@ -627,6 +781,9 @@ mod service {
             })?;
         if resp.status() == StatusCode::FORBIDDEN {
             return Err(OidcCallbackServiceError::ConsentRequired);
+        }
+        if resp.status() == StatusCode::CONFLICT {
+            return Err(OidcCallbackServiceError::LinkNotConfirmed);
         }
         if !resp.status().is_success() {
             return Err(OidcCallbackServiceError::ExchangeFailed(format!(
@@ -652,8 +809,8 @@ mod service {
     }
 
     /// Finishes an OIDC login that `complete_oidc_callback` flagged as
-    /// needing password confirmation, once the caller has resupplied the
-    /// existing account's password. Forwards to backend's
+    /// needing link confirmation, once the caller has supplied the existing
+    /// account's password. Forwards to backend's
     /// `/oauth/oidc/confirm-link`, then completes the login exactly like a
     /// password login would.
     pub(crate) async fn confirm_oidc_link(

@@ -17,17 +17,35 @@ fn login_public_url(configured: Option<OsString>) -> OsString {
     configured.unwrap_or_else(|| "http://localhost:8081".into())
 }
 
+/// Where login reaches bff server-side. bff runs in this same container, so
+/// unless the deployer says otherwise that's loopback on bff's own port,
+/// never the public `WA_BFF_URL`, which may not route back in from here.
+fn bff_internal_url(configured: Option<OsString>, bff_port: Option<OsString>) -> OsString {
+    configured.filter(|url| !url.is_empty()).unwrap_or_else(|| {
+        let port = bff_port.unwrap_or_else(|| "8080".into());
+        let mut url = OsString::from("http://127.0.0.1:");
+        url.push(port);
+        url
+    })
+}
+
 // ponytail: no SIGTERM forwarding, so `docker stop` waits out its grace
 // period before SIGKILL; run with `docker run --init` if that matters.
 fn main() -> ExitCode {
     let url = login_public_url(std::env::var_os("WA_LOGIN_PUBLIC_URL"));
+    let bff_url = bff_internal_url(
+        std::env::var_os("WA_BFF_INTERNAL_URL"),
+        std::env::var_os("WA_BFF_PORT"),
+    );
 
     let mut children: Vec<(&str, Child)> = Vec::new();
     for service in SERVICES {
-        match Command::new(service)
-            .env("WA_LOGIN_PUBLIC_URL", &url)
-            .spawn()
-        {
+        let mut command = Command::new(service);
+        command.env("WA_LOGIN_PUBLIC_URL", &url);
+        if service == "weaveauth-login" {
+            command.env("WA_BFF_INTERNAL_URL", &bff_url);
+        }
+        match command.spawn() {
             Ok(child) => children.push((service, child)),
             Err(error) => {
                 eprintln!("launcher: could not start {service}: {error}");
@@ -70,6 +88,31 @@ mod tests {
         assert_eq!(
             login_public_url(None),
             OsString::from("http://localhost:8081")
+        );
+    }
+
+    #[test]
+    fn points_login_at_the_local_bff_when_no_internal_url_is_set() {
+        assert_eq!(
+            bff_internal_url(None, None),
+            OsString::from("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            bff_internal_url(None, Some("9090".into())),
+            OsString::from("http://127.0.0.1:9090")
+        );
+        // Empty counts as unset, as it does in login itself.
+        assert_eq!(
+            bff_internal_url(Some("".into()), None),
+            OsString::from("http://127.0.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn keeps_a_configured_bff_internal_url() {
+        assert_eq!(
+            bff_internal_url(Some("http://bff.internal".into()), Some("9090".into())),
+            OsString::from("http://bff.internal")
         );
     }
 

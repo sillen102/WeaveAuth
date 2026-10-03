@@ -6,9 +6,10 @@ use crate::server::api::{
     email_verification::request_email_verification_doc, health::health, jwks::jwks, jwks::jwks_doc,
     login::login, login::login_doc, oidc::oidc_callback, oidc::oidc_callback_doc,
     oidc::oidc_confirm_link, oidc::oidc_confirm_link_doc, oidc::oidc_login, oidc::oidc_login_doc,
-    password_reset::confirm_password_reset, password_reset::confirm_password_reset_doc,
-    password_reset::request_password_reset, password_reset::request_password_reset_doc,
-    register::register, register::register_doc, token::issue_token, token::issue_token_doc,
+    oidc::oidc_providers, oidc::oidc_providers_doc, password_reset::confirm_password_reset,
+    password_reset::confirm_password_reset_doc, password_reset::request_password_reset,
+    password_reset::request_password_reset_doc, register::register, register::register_doc,
+    token::issue_token, token::issue_token_doc,
 };
 use aide::axum::ApiRouter;
 use aide::axum::routing::{get_with, post_with};
@@ -37,6 +38,10 @@ fn oauth_routes() -> ApiRouter<AppState> {
         .api_route("/register", post_with(register, register_doc))
         .api_route("/.well-known/jwks.json", get_with(jwks, jwks_doc))
         .api_route("/oauth/oidc/login", get_with(oidc_login, oidc_login_doc))
+        .api_route(
+            "/oauth/oidc/providers",
+            get_with(oidc_providers, oidc_providers_doc),
+        )
         .api_route(
             "/oauth/oidc/callback",
             get_with(oidc_callback, oidc_callback_doc),

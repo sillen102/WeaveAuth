@@ -94,6 +94,7 @@ mod tests {
                 client_id: "client-id".to_string(),
                 client_secret: SecretString::from("client-secret".to_string()),
                 redirect_uri: "http://localhost/callback".to_string(),
+                display_name: None,
                 extra_claims: HashMap::new(),
                 scopes: vec!["email".to_string()],
                 profile_apis: Vec::new(),

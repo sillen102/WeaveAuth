@@ -173,33 +173,34 @@ impl UserStorage for InMemoryUserStorage {
             }
         }
 
-        let existing = inner.users.values().find(|u| u.email == email).cloned();
-        let user = match existing {
-            // An address verified only by an emailed code isn't vouched for by
-            // the provider: whoever registered it chose the password, and may
-            // not be the mailbox's owner who just signed in with the provider.
-            Some(existing) if !existing.email_verified || existing.email_verified_by_code => {
-                return OidcLinkOutcome::RequiresPasswordConfirmation {
-                    existing_user_id: existing.id,
-                };
-            }
-            Some(existing) => existing,
-            None => {
-                let now = Utc::now();
-                let user = User {
-                    id: new_user_id,
-                    email: email.to_string(),
-                    password: None,
-                    email_verified: true,
-                    email_verified_by_code: false,
-                    created_at: now,
-                    updated_at: now,
-                };
-                inner.users.insert(user.id, user.clone());
-                user
-            }
-        };
+        if let Some(existing) = inner.users.values().find(|u| u.email == email) {
+            let existing_user_id = existing.id;
+            let has_password = existing.password.is_some();
+            let mut linked_providers: Vec<String> = inner
+                .oidc_identities
+                .iter()
+                .filter(|(_, user_id)| **user_id == existing_user_id)
+                .map(|((provider, _), _)| provider.clone())
+                .collect();
+            linked_providers.sort();
+            linked_providers.dedup();
+            return OidcLinkOutcome::RequiresLinkConfirmation {
+                existing_user_id,
+                has_password,
+                linked_providers,
+            };
+        }
 
+        let now = Utc::now();
+        let user = User {
+            id: new_user_id,
+            email: email.to_string(),
+            password: None,
+            email_verified: true,
+            created_at: now,
+            updated_at: now,
+        };
+        inner.users.insert(user.id, user.clone());
         inner.oidc_identities.insert(identity_key, user.id);
         OidcLinkOutcome::Resolved(user)
     }
@@ -214,7 +215,6 @@ impl UserStorage for InMemoryUserStorage {
 
         let user = inner.users.get_mut(&user_id)?;
         user.email_verified = true;
-        user.email_verified_by_code = false;
         let user = user.clone();
 
         inner
@@ -237,17 +237,25 @@ impl UserStorage for InMemoryUserStorage {
         SetPasswordOutcome::Ok
     }
 
-    async fn mark_email_verified_by_code(&mut self, user_id: Uuid) -> MarkVerifiedOutcome {
+    async fn mark_email_verified(&mut self, user_id: Uuid) -> MarkVerifiedOutcome {
         let mut inner = self.inner.lock().await;
         let Some(user) = inner.users.get_mut(&user_id) else {
             return MarkVerifiedOutcome::UserNotFound;
         };
         if !user.email_verified {
             user.email_verified = true;
-            user.email_verified_by_code = true;
             user.updated_at = Utc::now();
         }
         MarkVerifiedOutcome::Ok
+    }
+
+    async fn oidc_identity_owner(&self, provider: &str, subject: &str) -> Option<Uuid> {
+        self.inner
+            .lock()
+            .await
+            .oidc_identities
+            .get(&(provider.to_string(), subject.to_string()))
+            .copied()
     }
 }
 
@@ -1283,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_oidc_login_links_directly_into_an_already_verified_account() {
+    async fn resolve_oidc_login_asks_a_verified_password_account_to_confirm_the_link() {
         let mut storage = InMemoryUserStorage::new();
         let local_user = User {
             email: "alice@example.com".to_string(),
@@ -1302,16 +1310,22 @@ mod tests {
             )
             .await;
 
-        let OidcLinkOutcome::Resolved(oidc_user) = outcome else {
-            unreachable!("expected Resolved, got {outcome:?}");
+        let OidcLinkOutcome::RequiresLinkConfirmation {
+            existing_user_id,
+            has_password,
+            linked_providers,
+        } = outcome
+        else {
+            unreachable!("expected RequiresLinkConfirmation, got {outcome:?}");
         };
-        assert_eq!(oidc_user.id, local_user.id);
-        // The password is untouched -- the user can still log in with it too.
-        assert_eq!(oidc_user.password.unwrap().expose(), ("argon2", "hash"));
+        assert_eq!(existing_user_id, local_user.id);
+        assert!(has_password);
+        assert!(linked_providers.is_empty());
+        assert_eq!(storage.oidc_identity_owner("google", "sub-123").await, None);
     }
 
     #[tokio::test]
-    async fn resolve_oidc_login_links_a_second_provider_to_the_same_account() {
+    async fn resolve_oidc_login_asks_a_second_provider_to_confirm_and_lists_the_linked_ones() {
         let mut storage = InMemoryUserStorage::new();
         let OidcLinkOutcome::Resolved(google_user) = storage
             .resolve_oidc_login(
@@ -1325,22 +1339,32 @@ mod tests {
             unreachable!("expected Resolved");
         };
 
-        let OidcLinkOutcome::Resolved(linkedin_user) = storage
+        let outcome = storage
             .resolve_oidc_login(
                 "linkedin",
                 "linkedin-sub",
                 &verified("alice@example.com"),
                 Uuid::new_v4(),
             )
-            .await
+            .await;
+
+        let OidcLinkOutcome::RequiresLinkConfirmation {
+            existing_user_id,
+            has_password,
+            linked_providers,
+        } = outcome
         else {
-            unreachable!("expected Resolved");
+            unreachable!("expected RequiresLinkConfirmation, got {outcome:?}");
         };
+        assert_eq!(existing_user_id, google_user.id);
+        assert!(!has_password);
+        assert_eq!(linked_providers, vec!["google".to_string()]);
+    }
 
-        assert_eq!(google_user.id, linkedin_user.id);
-
-        // Both identities now resolve to the same account.
-        let OidcLinkOutcome::Resolved(via_google) = storage
+    #[tokio::test]
+    async fn oidc_identity_owner_finds_only_linked_identities() {
+        let mut storage = InMemoryUserStorage::new();
+        let OidcLinkOutcome::Resolved(user) = storage
             .resolve_oidc_login(
                 "google",
                 "google-sub",
@@ -1351,7 +1375,19 @@ mod tests {
         else {
             unreachable!("expected Resolved");
         };
-        assert_eq!(via_google.id, google_user.id);
+
+        assert_eq!(
+            storage.oidc_identity_owner("google", "google-sub").await,
+            Some(user.id)
+        );
+        assert_eq!(
+            storage.oidc_identity_owner("google", "other-sub").await,
+            None
+        );
+        assert_eq!(
+            storage.oidc_identity_owner("linkedin", "google-sub").await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1378,10 +1414,17 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            outcome,
-            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } if existing_user_id == squatter.id
-        ));
+        let OidcLinkOutcome::RequiresLinkConfirmation {
+            existing_user_id,
+            has_password,
+            linked_providers,
+        } = outcome
+        else {
+            unreachable!("expected RequiresLinkConfirmation, got {outcome:?}");
+        };
+        assert_eq!(existing_user_id, squatter.id);
+        assert!(has_password);
+        assert!(linked_providers.is_empty());
         // Nothing was mutated -- still unverified, no identity linked yet.
         let still_unverified = storage
             .get_user_by_email("alice@example.com")
@@ -1436,98 +1479,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_email_verified_by_code_sets_both_flags() {
+    async fn mark_email_verified_sets_the_flag() {
         let mut storage = InMemoryUserStorage::new();
         let user = User::default();
         let user_id = user.id;
         let _ = storage.create_user(user).await;
 
         assert_eq!(
-            storage.mark_email_verified_by_code(user_id).await,
+            storage.mark_email_verified(user_id).await,
             MarkVerifiedOutcome::Ok
         );
 
         let user = storage.get_user_by_id(user_id).await.unwrap();
         assert!(user.email_verified);
-        assert!(user.email_verified_by_code);
     }
 
     #[tokio::test]
-    async fn mark_email_verified_by_code_reports_an_unknown_user() {
+    async fn mark_email_verified_reports_an_unknown_user() {
         let mut storage = InMemoryUserStorage::new();
 
         assert_eq!(
-            storage.mark_email_verified_by_code(Uuid::new_v4()).await,
+            storage.mark_email_verified(Uuid::new_v4()).await,
             MarkVerifiedOutcome::UserNotFound
         );
-    }
-
-    #[tokio::test]
-    async fn mark_email_verified_by_code_does_not_downgrade_a_provider_verified_account() {
-        let mut storage = InMemoryUserStorage::new();
-        let user = User {
-            email_verified: true,
-            ..User::default()
-        };
-        let user_id = user.id;
-        let _ = storage.create_user(user).await;
-
-        let _ = storage.mark_email_verified_by_code(user_id).await;
-
-        assert!(
-            !storage
-                .get_user_by_id(user_id)
-                .await
-                .unwrap()
-                .email_verified_by_code
-        );
-    }
-
-    // The account-takeover guard: an attacker registers the victim's address
-    // with their own password; if the victim later confirms the emailed code,
-    // a Google sign-in must still ask for the account's password.
-    #[tokio::test]
-    async fn oidc_login_into_a_code_verified_password_account_still_requires_the_password() {
-        let mut storage = InMemoryUserStorage::new();
-        let squatter = User {
-            email: "victim@example.com".to_string(),
-            password: Some(PasswordHash::Argon2("attackers-hash".into())),
-            ..User::default()
-        };
-        let squatter_id = squatter.id;
-        let _ = storage.create_user(squatter).await;
-        let _ = storage.mark_email_verified_by_code(squatter_id).await;
-
-        let outcome = storage
-            .resolve_oidc_login(
-                "google",
-                "victims-sub",
-                &verified("victim@example.com"),
-                Uuid::new_v4(),
-            )
-            .await;
-
-        assert!(matches!(
-            outcome,
-            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } if existing_user_id == squatter_id
-        ));
-    }
-
-    #[tokio::test]
-    async fn confirming_the_password_for_an_oidc_link_clears_the_code_verified_flag() {
-        let mut storage = InMemoryUserStorage::new();
-        let user = User::default();
-        let user_id = user.id;
-        let _ = storage.create_user(user).await;
-        let _ = storage.mark_email_verified_by_code(user_id).await;
-
-        let linked = storage
-            .link_verified_oidc_identity(user_id, "google", "sub")
-            .await
-            .unwrap();
-
-        assert!(linked.email_verified);
-        assert!(!linked.email_verified_by_code);
     }
 
     fn codes() -> InMemoryEmailVerificationCodeStorage {

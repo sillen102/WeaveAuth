@@ -10,6 +10,46 @@ fn test_config() -> Config {
         bff_url: "http://bff.test".into(),
         own_origin: "http://login.test".into(),
         verify_default_redirect_uri: None,
+        bff_internal_url: None,
+    }
+}
+
+/// A bff stand-in serving `/oidc/providers` with `status`; returns its URL
+/// and how many times the list was fetched.
+async fn counting_stub_bff(
+    status: StatusCode,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = fetches.clone();
+    let router = axum::Router::new().route(
+        "/oidc/providers",
+        axum::routing::get(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                (
+                    status,
+                    axum::Json(serde_json::json!({"providers": [
+                        {"key": "google", "display_name": "Google"},
+                        {"key": "linkedin", "display_name": "LinkedIn"},
+                    ]})),
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), fetches)
+}
+
+async fn stub_bff() -> String {
+    counting_stub_bff(StatusCode::OK).await.0
+}
+
+async fn config_with_stub_bff() -> Config {
+    Config {
+        bff_url: stub_bff().await,
+        ..test_config()
     }
 }
 
@@ -147,7 +187,7 @@ async fn login_page_shows_the_link_failed_error_message() {
         .unwrap();
 
     let body = body_string(resp).await;
-    assert!(body.contains("please try Sign in with Google again"));
+    assert!(body.contains("please sign in again"), "got {body}");
     assert!(!body.contains("Incorrect email or password."));
 }
 
@@ -190,6 +230,174 @@ async fn login_page_renders_the_confirm_link_form_when_email_is_present() {
     assert!(body.contains("squatter@example.com"));
     assert!(body.contains("action=\"http://bff.test/oidc/confirm-link\""));
     assert!(!body.contains("id=\"login-form\""));
+}
+
+#[tokio::test]
+async fn confirm_link_page_offers_the_password_and_each_linked_provider() {
+    let body = get_body(
+        test_config(),
+        "/login.html?email=alice%40example.com&has_password=true&linked_providers=google%2Clinkedin&redirect_uri=http%3A%2F%2Fadmin.test%2F",
+    )
+    .await;
+
+    assert!(body.contains("id=\"confirm-link-form\""));
+    let next = "next=http%3A%2F%2Flogin.test%2Flogin.html%3Fredirect_uri%3Dhttp%253A%252F%252Fadmin.test%252F";
+    for provider in ["google", "linkedin"] {
+        let href = format!(
+            "href=\"http://bff.test/oidc/{provider}/login?redirect_uri=http%3A%2F%2Fadmin.test%2F&{next}&confirm_link=true\""
+        );
+        assert!(body.contains(&href), "missing {href} in {body}");
+    }
+}
+
+#[tokio::test]
+async fn confirm_link_page_leaves_out_the_password_form_for_an_account_without_one() {
+    let body = get_body(
+        test_config(),
+        "/login.html?email=alice%40example.com&has_password=false&linked_providers=google",
+    )
+    .await;
+
+    assert!(!body.contains("id=\"confirm-link-form\""));
+    assert!(body.contains("http://bff.test/oidc/google/login?"));
+}
+
+#[tokio::test]
+async fn confirm_link_page_says_so_when_there_is_no_way_to_confirm() {
+    let body = get_body(
+        test_config(),
+        "/login.html?email=alice%40example.com&has_password=false",
+    )
+    .await;
+
+    assert!(body.contains("id=\"no-link-option\""));
+    assert!(!body.contains("id=\"confirm-link-form\""));
+}
+
+#[tokio::test]
+async fn confirm_link_page_only_offers_providers_bff_lists() {
+    let config = config_with_stub_bff().await;
+    let bff = config.bff_url.clone();
+    let body = get_body(
+        config,
+        "/login.html?email=alice%40example.com&has_password=false&linked_providers=..%2F..%2Fx%2Cgoogle%2Cunknown",
+    )
+    .await;
+
+    assert!(
+        body.contains(&format!("{bff}/oidc/google/login?")),
+        "got {body}"
+    );
+    assert!(!body.contains("/oidc/.."), "got {body}");
+    assert!(!body.contains("unknown"), "got {body}");
+}
+
+#[tokio::test]
+async fn confirm_link_page_names_providers_from_bff_not_the_url() {
+    let body = get_body(
+        config_with_stub_bff().await,
+        "/login.html?email=alice%40example.com&provider=linkedin&has_password=false&linked_providers=linkedin%2Cgoogle",
+    )
+    .await;
+
+    assert!(body.contains("link your LinkedIn sign-in"), "got {body}");
+    assert!(body.contains("Continue with LinkedIn"), "got {body}");
+    assert!(body.contains("Continue with Google"), "got {body}");
+}
+
+#[tokio::test]
+async fn confirm_link_page_shows_no_text_for_an_unknown_provider() {
+    let body = get_body(
+        config_with_stub_bff().await,
+        "/login.html?email=alice%40example.com&provider=Call%20support%20now&has_password=true",
+    )
+    .await;
+
+    assert!(body.contains("link this sign-in"), "got {body}");
+    assert!(!body.contains("Call support now"), "got {body}");
+}
+
+#[tokio::test]
+async fn confirm_link_page_falls_back_to_plain_keys_when_bff_is_unreachable() {
+    let config = Config {
+        bff_url: "http://127.0.0.1:9".into(),
+        ..test_config()
+    };
+    let body = get_body(
+        config,
+        "/login.html?email=alice%40example.com&provider=Call%20support%20now&has_password=false&linked_providers=google%2C..%2Fx",
+    )
+    .await;
+
+    assert!(body.contains("Continue with google"), "got {body}");
+    assert!(!body.contains("/oidc/../"), "got {body}");
+    assert!(!body.contains("Call support now"), "got {body}");
+}
+
+#[tokio::test]
+async fn provider_names_are_fetched_once_and_reused_across_renders() {
+    let (bff, fetches) = counting_stub_bff(StatusCode::OK).await;
+    let app = app(Config {
+        bff_url: bff,
+        ..test_config()
+    });
+    let path = "/login.html?email=alice%40example.com&provider=linkedin&has_password=true";
+
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            body_string(resp)
+                .await
+                .contains("link your LinkedIn sign-in")
+        );
+    }
+
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_failed_provider_lookup_is_not_retried_on_every_render() {
+    let (bff, fetches) = counting_stub_bff(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let app = app(Config {
+        bff_url: bff,
+        ..test_config()
+    });
+    let path = "/login.html?email=alice%40example.com&has_password=false&linked_providers=google";
+
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(body_string(resp).await.contains("Continue with google"));
+    }
+
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn provider_names_come_from_the_internal_bff_url_when_set() {
+    let config = Config {
+        bff_internal_url: Some(stub_bff().await),
+        ..test_config()
+    };
+    let body = get_body(
+        config,
+        "/login.html?email=alice%40example.com&has_password=false&linked_providers=linkedin",
+    )
+    .await;
+
+    assert!(body.contains("Continue with LinkedIn"), "got {body}");
+    // Links still go to the public URL.
+    assert!(
+        body.contains("http://bff.test/oidc/linkedin/login?"),
+        "got {body}"
+    );
 }
 
 #[tokio::test]
