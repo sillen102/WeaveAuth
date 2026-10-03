@@ -3,16 +3,42 @@ pub(crate) mod in_memory;
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::{PasswordHash, User};
+use chrono::{DateTime, Utc};
 use email_address::EmailAddress;
 use secrecy::SecretString;
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JwkRotationError {
+    #[error("could not generate a signing key: {0}")]
+    Generate(String),
+    #[error("no next signing key is staged")]
+    NoNextKey,
+}
+
 pub(crate) trait JwkStorage {
     /// The key `/oauth/token` should sign new access tokens with.
     async fn active_key(&self) -> Arc<JwtKeys>;
-    /// The public keys to publish at `/.well-known/jwks.json`.
+    /// The public keys to publish at `/.well-known/jwks.json`: the active
+    /// key first, then the staged next key (if any), then keys still inside
+    /// their grace period.
     async fn jwk_set(&self) -> serde_json::Value;
+    /// When the active key became active.
+    async fn active_since(&self) -> DateTime<Utc>;
+    /// When the next key was staged, if one is.
+    async fn next_since(&self) -> Option<DateTime<Utc>>;
+    /// Generates the next key and publishes it without signing with it yet,
+    /// so consumers can cache it before it is used. Does nothing if one is
+    /// already staged. The active key is untouched if this fails.
+    async fn stage_next(&self, now: DateTime<Utc>) -> Result<(), JwkRotationError>;
+    /// Makes the staged next key active; the previous one stays published
+    /// until [`JwkStorage::prune_retired`] drops it. Fails with
+    /// [`JwkRotationError::NoNextKey`] if none is staged.
+    async fn promote_next(&self, now: DateTime<Utc>) -> Result<(), JwkRotationError>;
+    /// Stops publishing retired keys whose grace period (counted from when
+    /// they were replaced) is over. Never touches the active key.
+    async fn prune_retired(&self, now: DateTime<Utc>, grace: chrono::Duration);
 }
 
 /// An email address, paired with proof it was actually confirmed by whoever

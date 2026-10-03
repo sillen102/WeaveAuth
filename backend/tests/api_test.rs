@@ -19,6 +19,7 @@ fn test_config() -> Config {
         login_session_ttl_secs: 60,
         access_token_ttl_secs: 900,
         refresh_token_ttl_secs: 2_592_000,
+        jwt_key_rotation_interval_secs: 2_592_000,
         oidc_state_ttl_secs: 300,
         pending_oidc_link_ttl_secs: 600,
         password_reset_token_ttl_secs: 1_800,

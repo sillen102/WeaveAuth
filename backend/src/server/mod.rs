@@ -1,6 +1,6 @@
 use crate::config::{
-    Config, EmailHandlerConfig, ExtraDataHandlerConfig, LoginClaimsHandlerConfig,
-    OidcProviderConfig, ProfileApiConfig,
+    Config, EmailHandlerConfig, ExtraDataHandlerConfig, JWT_KEY_ROTATION_MARGIN_SECS,
+    LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig, jwt_key_grace_secs,
 };
 use crate::oidc::{self, OidcClient};
 use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
@@ -12,13 +12,14 @@ use crate::server::api::token::{
     self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
 };
 use crate::server::router::router;
-use crate::storage::ExpiryMaintenance;
 use crate::storage::in_memory::{
     InMemoryEmailVerificationCodeStorage, InMemoryJwkStorage, InMemoryLoginSessionStorage,
     InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage, InMemoryPendingOidcLinkStorage,
     InMemoryPkceStorage, InMemoryRefreshTokenStorage, InMemoryUserStorage,
     InMemoryVerificationSessionStorage,
 };
+use crate::storage::{ExpiryMaintenance, JwkStorage};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub(crate) struct AppState {
     pub(crate) access_token_ttl_secs: i64,
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
     pub(crate) refresh_token_ttl_secs: i64,
+    pub(crate) jwt_key_rotation_interval_secs: i64,
     pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
     /// Per provider: `field name -> id_token claim name` (see `OidcProviderConfig::extra_claims`).
     pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
@@ -66,6 +68,48 @@ impl AppState {
         self.password_reset_tokens.sweep_expired().await;
         self.email_verification.codes.sweep_expired().await;
         self.email_verification.sessions.sweep_expired().await;
+        self.rotate_keys_if_due(Utc::now()).await;
+    }
+
+    /// Keeps the signing key rotating, one step per call as each falls due.
+    ///
+    /// Stage: `JWT_KEY_ROTATION_MARGIN_SECS` before the active key is
+    /// `jwt_key_rotation_interval_secs` old, the next key is published
+    /// without signing.
+    ///
+    /// Promote: once the active key is that old and the staged key has been
+    /// published for the margin, the staged key takes over.
+    ///
+    /// Prune: a replaced key stays published for [`jwt_key_grace_secs`]
+    /// after that, by which time every access token it signed has expired.
+    pub(crate) async fn rotate_keys_if_due(&self, now: DateTime<Utc>) {
+        self.jwt_keys
+            .prune_retired(
+                now,
+                chrono::Duration::seconds(jwt_key_grace_secs(self.access_token_ttl_secs)),
+            )
+            .await;
+        let margin = chrono::Duration::seconds(JWT_KEY_ROTATION_MARGIN_SECS);
+        let interval = chrono::Duration::seconds(self.jwt_key_rotation_interval_secs);
+        let active_for = now - self.jwt_keys.active_since().await;
+
+        let staged_at = match self.jwt_keys.next_since().await {
+            Some(at) => at,
+            None if active_for >= interval - margin => {
+                if let Err(error) = self.jwt_keys.stage_next(now).await {
+                    tracing::error!(%error, "staging the next JWT signing key failed; retrying on the next sweep");
+                    return;
+                }
+                now
+            }
+            None => return,
+        };
+        if active_for >= interval
+            && now - staged_at >= margin
+            && let Err(error) = self.jwt_keys.promote_next(now).await
+        {
+            tracing::error!(%error, "JWT signing key rotation failed; keeping the current key");
+        }
     }
 
     /// A fully wired state with default config and no handlers.
@@ -138,6 +182,7 @@ impl AppState {
             access_token_ttl_secs: config.access_token_ttl_secs,
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
+            jwt_key_rotation_interval_secs: config.jwt_key_rotation_interval_secs,
             oidc_providers: Arc::new(oidc_providers),
             oidc_profile_apis: Arc::new(
                 config
@@ -385,6 +430,89 @@ pub async fn app(config: &Config) -> anyhow::Result<axum::Router> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn published(state: &AppState) -> usize {
+        state.jwt_keys.jwk_set().await["keys"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+
+    fn secs(n: i64) -> chrono::Duration {
+        chrono::Duration::seconds(n)
+    }
+
+    #[tokio::test]
+    async fn next_key_is_staged_one_rotation_margin_before_the_interval_without_signing() {
+        let state = AppState::for_test().await;
+        let kid = state.jwt_keys.active_key().await.kid.clone();
+        let since = state.jwt_keys.active_since().await;
+        let stage_at =
+            since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_ROTATION_MARGIN_SECS);
+
+        state.rotate_keys_if_due(stage_at - secs(1)).await;
+        assert_eq!(published(&state).await, 1);
+
+        state.rotate_keys_if_due(stage_at).await;
+        assert_eq!(published(&state).await, 2);
+        assert_eq!(state.jwt_keys.active_key().await.kid, kid);
+
+        state
+            .rotate_keys_if_due(since + secs(state.jwt_key_rotation_interval_secs - 1))
+            .await;
+        assert_eq!(state.jwt_keys.active_key().await.kid, kid);
+    }
+
+    #[tokio::test]
+    async fn staged_key_takes_over_at_the_interval_and_the_old_one_drops_after_the_grace_period() {
+        let state = AppState::for_test().await;
+        let old_kid = state.jwt_keys.active_key().await.kid.clone();
+        let since = state.jwt_keys.active_since().await;
+        state
+            .rotate_keys_if_due(
+                since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_ROTATION_MARGIN_SECS),
+            )
+            .await;
+        let staged_kid = state.jwt_keys.jwk_set().await["keys"][1]["kid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let rotate_at = since + secs(state.jwt_key_rotation_interval_secs);
+        state.rotate_keys_if_due(rotate_at).await;
+        assert_eq!(state.jwt_keys.active_key().await.kid, staged_kid);
+        assert_eq!(published(&state).await, 2);
+
+        let grace = jwt_key_grace_secs(state.access_token_ttl_secs);
+        state.rotate_keys_if_due(rotate_at + secs(grace - 1)).await;
+        assert_eq!(published(&state).await, 2);
+
+        state.rotate_keys_if_due(rotate_at + secs(grace)).await;
+        assert_eq!(published(&state).await, 1);
+        assert_ne!(state.jwt_keys.active_key().await.kid, old_kid);
+    }
+
+    #[tokio::test]
+    async fn a_key_staged_late_is_published_for_the_full_margin_before_it_signs() {
+        let state = AppState::for_test().await;
+        let kid = state.jwt_keys.active_key().await.kid.clone();
+        let late =
+            state.jwt_keys.active_since().await + secs(state.jwt_key_rotation_interval_secs + 10);
+
+        state.rotate_keys_if_due(late).await;
+        assert_eq!(published(&state).await, 2);
+        assert_eq!(state.jwt_keys.active_key().await.kid, kid);
+
+        state
+            .rotate_keys_if_due(late + secs(JWT_KEY_ROTATION_MARGIN_SECS - 1))
+            .await;
+        assert_eq!(state.jwt_keys.active_key().await.kid, kid);
+
+        state
+            .rotate_keys_if_due(late + secs(JWT_KEY_ROTATION_MARGIN_SECS))
+            .await;
+        assert_ne!(state.jwt_keys.active_key().await.kid, kid);
+    }
 
     fn webhook_pair() -> (ExtraDataHandlerConfig, LoginClaimsHandlerConfig) {
         (

@@ -19,6 +19,13 @@ pub struct Config {
     /// How long a refresh token stays redeemable before it must be re-issued
     /// via a fresh login.
     pub refresh_token_ttl_secs: i64,
+    /// How often a new JWT signing key replaces the active one. The
+    /// replaced key stays published at `/.well-known/jwks.json` for
+    /// [`jwt_key_grace_secs()`] after that, and the next key is published
+    /// [`JWT_KEY_ROTATION_MARGIN_SECS`] before it starts signing. The grace
+    /// plus that margin must fit inside this interval, so at most two keys
+    /// are published at once.
+    pub jwt_key_rotation_interval_secs: i64,
     /// How long a state entry for an in-flight `/oauth/oidc/login`
     /// redirect stays valid while the user is off at the provider's consent
     /// screen.
@@ -356,6 +363,7 @@ impl Default for Config {
             login_session_ttl_secs: 60,
             access_token_ttl_secs: 900,
             refresh_token_ttl_secs: 2_592_000,
+            jwt_key_rotation_interval_secs: 2_592_000,
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
             password_reset_token_ttl_secs: 1_800,
@@ -373,6 +381,23 @@ impl Default for Config {
             require_verified_email: false,
         }
     }
+}
+
+/// Margin around signing key changes, serving two purposes. A new key is
+/// published this long before it signs anything, so a consumer that caches
+/// the JWKS for less than this has it by then. A replaced key is kept this
+/// long past the last access token it signed, to cover verifiers' `exp`
+/// leeway (jsonwebtoken defaults to 60s) and clock skew.
+pub const JWT_KEY_ROTATION_MARGIN_SECS: i64 = 3_600;
+
+/// Largest accepted TTL or rotation interval (10 years): keeps the time
+/// arithmetic on these far from overflow.
+const MAX_SECS: i64 = 315_360_000;
+
+/// How long a replaced signing key stays published: the longest-lived access
+/// token it can have signed, plus [`JWT_KEY_ROTATION_MARGIN_SECS`].
+pub fn jwt_key_grace_secs(access_token_ttl_secs: i64) -> i64 {
+    access_token_ttl_secs.saturating_add(JWT_KEY_ROTATION_MARGIN_SECS)
 }
 
 impl Config {
@@ -459,6 +484,30 @@ impl Config {
                 "WA_MAX_BCRYPT_COST exceeds bcrypt's own maximum cost; clamping"
             );
             config.max_bcrypt_cost = BCRYPT_MAX_COST;
+        }
+
+        for (name, value) in [
+            ("WA_ACCESS_TOKEN_TTL_SECS", config.access_token_ttl_secs),
+            ("WA_REFRESH_TOKEN_TTL_SECS", config.refresh_token_ttl_secs),
+            (
+                "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
+                config.jwt_key_rotation_interval_secs,
+            ),
+        ] {
+            if !(1..=MAX_SECS).contains(&value) {
+                anyhow::bail!("{name} must be between 1 and {MAX_SECS} seconds");
+            }
+        }
+        // The replaced key must be pruned before the next one is staged, so at most two are published.
+        if jwt_key_grace_secs(config.access_token_ttl_secs)
+            .saturating_add(JWT_KEY_ROTATION_MARGIN_SECS)
+            > config.jwt_key_rotation_interval_secs
+        {
+            anyhow::bail!(
+                "WA_ACCESS_TOKEN_TTL_SECS ({}) plus twice the {JWT_KEY_ROTATION_MARGIN_SECS}s key rotation margin must not exceed WA_JWT_KEY_ROTATION_INTERVAL_SECS ({})",
+                config.access_token_ttl_secs,
+                config.jwt_key_rotation_interval_secs
+            );
         }
 
         Ok(config)
@@ -573,7 +622,96 @@ mod tests {
             assert_eq!(config.login_session_ttl_secs, 60);
             assert_eq!(config.access_token_ttl_secs, 900);
             assert_eq!(config.refresh_token_ttl_secs, 2_592_000);
+            assert_eq!(config.jwt_key_rotation_interval_secs, 2_592_000);
             assert_eq!(config.max_bcrypt_cost, bcrypt::DEFAULT_COST);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rotation_interval_can_be_set_from_env() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "1209600");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.jwt_key_rotation_interval_secs, 1_209_600);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn access_ttl_plus_twice_the_margin_longer_than_rotation_interval_is_rejected() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1001");
+            jail.set_env(
+                "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
+                (1000 + 2 * JWT_KEY_ROTATION_MARGIN_SECS).to_string(),
+            );
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_ACCESS_TOKEN_TTL_SECS"), "{error}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn access_ttl_plus_twice_the_margin_equal_to_rotation_interval_is_accepted() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1000");
+            jail.set_env(
+                "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
+                (1000 + 2 * JWT_KEY_ROTATION_MARGIN_SECS).to_string(),
+            );
+
+            Config::load().unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn refresh_ttl_may_outlast_the_rotation_interval() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "86400");
+            jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "864000");
+
+            Config::load().unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn out_of_range_ttls_and_rotation_interval_are_rejected() {
+        for (name, value) in [
+            ("WA_ACCESS_TOKEN_TTL_SECS", "0"),
+            ("WA_REFRESH_TOKEN_TTL_SECS", "0"),
+            ("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "0"),
+            ("WA_ACCESS_TOKEN_TTL_SECS", "315360001"),
+            ("WA_REFRESH_TOKEN_TTL_SECS", "9223372036854775807"),
+            ("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "9223372036854775807"),
+        ] {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                jail.set_env(name, value);
+
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains(name), "{error}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn ttls_and_rotation_interval_are_accepted_at_the_upper_bound() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "315360000");
+            jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "315360000");
+
+            Config::load().unwrap();
             Ok(())
         });
     }

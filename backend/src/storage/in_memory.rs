@@ -1,10 +1,10 @@
-use crate::crypto::JwtKeys;
+use crate::crypto::{Jwk, JwtKeys};
 use crate::model::pkce::CodeChallengeMethod;
 use crate::model::user::{PasswordHash, User};
 use crate::storage::{
     CheckCodeOutcome, CreateUserOutcome, EmailVerificationCodeStorage, ExpiryMaintenance,
-    IssueCodeOutcome, JwkStorage, LoginSessionStorage, MarkVerifiedOutcome, OidcLinkOutcome,
-    OidcLoginState, OidcStateStorage, PasswordResetTokenStorage, PendingOidcLink,
+    IssueCodeOutcome, JwkRotationError, JwkStorage, LoginSessionStorage, MarkVerifiedOutcome,
+    OidcLinkOutcome, OidcLoginState, OidcStateStorage, PasswordResetTokenStorage, PendingOidcLink,
     PendingOidcLinkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, RevokeOutcome,
     SetPasswordOutcome, UserStorage, VerificationSessionStorage, VerifiedEmail,
 };
@@ -15,29 +15,92 @@ use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+struct JwkKeys {
+    active: Arc<JwtKeys>,
+    active_since: DateTime<Utc>,
+    /// Published but not yet signing, with when it was staged.
+    next: Option<(Arc<JwtKeys>, DateTime<Utc>)>,
+    /// Public halves of replaced keys, with when they were replaced; the
+    /// private key is dropped at rotation.
+    retired: Vec<(Jwk, DateTime<Utc>)>,
+}
 
 #[derive(Clone)]
 pub(crate) struct InMemoryJwkStorage {
-    active_key: Arc<JwtKeys>,
+    keys: Arc<RwLock<JwkKeys>>,
 }
 
 impl InMemoryJwkStorage {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            active_key: Arc::new(JwtKeys::generate()?),
+            keys: Arc::new(RwLock::new(JwkKeys {
+                active: Arc::new(JwtKeys::generate()?),
+                active_since: Utc::now(),
+                next: None,
+                retired: Vec::new(),
+            })),
         })
     }
 }
 
 impl JwkStorage for InMemoryJwkStorage {
     async fn active_key(&self) -> Arc<JwtKeys> {
-        self.active_key.clone()
+        self.keys.read().await.active.clone()
     }
 
     async fn jwk_set(&self) -> serde_json::Value {
-        self.active_key.jwk_set()
+        let keys = self.keys.read().await;
+        let published: Vec<&Jwk> = std::iter::once(keys.active.jwk())
+            .chain(keys.next.iter().map(|(key, _)| key.jwk()))
+            .chain(keys.retired.iter().map(|(jwk, _)| jwk))
+            .collect();
+        serde_json::json!({ "keys": published })
+    }
+
+    async fn active_since(&self) -> DateTime<Utc> {
+        self.keys.read().await.active_since
+    }
+
+    async fn next_since(&self) -> Option<DateTime<Utc>> {
+        self.keys.read().await.next.as_ref().map(|(_, at)| *at)
+    }
+
+    async fn stage_next(&self, now: DateTime<Utc>) -> Result<(), JwkRotationError> {
+        if self.keys.read().await.next.is_some() {
+            return Ok(());
+        }
+        // RSA keygen is slow; do it before taking the write lock so token issuance isn't stalled.
+        let new_key = tokio::task::spawn_blocking(JwtKeys::generate)
+            .await
+            .map_err(|e| JwkRotationError::Generate(e.to_string()))?
+            .map_err(|e| JwkRotationError::Generate(format!("{e:#}")))?;
+
+        self.keys
+            .write()
+            .await
+            .next
+            .get_or_insert((Arc::new(new_key), now));
+        Ok(())
+    }
+
+    async fn promote_next(&self, now: DateTime<Utc>) -> Result<(), JwkRotationError> {
+        let mut keys = self.keys.write().await;
+        let (next, _) = keys.next.take().ok_or(JwkRotationError::NoNextKey)?;
+        let previous = std::mem::replace(&mut keys.active, next);
+        keys.retired.push((previous.jwk().clone(), now));
+        keys.active_since = now;
+        Ok(())
+    }
+
+    async fn prune_retired(&self, now: DateTime<Utc>, grace: chrono::Duration) {
+        self.keys
+            .write()
+            .await
+            .retired
+            .retain(|(_, retired_at)| now < *retired_at + grace);
     }
 }
 
@@ -857,6 +920,7 @@ impl ExpiryMaintenance for InMemoryRefreshTokenStorage {
 mod tests {
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::{PasswordHash, User};
+    use crate::storage::JwkStorage;
     use crate::storage::in_memory::{
         InMemoryEmailVerificationCodeStorage, InMemoryLoginSessionStorage,
         InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
@@ -873,6 +937,154 @@ mod tests {
     use chrono::Utc;
     use secrecy::ExposeSecret;
     use uuid::Uuid;
+
+    fn jwk_kids(set: &serde_json::Value) -> Vec<String> {
+        set["keys"]
+            .as_array()
+            .expect("keys array")
+            .iter()
+            .map(|k| k["kid"].as_str().expect("kid").to_string())
+            .collect()
+    }
+
+    async fn rotate(
+        storage: &crate::storage::in_memory::InMemoryJwkStorage,
+        now: chrono::DateTime<Utc>,
+    ) {
+        storage.stage_next(now).await.unwrap();
+        storage.promote_next(now).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage_next_publishes_a_key_without_signing_with_it() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let active_kid = storage.active_key().await.kid.clone();
+        let since = storage.active_since().await;
+        let now = Utc::now();
+        assert_eq!(storage.next_since().await, None);
+
+        storage.stage_next(now).await.unwrap();
+
+        assert_eq!(storage.active_key().await.kid, active_kid);
+        assert_eq!(storage.active_since().await, since);
+        assert_eq!(storage.next_since().await, Some(now));
+        let kids = jwk_kids(&storage.jwk_set().await);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0], active_kid);
+    }
+
+    #[tokio::test]
+    async fn staging_again_keeps_the_already_staged_key() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let first = Utc::now();
+        storage.stage_next(first).await.unwrap();
+        let kids = jwk_kids(&storage.jwk_set().await);
+
+        storage
+            .stage_next(first + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+
+        assert_eq!(jwk_kids(&storage.jwk_set().await), kids);
+        assert_eq!(storage.next_since().await, Some(first));
+    }
+
+    #[tokio::test]
+    async fn promote_next_activates_the_staged_key_and_keeps_the_old_one_published() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let old_kid = storage.active_key().await.kid.clone();
+        let now = Utc::now();
+        storage.stage_next(now).await.unwrap();
+        let staged_kid = jwk_kids(&storage.jwk_set().await)[1].clone();
+
+        storage.promote_next(now).await.unwrap();
+
+        assert_eq!(storage.active_key().await.kid, staged_kid);
+        assert_eq!(storage.active_since().await, now);
+        assert_eq!(storage.next_since().await, None);
+        assert_eq!(
+            jwk_kids(&storage.jwk_set().await),
+            vec![staged_kid, old_kid]
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_next_without_a_staged_key_fails_and_changes_nothing() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let kid = storage.active_key().await.kid.clone();
+
+        let result = storage.promote_next(Utc::now()).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::storage::JwkRotationError::NoNextKey)
+        ));
+        assert_eq!(storage.active_key().await.kid, kid);
+    }
+
+    #[tokio::test]
+    async fn token_signed_before_rotation_verifies_against_the_published_set() {
+        use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, encode};
+
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let old = storage.active_key().await;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(old.kid.clone());
+        let claims = serde_json::json!({ "exp": Utc::now().timestamp() + 3600 });
+        let token = encode(&header, &claims, &old.encoding_key).unwrap();
+
+        rotate(&storage, Utc::now()).await;
+
+        let set = storage.jwk_set().await;
+        let jwk = set["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["kid"] == old.kid.as_str())
+            .expect("old key still published");
+        let decoding_key = DecodingKey::from_rsa_components(
+            jwk["n"].as_str().unwrap(),
+            jwk["e"].as_str().unwrap(),
+        )
+        .unwrap();
+        decode::<serde_json::Value>(&token, &decoding_key, &Validation::new(Algorithm::RS256))
+            .expect("old-key token verifies during grace");
+    }
+
+    #[tokio::test]
+    async fn prune_retired_drops_the_old_key_only_once_the_grace_period_is_over() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let old_kid = storage.active_key().await.kid.clone();
+        let rotated_at = Utc::now();
+        let grace = chrono::Duration::seconds(100);
+        rotate(&storage, rotated_at).await;
+
+        storage
+            .prune_retired(rotated_at + chrono::Duration::seconds(99), grace)
+            .await;
+        assert!(jwk_kids(&storage.jwk_set().await).contains(&old_kid));
+
+        storage
+            .prune_retired(rotated_at + chrono::Duration::seconds(100), grace)
+            .await;
+        let new_kid = storage.active_key().await.kid.clone();
+        assert_eq!(jwk_kids(&storage.jwk_set().await), vec![new_kid]);
+    }
+
+    #[tokio::test]
+    async fn prune_retired_never_drops_the_active_key() {
+        let storage = crate::storage::in_memory::InMemoryJwkStorage::new().unwrap();
+        let kid = storage.active_key().await.kid.clone();
+
+        storage
+            .prune_retired(
+                Utc::now() + chrono::Duration::days(365),
+                chrono::Duration::zero(),
+            )
+            .await;
+
+        assert_eq!(jwk_kids(&storage.jwk_set().await), vec![kid]);
+    }
 
     fn verified(email: &str) -> VerifiedEmail {
         VerifiedEmail::new(email.to_string(), true).expect("true always verifies")

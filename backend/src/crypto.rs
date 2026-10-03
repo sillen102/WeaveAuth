@@ -139,8 +139,8 @@ impl JwtKeys {
         })
     }
 
-    pub(crate) fn jwk_set(&self) -> serde_json::Value {
-        serde_json::json!({ "keys": [self.jwk] })
+    pub(crate) fn jwk(&self) -> &Jwk {
+        &self.jwk
     }
 }
 
@@ -170,7 +170,7 @@ mod tests {
         };
         let token = encode(&header, &claims, &keys.encoding_key).expect("signing");
 
-        let jwk_set = keys.jwk_set();
+        let jwk_set = serde_json::json!({ "keys": [keys.jwk()] });
         let jwk = &jwk_set["keys"][0];
         assert_eq!(jwk["kid"], keys.kid);
 
