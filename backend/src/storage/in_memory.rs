@@ -470,14 +470,24 @@ impl ExpiryMaintenance for InMemoryVerificationSessionStorage {
     }
 }
 
+/// Digits in a code; 10^CODE_DIGITS must fit the u32 it is drawn from.
+pub(crate) const CODE_DIGITS: usize = 9;
+const _: () = assert!(CODE_DIGITS < 10);
+
 /// Wrong guesses a single code survives; the next one deletes it.
 const MAX_CODE_ATTEMPTS: u32 = 5;
 /// Wrong guesses (across codes, since the last success) before the user is
 /// locked out. The count is kept as long as the user's record is: dropping it
 /// after an hour without a new code (see the sweep) resets it too.
 const MAX_FAILED_ATTEMPTS: u32 = 10;
-/// How long that lock lasts.
+/// How long the first lock lasts. Each repeat doubles it while the earlier
+/// locks are remembered (1h, 2h, 4h, 8h, 16h).
 const LOCKOUT_SECS: i64 = 3_600;
+/// Locks within the remembered window after which the user stays locked
+/// until a password reset.
+const MAX_LOCKOUTS: u32 = 5;
+/// How long after a lock ends it still counts towards the next one's length.
+const LOCKOUT_MEMORY_SECS: i64 = 86_400;
 
 /// The current code, stored as sha256(user id || code) rather than the code
 /// itself, like the other single-use secrets here.
@@ -496,7 +506,20 @@ struct UserCodes {
     /// Wrong guesses since the last success or lock; reaching
     /// `MAX_FAILED_ATTEMPTS` starts a lockout.
     failed_attempts: u32,
+    /// When the latest lock ends (or ended: kept for `LOCKOUT_MEMORY_SECS`).
     locked_until: Option<DateTime<Utc>>,
+    /// Locks within the remembered window; each doubles the next one.
+    lockouts: u32,
+    /// Set by the lock after `MAX_LOCKOUTS` of them; only removing the record
+    /// (a password reset) ends it.
+    locked_until_reset: bool,
+}
+
+/// A lock in force.
+#[derive(Debug, Eq, PartialEq)]
+enum Lock {
+    Until(DateTime<Utc>),
+    UntilReset,
 }
 
 impl UserCodes {
@@ -507,24 +530,45 @@ impl UserCodes {
         let age = self
             .last_issued_at
             .map(|issued| (now - issued).num_seconds());
-        self.locked_until.is_some_and(|until| until > now)
+        self.locked_until_reset
+            || self
+                .locked_until
+                .is_some_and(|until| until + chrono::Duration::seconds(LOCKOUT_MEMORY_SECS) > now)
             || age.is_some_and(|age| {
                 age <= ttl || age < cooldown || (self.failed_attempts > 0 && age <= lockout)
             })
     }
 
-    /// Whether a lock is in force. An elapsed one is cleared, with the
-    /// failure count.
-    fn locked(&mut self, now: DateTime<Utc>) -> bool {
-        match self.locked_until {
-            Some(until) if until > now => true,
-            Some(_) => {
-                self.locked_until = None;
-                self.failed_attempts = 0;
-                false
-            }
-            None => false,
+    /// The lock in force, if any.
+    fn locked(&self, now: DateTime<Utc>) -> Option<Lock> {
+        if self.locked_until_reset {
+            return Some(Lock::UntilReset);
         }
+        self.locked_until
+            .filter(|until| *until > now)
+            .map(Lock::Until)
+    }
+
+    /// Starts a lock, twice as long as the previous one if that is still
+    /// remembered, or one that only a password reset ends after
+    /// `MAX_LOCKOUTS` of them.
+    fn lock(&mut self, now: DateTime<Utc>, lockout_secs: i64) -> Lock {
+        self.failed_attempts = 0;
+        let remembered = self
+            .locked_until
+            .is_some_and(|until| until + chrono::Duration::seconds(LOCKOUT_MEMORY_SECS) > now);
+        if !remembered {
+            self.lockouts = 0;
+        }
+        if self.lockouts >= MAX_LOCKOUTS {
+            self.locked_until_reset = true;
+            return Lock::UntilReset;
+        }
+        let secs = lockout_secs << self.lockouts;
+        self.lockouts += 1;
+        let until = now + chrono::Duration::seconds(secs);
+        self.locked_until = Some(until);
+        Lock::Until(until)
     }
 }
 
@@ -553,8 +597,39 @@ impl InMemoryEmailVerificationCodeStorage {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hard_lock(&self, user_id: Uuid) {
+        self.users
+            .lock()
+            .await
+            .entry(user_id)
+            .or_default()
+            .locked_until_reset = true;
+    }
+
+    #[cfg(test)]
     pub(crate) async fn entry_count(&self) -> usize {
         self.users.lock().await.len()
+    }
+}
+
+/// Whole seconds from `now` until `until`, rounded up so a user who waits
+/// that long is never turned away again.
+fn secs_until(until: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    ((until - now).num_milliseconds() + 999) / 1000
+}
+
+/// A code that is not `code`.
+#[cfg(test)]
+pub(crate) fn wrong_code(code: &str) -> &'static str {
+    debug_assert_eq!(
+        code.len(),
+        CODE_DIGITS,
+        "the literals below have nine digits"
+    );
+    if code == "000000000" {
+        "000000001"
+    } else {
+        "000000000"
     }
 }
 
@@ -570,17 +645,30 @@ impl EmailVerificationCodeStorage for InMemoryEmailVerificationCodeStorage {
         let mut users = self.users.lock().await;
         let user = users.entry(user_id).or_default();
         let now = Utc::now();
-        if user.locked(now) {
-            return IssueCodeOutcome::Locked;
+        match user.locked(now) {
+            Some(Lock::Until(until)) => {
+                return IssueCodeOutcome::Locked {
+                    retry_after_secs: secs_until(until, now),
+                };
+            }
+            Some(Lock::UntilReset) => return IssueCodeOutcome::LockedUntilReset,
+            None => {}
         }
-        if user
+        let cooldown_ends = user
             .last_issued_at
-            .is_some_and(|issued| (now - issued).num_seconds() < self.cooldown_secs)
-        {
-            return IssueCodeOutcome::CoolingDown;
+            .map(|issued| issued + chrono::Duration::seconds(self.cooldown_secs))
+            .filter(|ends| *ends > now);
+        if let Some(ends) = cooldown_ends {
+            return IssueCodeOutcome::CoolingDown {
+                retry_after_secs: secs_until(ends, now),
+            };
         }
 
-        let code = format!("{:06}", rand::rng().random_range(0..1_000_000u32));
+        let code = format!(
+            "{:0width$}",
+            rand::rng().random_range(0..10u32.pow(CODE_DIGITS as u32)),
+            width = CODE_DIGITS
+        );
         user.code = Some(CodeEntry {
             hash: hash_code(user_id, &code),
             attempts: 0,
@@ -595,8 +683,14 @@ impl EmailVerificationCodeStorage for InMemoryEmailVerificationCodeStorage {
             return CheckCodeOutcome::NoCode;
         };
         let now = Utc::now();
-        if user.locked(now) {
-            return CheckCodeOutcome::Locked;
+        match user.locked(now) {
+            Some(Lock::Until(until)) => {
+                return CheckCodeOutcome::Locked {
+                    retry_after_secs: secs_until(until, now),
+                };
+            }
+            Some(Lock::UntilReset) => return CheckCodeOutcome::LockedUntilReset,
+            None => {}
         }
         if user
             .last_issued_at
@@ -611,14 +705,19 @@ impl EmailVerificationCodeStorage for InMemoryEmailVerificationCodeStorage {
         if entry.hash == hash_code(user_id, code) {
             user.code = None;
             user.failed_attempts = 0;
+            user.lockouts = 0;
             return CheckCodeOutcome::Verified;
         }
         entry.attempts += 1;
         user.failed_attempts += 1;
         if user.failed_attempts >= MAX_FAILED_ATTEMPTS {
             user.code = None;
-            user.locked_until = Some(now + chrono::Duration::seconds(self.lockout_secs));
-            return CheckCodeOutcome::TooManyAttempts;
+            return match user.lock(now, self.lockout_secs) {
+                Lock::Until(until) => CheckCodeOutcome::Locked {
+                    retry_after_secs: secs_until(until, now),
+                },
+                Lock::UntilReset => CheckCodeOutcome::LockedUntilReset,
+            };
         }
         if entry.attempts >= MAX_CODE_ATTEMPTS {
             user.code = None;
@@ -921,11 +1020,12 @@ mod tests {
     use crate::model::pkce::CodeChallengeMethod;
     use crate::model::user::{PasswordHash, User};
     use crate::storage::JwkStorage;
+    use crate::storage::in_memory::{CODE_DIGITS, MAX_LOCKOUTS, wrong_code};
     use crate::storage::in_memory::{
         InMemoryEmailVerificationCodeStorage, InMemoryLoginSessionStorage,
         InMemoryOidcStateStorage, InMemoryPasswordResetTokenStorage,
         InMemoryPendingOidcLinkStorage, InMemoryPkceStorage, InMemoryRefreshTokenStorage,
-        InMemoryUserStorage, InMemoryVerificationSessionStorage, UserCodes,
+        InMemoryUserStorage, InMemoryVerificationSessionStorage, Lock, UserCodes,
     };
     use crate::storage::{
         CheckCodeOutcome, CreateUserOutcome, EmailVerificationCodeStorage, ExpiryMaintenance,
@@ -1437,19 +1537,21 @@ mod tests {
     async fn issued(storage: &mut InMemoryEmailVerificationCodeStorage, user_id: Uuid) -> String {
         match storage.issue_code(user_id).await {
             IssueCodeOutcome::Issued(code) => code,
-            IssueCodeOutcome::CoolingDown | IssueCodeOutcome::Locked => {
+            IssueCodeOutcome::CoolingDown { .. }
+            | IssueCodeOutcome::Locked { .. }
+            | IssueCodeOutcome::LockedUntilReset => {
                 unreachable!("no cooldown or lock in these tests")
             }
         }
     }
 
     #[tokio::test]
-    async fn a_code_is_six_digits_and_works_once() {
+    async fn a_code_is_nine_digits_and_works_once() {
         let mut storage = codes();
         let user_id = Uuid::new_v4();
         let code = issued(&mut storage, user_id).await;
 
-        assert_eq!(code.len(), 6);
+        assert_eq!(code.len(), CODE_DIGITS);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(
             storage.check_code(user_id, &code).await,
@@ -1477,7 +1579,7 @@ mod tests {
         let mut storage = codes();
         let user_id = Uuid::new_v4();
         let code = issued(&mut storage, user_id).await;
-        let wrong = if code == "000000" { "000001" } else { "000000" };
+        let wrong = wrong_code(&code);
 
         assert_eq!(
             storage.check_code(user_id, wrong).await,
@@ -1494,7 +1596,7 @@ mod tests {
         let mut storage = codes();
         let user_id = Uuid::new_v4();
         let code = issued(&mut storage, user_id).await;
-        let wrong = if code == "000000" { "000001" } else { "000000" };
+        let wrong = wrong_code(&code);
 
         for _ in 0..4 {
             assert_eq!(
@@ -1545,15 +1647,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issuing_within_the_cooldown_reports_the_seconds_left() {
+        let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
+        let user_id = Uuid::new_v4();
+        let _ = issued(&mut storage, user_id).await;
+
+        let IssueCodeOutcome::CoolingDown { retry_after_secs } = storage.issue_code(user_id).await
+        else {
+            unreachable!("cooling down");
+        };
+        assert!((59..=60).contains(&retry_after_secs), "{retry_after_secs}");
+    }
+
+    #[tokio::test]
     async fn issuing_again_within_the_cooldown_changes_nothing() {
         let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
         let user_id = Uuid::new_v4();
         let code = issued(&mut storage, user_id).await;
 
-        assert_eq!(
+        assert!(matches!(
             storage.issue_code(user_id).await,
-            IssueCodeOutcome::CoolingDown
-        );
+            IssueCodeOutcome::CoolingDown { .. }
+        ));
         assert_eq!(
             storage.check_code(user_id, &code).await,
             CheckCodeOutcome::Verified
@@ -1610,15 +1725,15 @@ mod tests {
         let mut storage = InMemoryEmailVerificationCodeStorage::new(60, 60);
         let user_id = Uuid::new_v4();
         let code = issued(&mut storage, user_id).await;
-        let wrong = if code == "000000" { "000001" } else { "000000" };
+        let wrong = wrong_code(&code);
         for _ in 0..5 {
             let _ = storage.check_code(user_id, wrong).await;
         }
 
-        assert_eq!(
+        assert!(matches!(
             storage.issue_code(user_id).await,
-            IssueCodeOutcome::CoolingDown
-        );
+            IssueCodeOutcome::CoolingDown { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1631,10 +1746,10 @@ mod tests {
             CheckCodeOutcome::Verified
         );
 
-        assert_eq!(
+        assert!(matches!(
             storage.issue_code(user_id).await,
-            IssueCodeOutcome::CoolingDown
-        );
+            IssueCodeOutcome::CoolingDown { .. }
+        ));
     }
 
     // 10 wrong guesses across codes lock the user out: no further guesses
@@ -1645,7 +1760,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let mut code = issued(&mut storage, user_id).await;
         for round in 0..2 {
-            let wrong = if code == "000000" { "000001" } else { "000000" };
+            let wrong = wrong_code(&code);
             for _ in 0..5 {
                 let _ = storage.check_code(user_id, wrong).await;
             }
@@ -1654,11 +1769,19 @@ mod tests {
             }
         }
 
-        assert_eq!(
+        assert!(matches!(
             storage.check_code(user_id, &code).await,
-            CheckCodeOutcome::Locked
+            CheckCodeOutcome::Locked { .. }
+        ));
+        // Locked for the hour: the wait is reported to the second.
+        let IssueCodeOutcome::Locked { retry_after_secs } = storage.issue_code(user_id).await
+        else {
+            unreachable!("locked");
+        };
+        assert!(
+            (3_599..=3_600).contains(&retry_after_secs),
+            "{retry_after_secs}"
         );
-        assert_eq!(storage.issue_code(user_id).await, IssueCodeOutcome::Locked);
     }
 
     #[tokio::test]
@@ -1667,7 +1790,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         for _ in 0..3 {
             let code = issued(&mut storage, user_id).await;
-            let wrong = if code == "000000" { "000001" } else { "000000" };
+            let wrong = wrong_code(&code);
             for _ in 0..4 {
                 let _ = storage.check_code(user_id, wrong).await;
             }
@@ -1690,7 +1813,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let mut code = issued(&mut storage, user_id).await;
         for _ in 0..2 {
-            let wrong = if code == "000000" { "000001" } else { "000000" };
+            let wrong = wrong_code(&code);
             for _ in 0..5 {
                 let _ = storage.check_code(user_id, wrong).await;
             }
@@ -1706,6 +1829,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_tenth_wrong_guess_reports_the_lock_it_started() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        let mut code = issued(&mut storage, user_id).await;
+        let mut last = CheckCodeOutcome::Wrong;
+        for round in 0..2 {
+            let wrong = wrong_code(&code);
+            for _ in 0..5 {
+                last = storage.check_code(user_id, wrong).await;
+            }
+            if round == 0 {
+                assert_eq!(last, CheckCodeOutcome::TooManyAttempts);
+                code = issued(&mut storage, user_id).await;
+            }
+        }
+
+        assert!(
+            matches!(
+                last,
+                CheckCodeOutcome::Locked { retry_after_secs }
+                    if (3_599..=3_600).contains(&retry_after_secs)
+            ),
+            "{last:?}"
+        );
+    }
+
+    #[test]
+    fn each_lock_within_a_day_of_the_last_is_twice_as_long() {
+        let now = Utc::now();
+        let hour = chrono::Duration::hours(1);
+        let mut user = UserCodes::default();
+
+        assert_eq!(user.lock(now, 3_600), Lock::Until(now + hour));
+        let second = now + hour * 2;
+        assert_eq!(user.lock(second, 3_600), Lock::Until(second + hour * 2));
+        let third = second + hour * 5;
+        assert_eq!(user.lock(third, 3_600), Lock::Until(third + hour * 4));
+        // Forgotten after a quiet day: back to the first length.
+        let much_later = third + hour * 4 + hour * 25;
+        assert_eq!(user.lock(much_later, 3_600), Lock::Until(much_later + hour));
+    }
+
+    #[test]
+    fn the_lock_after_the_fifth_lasts_until_a_password_reset() {
+        let mut now = Utc::now();
+        let mut user = UserCodes::default();
+        for n in 0..MAX_LOCKOUTS {
+            assert!(matches!(user.lock(now, 3_600), Lock::Until(_)), "lock {n}");
+            now += chrono::Duration::hours(1 << n);
+        }
+
+        assert_eq!(user.lock(now, 3_600), Lock::UntilReset);
+        // A year later it is still in force, and the sweep keeps it.
+        let later = now + chrono::Duration::days(365);
+        assert_eq!(user.locked(later), Some(Lock::UntilReset));
+        assert!(user.still_needed(later, 900, 60, 3_600));
+    }
+
+    // Guessing keeps counting after a lock ends: every lock ends at once
+    // here, and the sixth still has to be the hard one.
+    #[tokio::test]
+    async fn repeated_wrong_guesses_keep_escalating_after_a_lock_ends() {
+        let mut storage = codes().with_lockout_secs(0);
+        let user_id = Uuid::new_v4();
+        let mut last = CheckCodeOutcome::Wrong;
+
+        for _ in 0..=MAX_LOCKOUTS {
+            for _ in 0..2 {
+                let code = issued(&mut storage, user_id).await;
+                for _ in 0..5 {
+                    last = storage.check_code(user_id, wrong_code(&code)).await;
+                }
+            }
+        }
+
+        assert_eq!(last, CheckCodeOutcome::LockedUntilReset);
+    }
+
+    #[tokio::test]
+    async fn a_hard_lock_refuses_codes_and_issuing_until_the_user_is_cleared() {
+        let mut storage = codes();
+        let user_id = Uuid::new_v4();
+        storage.hard_lock(user_id).await;
+
+        assert_eq!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::LockedUntilReset
+        );
+        assert_eq!(
+            storage.check_code(user_id, "123456789").await,
+            CheckCodeOutcome::LockedUntilReset
+        );
+
+        assert_eq!(storage.clear_user(user_id).await, RevokeOutcome::Ok);
+        assert!(matches!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::Issued(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn clearing_a_user_removes_the_lock_the_cooldown_and_the_code() {
         let mut storage = codes();
         let user_id = Uuid::new_v4();
@@ -1713,7 +1937,7 @@ mod tests {
         let mut code = issued(&mut storage, user_id).await;
         let other_code = issued(&mut storage, other).await;
         for _ in 0..2 {
-            let wrong = if code == "000000" { "000001" } else { "000000" };
+            let wrong = wrong_code(&code);
             for _ in 0..5 {
                 let _ = storage.check_code(user_id, wrong).await;
             }
@@ -1721,7 +1945,10 @@ mod tests {
                 code = next;
             }
         }
-        assert_eq!(storage.issue_code(user_id).await, IssueCodeOutcome::Locked);
+        assert!(matches!(
+            storage.issue_code(user_id).await,
+            IssueCodeOutcome::Locked { .. }
+        ));
 
         assert_eq!(storage.clear_user(user_id).await, RevokeOutcome::Ok);
 
@@ -1752,14 +1979,21 @@ mod tests {
             last_issued_at: long_ago,
             failed_attempts,
             locked_until,
+            lockouts: 0,
+            locked_until_reset: false,
         };
 
         assert!(
             user(10, Some(now + chrono::Duration::hours(1)))
                 .still_needed(now, ttl, cooldown, lockout)
         );
+        // An ended lock is remembered for a day, so the next one can be longer.
         assert!(
-            !user(10, Some(now - chrono::Duration::seconds(1)))
+            user(10, Some(now - chrono::Duration::seconds(1)))
+                .still_needed(now, ttl, cooldown, lockout)
+        );
+        assert!(
+            !user(10, Some(now - chrono::Duration::hours(25)))
                 .still_needed(now, ttl, cooldown, lockout)
         );
         assert!(!user(0, None).still_needed(now, ttl, cooldown, lockout));
@@ -1769,6 +2003,8 @@ mod tests {
             last_issued_at: Some(now - chrono::Duration::minutes(30)),
             failed_attempts: 3,
             locked_until: None,
+            lockouts: 0,
+            locked_until_reset: false,
         };
         assert!(recent.still_needed(now, ttl, cooldown, lockout));
         let recent_without_failures = UserCodes {

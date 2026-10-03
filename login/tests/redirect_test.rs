@@ -317,6 +317,14 @@ async fn verify_email_page_reports_each_outcome() {
     for (status, marker, forms) in [
         ("invalid", "id=\"verify-invalid\"", true),
         ("sent", "id=\"verify-sent\"", true),
+        ("cooling_down", "id=\"verify-cooling-down\"", true),
+        ("locked", "id=\"verify-locked\"", false),
+        (
+            "locked_until_reset",
+            "id=\"verify-locked-until-reset\"",
+            false,
+        ),
+        ("code_used_up", "id=\"verify-code-used-up\"", true),
         ("session_expired", "id=\"verify-session-expired\"", false),
         ("", "id=\"verify-intro\"", true),
     ] {
@@ -332,7 +340,88 @@ async fn verify_email_page_reports_each_outcome() {
         let body = body_string(resp).await;
         assert!(body.contains(marker), "{status}: {body}");
         assert_eq!(body.contains("id=\"verify-form\""), forms, "{status}");
+        // Signing in again can't lift a hard lock, so that page has no link.
+        assert_eq!(
+            body.contains("id=\"login-link\""),
+            !forms && status != "locked_until_reset",
+            "{status}: a page without forms offers signing in again, except when locked for good"
+        );
     }
+}
+
+#[tokio::test]
+async fn verify_email_page_shows_a_lockout_in_minutes_and_the_code_validity() {
+    for (query, expected) in [
+        (
+            "status=locked&retry_after=3600",
+            "sign in again in 60 minutes",
+        ),
+        ("status=cooling_down&retry_after=300", "in 5 minutes."),
+        ("status=sent&expires_in=900", "valid for 15 minutes"),
+    ] {
+        let resp = app(test_config())
+            .oneshot(
+                Request::get(format!("/verify-email.html?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = body_string(resp).await;
+        assert!(body.contains(expected), "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_short_cooldown_gets_a_countdown_and_a_long_one_does_not() {
+    for (retry_after, countdown) in [(42, true), (119, true), (120, false), (3600, false)] {
+        let resp = app(test_config())
+            .oneshot(
+                Request::get(format!(
+                    "/verify-email.html?status=cooling_down&retry_after={retry_after}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = body_string(resp).await;
+        assert_eq!(
+            body.contains(&format!("data-countdown=\"{retry_after}\"")),
+            countdown,
+            "{retry_after}: {body}"
+        );
+        // The only script is the same-origin file, and only with a countdown.
+        assert_eq!(
+            body.contains("<script src=\"/countdown.js\" defer></script>"),
+            countdown,
+            "{retry_after}"
+        );
+        assert_eq!(body.matches("<script").count(), usize::from(countdown));
+        // Without the script the page still reads right.
+        if countdown {
+            assert!(
+                body.contains(&format!(
+                    "in <span class=\"countdown-number\">{retry_after}</span>"
+                )),
+                "{body}"
+            );
+            assert!(body.contains("class=\"countdown-ready\" hidden"), "{body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_countdown_script_is_served() {
+    let resp = app(test_config())
+        .oneshot(Request::get("/countdown.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains("data-countdown"));
 }
 
 #[tokio::test]

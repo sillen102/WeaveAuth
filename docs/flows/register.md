@@ -78,7 +78,7 @@ Order matters here; each step gates the next.
   email was taken in the meantime. `email_verified` is `false` until the address is
   confirmed, by entering the emailed code ([verify email](verify-email.md)) or by an OIDC provider
   (see [OIDC](oidc.md)).
-- With an `email_handler` configured, a verification email with a 6-digit code is then sent
+- With an `email_handler` configured, a verification email with a 9-digit code is then sent
   in a background task. If backend requires verification, bff's auto-login then gets only a
   verification session and sends the new user to the code page rather than into the app
   ([verify email](verify-email.md)). A delivery failure is logged and does not fail the registration, and

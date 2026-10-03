@@ -42,7 +42,7 @@ pub struct Config {
     /// and clicking a link, not just a redirect round-trip.
     pub password_reset_token_ttl_secs: i64,
     /// How long an emailed verification code stays valid. Short, since a
-    /// 6-digit code is guessable (it also dies after a few wrong attempts).
+    /// 9-digit code is guessable (it also dies after a few wrong attempts).
     pub email_verification_code_ttl_secs: i64,
     /// Minimum time between two verification emails to the same user, so the
     /// resend endpoint can't be used to flood an inbox or to keep replacing

@@ -74,7 +74,7 @@ release. A plugin only has to handle the hooks it's wired into; return
 
 - Called after a user registers, and again on every resend request, when
   `email_handler` is `kind: plugin`. `user_id` and `email` identify the
-  account; `data` carries `code` (the 6-digit code to put in the mail),
+  account; `data` carries `code` (the 9-digit code to put in the mail),
   `verify_page_url` (login's `/verify-email.html`, where it is entered) and
   `expires_at` (RFC 3339, UTC). The call runs in a background task, so a slow
   plugin never delays the user's request.

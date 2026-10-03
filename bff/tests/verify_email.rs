@@ -33,7 +33,7 @@ fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
 
 /// Backend stub. `/oauth/login`: "required@x" gets only a verification
 /// session (verification required), "optional@x" gets both, anyone else a
-/// plain login session. Session "good-session" + code "123456" releases a
+/// plain login session. Session "good-session" + code "123456789" releases a
 /// login session; another code is a 400, another session a 401. Resend
 /// requests are recorded.
 async fn stub_backend()
@@ -62,9 +62,31 @@ async fn stub_backend()
         .route(
             "/oauth/email-verification/confirm",
             post(|Json(body): Json<serde_json::Value>| async move {
-                if body["verification_session"] != "good-session" {
+                if body["verification_session"] == "locked-session" {
+                    (
+                        StatusCode::LOCKED,
+                        Json(serde_json::json!({"status": "locked", "retry_after_secs": 3600})),
+                    )
+                        .into_response()
+                } else if body["verification_session"] == "hard-session" {
+                    (
+                        StatusCode::LOCKED,
+                        Json(serde_json::json!({"status": "locked_until_reset"})),
+                    )
+                        .into_response()
+                } else if body["verification_session"] == "used-up-session" {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "timestamp": chrono::Utc::now(),
+                            "reason": "CodeUsedUp",
+                            "details": "email verification code used up by wrong attempts"
+                        })),
+                    )
+                        .into_response()
+                } else if body["verification_session"] != "good-session" {
                     StatusCode::UNAUTHORIZED.into_response()
-                } else if body["code"] == "123456" {
+                } else if body["code"] == "123456789" {
                     Json(serde_json::json!({"login_session": "stub-session"})).into_response()
                 } else {
                     StatusCode::BAD_REQUEST.into_response()
@@ -76,11 +98,34 @@ async fn stub_backend()
             post(move |Json(body): Json<serde_json::Value>| {
                 let recorded = recorded.clone();
                 async move {
-                    if body["verification_session"] != "good-session" {
-                        return StatusCode::UNAUTHORIZED;
+                    match body["verification_session"].as_str() {
+                        Some("good-session") => {
+                            recorded.lock().unwrap().push("resent".to_string());
+                            (
+                                StatusCode::ACCEPTED,
+                                Json(serde_json::json!({"status": "sent", "expires_in_secs": 900})),
+                            )
+                                .into_response()
+                        }
+                        Some("cooling-session") => (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!(
+                                {"status": "cooling_down", "retry_after_secs": 42}
+                            )),
+                        )
+                            .into_response(),
+                        Some("locked-session") => (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({"status": "locked", "retry_after_secs": 3600})),
+                        )
+                            .into_response(),
+                        Some("hard-session") => (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({"status": "locked_until_reset"})),
+                        )
+                            .into_response(),
+                        _ => StatusCode::UNAUTHORIZED.into_response(),
                     }
-                    recorded.lock().unwrap().push("resent".to_string());
-                    StatusCode::ACCEPTED
                 }
             }),
         )
@@ -229,7 +274,7 @@ async fn the_right_code_completes_the_login_and_lands_on_the_destination() -> an
     let resp = post_form(
         backend,
         "/verify-email",
-        &format!("code=123456&{REDIRECT}&{NEXT}"),
+        &format!("code=123456789&{REDIRECT}&{NEXT}"),
         LOGIN,
         Some(GOOD_COOKIE),
     )
@@ -260,7 +305,7 @@ async fn a_wrong_code_bounces_back_without_a_session() -> anyhow::Result<()> {
     let resp = post_form(
         backend,
         "/verify-email",
-        &format!("code=000000&{REDIRECT}&{NEXT}"),
+        &format!("code=000000000&{REDIRECT}&{NEXT}"),
         LOGIN,
         Some(GOOD_COOKIE),
     )
@@ -282,7 +327,7 @@ async fn a_missing_or_unknown_verification_session_asks_for_a_new_login() -> any
         let resp = post_form(
             backend.clone(),
             "/verify-email",
-            &format!("code=123456&{REDIRECT}&{NEXT}"),
+            &format!("code=123456789&{REDIRECT}&{NEXT}"),
             LOGIN,
             cookie,
         )
@@ -317,12 +362,137 @@ async fn resend_uses_the_verification_session() -> anyhow::Result<()> {
 
     assert_eq!(
         location(&resp),
-        Some("http://login.test/verify-email.html?status=sent")
+        Some("http://login.test/verify-email.html?status=sent&expires_in=900")
     );
     assert_eq!(requested.lock().unwrap().len(), 1);
     assert_eq!(
         location(&without),
         Some("http://login.test/verify-email.html?status=session_expired")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resend_inside_the_cooldown_bounces_with_the_seconds_left() -> anyhow::Result<()> {
+    let (backend, _, _h) = stub_backend().await?;
+
+    let resp = post_form(
+        backend,
+        "/verify-email/resend",
+        NEXT,
+        LOGIN,
+        Some("wa_verify_session=cooling-session"),
+    )
+    .await?;
+
+    assert_eq!(
+        location(&resp),
+        Some("http://login.test/verify-email.html?status=cooling_down&retry_after=42")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resend_while_locked_out_bounces_as_locked_with_the_seconds_left() -> anyhow::Result<()> {
+    let (backend, _, _h) = stub_backend().await?;
+
+    let resp = post_form(
+        backend,
+        "/verify-email/resend",
+        NEXT,
+        LOGIN,
+        Some("wa_verify_session=locked-session"),
+    )
+    .await?;
+
+    assert_eq!(
+        location(&resp),
+        Some("http://login.test/verify-email.html?status=locked&retry_after=3600")
+    );
+    assert!(
+        set_cookies(&resp)
+            .iter()
+            .any(|c| c.starts_with("wa_verify_session=;") && c.contains("Max-Age=0")),
+        "{:?}",
+        set_cookies(&resp)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn entering_a_code_while_locked_out_bounces_as_locked_and_clears_the_cookie()
+-> anyhow::Result<()> {
+    let (backend, _, _h) = stub_backend().await?;
+
+    for (cookie, expected) in [
+        (
+            "wa_verify_session=locked-session",
+            "http://login.test/verify-email.html?status=locked&retry_after=3600",
+        ),
+        (
+            "wa_verify_session=hard-session",
+            "http://login.test/verify-email.html?status=locked_until_reset",
+        ),
+    ] {
+        let resp = post_form(
+            backend.clone(),
+            "/verify-email",
+            &format!("code=123456789&{REDIRECT}&{NEXT}"),
+            LOGIN,
+            Some(cookie),
+        )
+        .await?;
+
+        assert_eq!(location(&resp), Some(expected), "{cookie}");
+        assert!(
+            set_cookies(&resp)
+                .iter()
+                .any(|c| c.starts_with("wa_verify_session=;") && c.contains("Max-Age=0")),
+            "{cookie}: {:?}",
+            set_cookies(&resp)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_code_used_up_by_wrong_guesses_bounces_as_code_used_up_and_keeps_the_session()
+-> anyhow::Result<()> {
+    let (backend, _, _h) = stub_backend().await?;
+
+    let resp = post_form(
+        backend,
+        "/verify-email",
+        &format!("code=000000000&{REDIRECT}&{NEXT}"),
+        LOGIN,
+        Some("wa_verify_session=used-up-session"),
+    )
+    .await?;
+
+    assert_eq!(
+        location(&resp),
+        Some("http://login.test/verify-email.html?status=code_used_up")
+    );
+    assert!(set_cookies(&resp).is_empty(), "{:?}", set_cookies(&resp));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resend_while_hard_locked_bounces_as_locked_until_reset() -> anyhow::Result<()> {
+    let (backend, _, _h) = stub_backend().await?;
+
+    let resp = post_form(
+        backend,
+        "/verify-email/resend",
+        NEXT,
+        LOGIN,
+        Some("wa_verify_session=hard-session"),
+    )
+    .await?;
+
+    assert_eq!(
+        location(&resp),
+        Some("http://login.test/verify-email.html?status=locked_until_reset")
     );
     Ok(())
 }
@@ -334,7 +504,7 @@ async fn an_untrusted_origin_is_refused_without_contacting_backend() -> anyhow::
     let verify = post_form(
         backend.clone(),
         "/verify-email",
-        &format!("code=123456&{REDIRECT}&{NEXT}"),
+        &format!("code=123456789&{REDIRECT}&{NEXT}"),
         "http://evil.test",
         Some(GOOD_COOKIE),
     )
@@ -362,7 +532,7 @@ async fn a_next_outside_the_trusted_origins_is_refused() -> anyhow::Result<()> {
         let resp = post_form(
             backend.clone(),
             path,
-            &format!("code=123456&{REDIRECT}&next=http%3A%2F%2Fevil.test%2F"),
+            &format!("code=123456789&{REDIRECT}&next=http%3A%2F%2Fevil.test%2F"),
             LOGIN,
             Some(GOOD_COOKIE),
         )

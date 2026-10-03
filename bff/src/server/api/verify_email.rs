@@ -90,13 +90,17 @@ mod controller {
     }
 
     /// Like `bounce`, and drops the verification cookie: backend no longer
-    /// knows the session, so keeping it would only repeat the failure.
-    fn bounce_session_expired(state: &AppState, next: &str) -> Response {
-        let mut response = bounce(next, "session_expired");
+    /// knows the session, or it can't be used for anything meanwhile.
+    fn bounce_clearing_session(state: &AppState, next: &str, status: &str) -> Response {
+        let mut response = bounce(next, status);
         if let Ok(value) = clear_verification_cookie(&state.config).parse() {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
         response
+    }
+
+    fn bounce_session_expired(state: &AppState, next: &str) -> Response {
+        bounce_clearing_session(state, next, "session_expired")
     }
 
     fn check_request(
@@ -114,7 +118,7 @@ mod controller {
         Ok(())
     }
 
-    /// Submits the 6-digit code with the restricted verification session the
+    /// Submits the 9-digit code with the restricted verification session the
     /// login handed out (in its own cookie, sent to this path only). A right
     /// code makes backend release the login session it withheld, which this
     /// completes into a real session on the spot -- so the user ends up where
@@ -147,6 +151,17 @@ mod controller {
             )
                 .into_response()),
             CodeOutcome::InvalidCode => Ok(bounce(&req.next, "invalid")),
+            CodeOutcome::CodeUsedUp => Ok(bounce(&req.next, "code_used_up")),
+            CodeOutcome::Locked { retry_after_secs } => Ok(bounce_clearing_session(
+                &state,
+                &req.next,
+                &format!("locked&retry_after={retry_after_secs}"),
+            )),
+            CodeOutcome::LockedUntilReset => Ok(bounce_clearing_session(
+                &state,
+                &req.next,
+                "locked_until_reset",
+            )),
             CodeOutcome::SessionExpired => Ok(bounce_session_expired(&state, &req.next)),
         }
     }
@@ -162,7 +177,24 @@ mod controller {
         };
 
         match service::resend(&state, &verification_session).await? {
-            ResendOutcome::Accepted => Ok(bounce(&req.next, "sent")),
+            ResendOutcome::Sent { expires_in_secs } => Ok(bounce(
+                &req.next,
+                &format!("sent&expires_in={expires_in_secs}"),
+            )),
+            ResendOutcome::CoolingDown { retry_after_secs } => Ok(bounce(
+                &req.next,
+                &format!("cooling_down&retry_after={retry_after_secs}"),
+            )),
+            ResendOutcome::Locked { retry_after_secs } => Ok(bounce_clearing_session(
+                &state,
+                &req.next,
+                &format!("locked&retry_after={retry_after_secs}"),
+            )),
+            ResendOutcome::LockedUntilReset => Ok(bounce_clearing_session(
+                &state,
+                &req.next,
+                "locked_until_reset",
+            )),
             ResendOutcome::SessionExpired => Ok(bounce_session_expired(&state, &req.next)),
         }
     }
@@ -172,6 +204,8 @@ mod service {
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
+
+    use common::model::error_response::ErrorResponse;
 
     use crate::server::AppState;
     use crate::server::api::complete_login::{CompleteLoginServiceError, complete_login};
@@ -187,15 +221,48 @@ mod service {
     pub(crate) enum CodeOutcome {
         /// `Set-Cookie` header value for the new session.
         LoggedIn { cookie: String },
-        /// Wrong, expired or used-up code.
+        /// Wrong or expired code.
         InvalidCode,
+        /// Too many wrong attempts deleted the code; a new one is needed.
+        CodeUsedUp,
+        /// Locked out after too many wrong guesses, even for the right code.
+        Locked { retry_after_secs: i64 },
+        /// Locked out too many times, until the password is reset.
+        LockedUntilReset,
         /// Backend doesn't know the verification session (any more).
         SessionExpired,
     }
 
     pub(crate) enum ResendOutcome {
-        Accepted,
+        Sent {
+            expires_in_secs: i64,
+        },
+        /// Backend sent nothing: a code went out too recently.
+        CoolingDown {
+            retry_after_secs: i64,
+        },
+        /// Backend sent nothing: too many wrong guesses.
+        Locked {
+            retry_after_secs: i64,
+        },
+        LockedUntilReset,
         SessionExpired,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum RequestResponse {
+        Sent { expires_in_secs: i64 },
+        CoolingDown { retry_after_secs: i64 },
+        Locked { retry_after_secs: i64 },
+        LockedUntilReset,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum ConfirmLocked {
+        Locked { retry_after_secs: i64 },
+        LockedUntilReset,
     }
 
     #[derive(Serialize)]
@@ -240,7 +307,31 @@ mod service {
             })?;
 
         match response.status() {
-            StatusCode::BAD_REQUEST => return Ok(CodeOutcome::InvalidCode),
+            StatusCode::BAD_REQUEST => {
+                let used_up = response
+                    .json::<ErrorResponse>()
+                    .await
+                    .is_ok_and(|body| body.reason == "CodeUsedUp");
+                return Ok(if used_up {
+                    CodeOutcome::CodeUsedUp
+                } else {
+                    CodeOutcome::InvalidCode
+                });
+            }
+            StatusCode::LOCKED => {
+                let locked: ConfirmLocked = response.json().await.map_err(|error| {
+                    VerifyEmailServiceError::BackendUnavailable(format!(
+                        "email verification confirm lock response unreadable: {}",
+                        common::error::cause_chain(&error.without_url())
+                    ))
+                })?;
+                return Ok(match locked {
+                    ConfirmLocked::Locked { retry_after_secs } => {
+                        CodeOutcome::Locked { retry_after_secs }
+                    }
+                    ConfirmLocked::LockedUntilReset => CodeOutcome::LockedUntilReset,
+                });
+            }
             StatusCode::UNAUTHORIZED => return Ok(CodeOutcome::SessionExpired),
             status if !status.is_success() => {
                 return Err(VerifyEmailServiceError::BackendUnavailable(format!(
@@ -283,11 +374,29 @@ mod service {
             })?;
 
         match response.status() {
-            status if status.is_success() => Ok(ResendOutcome::Accepted),
-            StatusCode::UNAUTHORIZED => Ok(ResendOutcome::SessionExpired),
-            status => Err(VerifyEmailServiceError::BackendUnavailable(format!(
-                "email verification request returned {status}"
-            ))),
+            status if status.is_success() => {}
+            StatusCode::UNAUTHORIZED => return Ok(ResendOutcome::SessionExpired),
+            status => {
+                return Err(VerifyEmailServiceError::BackendUnavailable(format!(
+                    "email verification request returned {status}"
+                )));
+            }
         }
+        let outcome: RequestResponse = response.json().await.map_err(|error| {
+            VerifyEmailServiceError::BackendUnavailable(format!(
+                "email verification request response unreadable: {}",
+                common::error::cause_chain(&error.without_url())
+            ))
+        })?;
+        Ok(match outcome {
+            RequestResponse::Sent { expires_in_secs } => ResendOutcome::Sent { expires_in_secs },
+            RequestResponse::CoolingDown { retry_after_secs } => {
+                ResendOutcome::CoolingDown { retry_after_secs }
+            }
+            RequestResponse::Locked { retry_after_secs } => {
+                ResendOutcome::Locked { retry_after_secs }
+            }
+            RequestResponse::LockedUntilReset => ResendOutcome::LockedUntilReset,
+        })
     }
 }

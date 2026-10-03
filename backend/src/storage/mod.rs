@@ -344,12 +344,14 @@ pub(crate) trait PasswordResetTokenStorage {
 #[derive(Debug, Eq, PartialEq)]
 #[must_use]
 pub(crate) enum IssueCodeOutcome {
-    /// The new 6-digit code; any earlier one for the user is gone.
+    /// The new 9-digit code; any earlier one for the user is gone.
     Issued(String),
     /// A code was issued too recently; nothing changed.
-    CoolingDown,
+    CoolingDown { retry_after_secs: i64 },
     /// Too many wrong guesses lately; no code is issued until the lock ends.
-    Locked,
+    Locked { retry_after_secs: i64 },
+    /// Locked out too many times; nothing is issued until a password reset.
+    LockedUntilReset,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -360,17 +362,22 @@ pub(crate) enum CheckCodeOutcome {
     Wrong,
     /// No code was issued, or it expired.
     NoCode,
-    /// This wrong guess used up the allowed attempts; the code is gone (and,
-    /// after enough of them in a row, the user is locked out for a while).
+    /// This wrong guess used up the allowed attempts; the code is gone.
     TooManyAttempts,
-    /// Locked out after too many wrong guesses; even the right code fails.
-    Locked,
+    /// Locked out after too many wrong guesses (this one may have been the
+    /// last); even the right code fails until the lock ends.
+    Locked {
+        retry_after_secs: i64,
+    },
+    /// Locked out too many times; even the right code fails until a password
+    /// reset.
+    LockedUntilReset,
 }
 
-/// A short-lived 6-digit code proving whoever enters it controls the inbox
-/// the verification email went to. Six digits are guessable, so a code only
-/// survives a few wrong attempts, issuing is rate-limited per user, and
-/// enough wrong guesses in total lock the user out for a while. The
+/// A short-lived 9-digit code proving whoever enters it controls the inbox
+/// the verification email went to. Even nine digits are guessable online, so
+/// a code only survives a few wrong attempts, issuing is rate-limited per
+/// user, and enough wrong guesses in total lock the user out for a while. The
 /// rate limit and the lock outlive any single code: they are kept per user,
 /// not per code, so deleting a spent code never resets them.
 pub(crate) trait EmailVerificationCodeStorage {

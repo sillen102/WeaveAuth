@@ -139,9 +139,14 @@ struct PageQuery {
     redirect_uri: Option<String>,
     error: Option<String>,
     email: Option<String>,
-    /// What bff bounced back with on the verification page: `invalid`, `sent`
-    /// or `session_expired`.
+    /// What bff bounced back with on the verification page: `invalid`, `sent`,
+    /// `cooling_down`, `code_used_up`, `locked`, `locked_until_reset` or
+    /// `session_expired`.
     status: Option<String>,
+    /// Seconds until a new code can be requested, with `cooling_down` or `locked`.
+    retry_after: Option<u64>,
+    /// Seconds the new code stays valid, with `sent`.
+    expires_in: Option<u64>,
 }
 
 /// A malformed query string (a repeated key, say) renders the page as a plain
@@ -184,6 +189,20 @@ async fn verify_email_page(
     render_page("verify-email.html", &config, uri.path(), &query)
 }
 
+/// Waits shorter than this are spelled out in seconds, and the page counts
+/// them down; longer ones are rounded up to minutes and stay static.
+const SHORT_WAIT_SECS: u64 = 120;
+
+/// "1 second", "42 seconds", "2 minutes": minutes (rounded up) from two on.
+fn human_duration(secs: u64) -> String {
+    let (n, unit) = if secs < SHORT_WAIT_SECS {
+        (secs, "second")
+    } else {
+        (secs.div_ceil(60), "minute")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Renders one of the deployer-replaceable page templates, computing the
 /// same values their inline scripts used to compute client-side:
 /// `redirect_uri` (falling back to this service's own origin), and
@@ -212,6 +231,12 @@ fn render_page(
     ctx.insert("error", &query.error);
     ctx.insert("email", &query.email);
     ctx.insert("status", &query.status);
+    ctx.insert("retry_after", &query.retry_after.map(human_duration));
+    ctx.insert(
+        "countdown_secs",
+        &query.retry_after.filter(|secs| *secs < SHORT_WAIT_SECS),
+    );
+    ctx.insert("expires_in", &query.expires_in.map(human_duration));
 
     let mut tera = Tera::new();
     tera.register_filter("urlencode", urlencode_filter);

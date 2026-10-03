@@ -228,6 +228,7 @@ mod tests {
     use super::controller::*;
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
+    use crate::server::api::email_verification::test_support::lock_out;
     use crate::storage::{CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome};
     use crate::storage::{
         LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage,
@@ -439,33 +440,15 @@ mod tests {
         let _ = state.users.create_user(user).await;
         state.email_verification.codes =
             crate::storage::in_memory::InMemoryEmailVerificationCodeStorage::new(900, 0);
-        let mut code = match state.email_verification.codes.issue_code(user_id).await {
-            IssueCodeOutcome::Issued(code) => code,
-            _ => unreachable!("fresh user"),
-        };
-        for _ in 0..2 {
-            let wrong = if code == "000000" { "000001" } else { "000000" };
-            for _ in 0..5 {
-                let _ = state
-                    .email_verification
-                    .codes
-                    .check_code(user_id, wrong)
-                    .await;
-            }
-            if let IssueCodeOutcome::Issued(next) =
-                state.email_verification.codes.issue_code(user_id).await
-            {
-                code = next;
-            }
-        }
-        assert_eq!(
+        lock_out(&mut state, user_id).await;
+        assert!(matches!(
             state
                 .email_verification
                 .codes
-                .check_code(user_id, &code)
+                .check_code(user_id, "123456789")
                 .await,
-            CheckCodeOutcome::Locked
-        );
+            CheckCodeOutcome::Locked { .. }
+        ));
         let token = state.password_reset_tokens.save_reset_token(user_id).await;
 
         let req = PasswordResetConfirmRequest {
