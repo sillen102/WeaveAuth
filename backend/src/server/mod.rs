@@ -1,16 +1,12 @@
 use crate::config::{
-    Config, EmailHandlerConfig, ExtraDataHandlerConfig, JWT_KEY_PUBLISH_AHEAD_SECS,
-    LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig, jwt_key_grace_secs,
+    Config, EmailHandlerConfig, HandlerConfig, JWT_KEY_PUBLISH_AHEAD_SECS, OidcProviderConfig,
+    PluginHook, PluginSettings, ProfileApiConfig, WebhookConfig, jwt_key_grace_secs,
 };
 use crate::oidc::{self, OidcClient};
 use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
-use crate::server::api::email_verification::{
-    self, EmailVerification, EmailVerificationHandler, PLUGIN_NAME as EMAIL_PLUGIN_NAME,
-};
-use crate::server::api::register::{self, ExtraDataHandler, PLUGIN_NAME as EXTRA_DATA_PLUGIN_NAME};
-use crate::server::api::token::{
-    self, LoginClaimsHandler, PLUGIN_NAME as LOGIN_CLAIMS_PLUGIN_NAME,
-};
+use crate::server::api::email_verification::{self, EmailVerification, EmailVerificationHandler};
+use crate::server::api::register::{self, ExtraDataHandler};
+use crate::server::api::token::{self, LoginClaimsHandler};
 use crate::server::router::router;
 use crate::storage::in_memory::{
     InMemoryEmailVerificationCodeStorage, InMemoryJwkStorage, InMemoryLoginSessionStorage,
@@ -156,7 +152,8 @@ impl AppState {
                 .build()?,
         );
         let oidc_providers =
-            oidc::build_providers(&config.oidc_providers, &oidc_http_client).await?;
+            oidc::build_providers(&config.oidc_providers, &config.bff_url, &oidc_http_client)
+                .await?;
         let extra_data_handler = build_extra_data_handler(
             config.extra_data_handler.as_ref(),
             config.setuid_helper.as_deref(),
@@ -167,9 +164,6 @@ impl AppState {
             config.setuid_helper.as_deref(),
         )
         .await?;
-        if config.email_handler.is_some() && config.login_public_url.is_none() {
-            anyhow::bail!("email_handler is configured but login_public_url is not set");
-        }
         let email_handler = build_email_handler(
             config.email_handler.as_ref(),
             config.setuid_helper.as_deref(),
@@ -177,15 +171,15 @@ impl AppState {
         .await?;
 
         Ok(Self {
-            pkce: InMemoryPkceStorage::new(config.pkce_code_ttl_secs),
+            pkce: InMemoryPkceStorage::new(config.tuning.pkce_code_ttl_secs),
             users: InMemoryUserStorage::new(),
-            login_sessions: InMemoryLoginSessionStorage::new(config.login_session_ttl_secs),
+            login_sessions: InMemoryLoginSessionStorage::new(config.tuning.login_session_ttl_secs),
             redirect_uri_allowlist: Arc::new(config.redirect_uri_allowlist.clone()),
             jwt_keys: InMemoryJwkStorage::new()?,
             access_token_ttl_secs: config.access_token_ttl_secs,
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
-            jwt_key_rotation_interval_secs: config.jwt_key_rotation_interval_secs,
+            jwt_key_rotation_interval_secs: config.rotation_interval_secs(),
             issuer: config.issuer.as_str().into(),
             oidc_providers: Arc::new(oidc_providers),
             oidc_profile_apis: Arc::new(
@@ -216,28 +210,28 @@ impl AppState {
                     .map(|(name, p)| (name.clone(), p.extra_claims.clone()))
                     .collect(),
             ),
-            oidc_state: InMemoryOidcStateStorage::new(config.oidc_state_ttl_secs),
+            oidc_state: InMemoryOidcStateStorage::new(config.tuning.oidc_state_ttl_secs),
             pending_oidc_links: InMemoryPendingOidcLinkStorage::new(
-                config.pending_oidc_link_ttl_secs,
+                config.tuning.pending_oidc_link_ttl_secs,
             ),
             oidc_http_client,
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(
-                config.password_reset_token_ttl_secs,
+                config.tuning.password_reset_token_ttl_secs,
             ),
-            max_bcrypt_cost: config.max_bcrypt_cost,
+            max_bcrypt_cost: config.tuning.max_bcrypt_cost,
             extra_data_handler,
             login_claims_handler,
             email_verification: EmailVerification {
                 codes: InMemoryEmailVerificationCodeStorage::new(
-                    config.email_verification_code_ttl_secs,
-                    config.email_verification_resend_cooldown_secs,
+                    config.tuning.email_verification_code_ttl_secs,
+                    config.tuning.email_verification_resend_cooldown_secs,
                 ),
                 sessions: InMemoryVerificationSessionStorage::new(
-                    config.email_verification_session_ttl_secs,
+                    config.tuning.email_verification_session_ttl_secs,
                 ),
                 handler: email_handler,
                 login_public_url: config.login_public_url.clone(),
-                code_ttl_secs: config.email_verification_code_ttl_secs,
+                code_ttl_secs: config.tuning.email_verification_code_ttl_secs,
                 required: config.require_verified_email,
             },
         })
@@ -245,44 +239,16 @@ impl AppState {
 }
 
 async fn build_extra_data_handler(
-    config: Option<&ExtraDataHandlerConfig>,
+    config: Option<&HandlerConfig>,
     setuid_helper: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn ExtraDataHandler>>> {
     let handler: Arc<dyn ExtraDataHandler> = match config {
         None => return Ok(None),
-        Some(ExtraDataHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
+        Some(HandlerConfig::Webhook(WebhookConfig { url, timeout_secs })) => Arc::new(
             register::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
         ),
-        Some(ExtraDataHandlerConfig::Plugin {
-            command,
-            args,
-            env,
-            timeout_secs,
-            startup_timeout_secs,
-            uid,
-            gid,
-        }) => {
-            // Ambient `WA_PLUGIN_REGISTRATION_ENV_*` first, then the config
-            // file, so a deployer can override an inherited value without
-            // unsetting it.
-            let mut plugin_env: HashMap<_, _> =
-                forwarded_env(std::env::vars_os(), EXTRA_DATA_PLUGIN_NAME)
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-                    .collect();
-            plugin_env.extend(env.clone());
-
-            let plugin = PluginProcess::start(PluginConfig {
-                command: command.clone(),
-                args: args.clone(),
-                env: plugin_env,
-                timeout: Duration::from_secs(*timeout_secs),
-                startup_timeout: Duration::from_secs(*startup_timeout_secs),
-                uid: *uid,
-                gid: *gid,
-                setuid_helper: setuid_helper.map(PathBuf::from),
-            })
-            .await?;
+        Some(HandlerConfig::Plugin(settings)) => {
+            let plugin = start_plugin(settings, PluginHook::Registration, setuid_helper).await?;
             Arc::new(register::PluginHandler::new(plugin))
         }
     };
@@ -290,44 +256,16 @@ async fn build_extra_data_handler(
 }
 
 async fn build_login_claims_handler(
-    config: Option<&LoginClaimsHandlerConfig>,
+    config: Option<&HandlerConfig>,
     setuid_helper: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn LoginClaimsHandler>>> {
     let handler: Arc<dyn LoginClaimsHandler> = match config {
         None => return Ok(None),
-        Some(LoginClaimsHandlerConfig::Webhook { url, timeout_secs }) => Arc::new(
+        Some(HandlerConfig::Webhook(WebhookConfig { url, timeout_secs })) => Arc::new(
             token::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
         ),
-        Some(LoginClaimsHandlerConfig::Plugin {
-            command,
-            args,
-            env,
-            timeout_secs,
-            startup_timeout_secs,
-            uid,
-            gid,
-        }) => {
-            // Ambient `WA_PLUGIN_LOGIN_CLAIMS_ENV_*` first, then the config
-            // file, so a deployer can override an inherited value without
-            // unsetting it.
-            let mut plugin_env: HashMap<_, _> =
-                forwarded_env(std::env::vars_os(), LOGIN_CLAIMS_PLUGIN_NAME)
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-                    .collect();
-            plugin_env.extend(env.clone());
-
-            let plugin = PluginProcess::start(PluginConfig {
-                command: command.clone(),
-                args: args.clone(),
-                env: plugin_env,
-                timeout: Duration::from_secs(*timeout_secs),
-                startup_timeout: Duration::from_secs(*startup_timeout_secs),
-                uid: *uid,
-                gid: *gid,
-                setuid_helper: setuid_helper.map(PathBuf::from),
-            })
-            .await?;
+        Some(HandlerConfig::Plugin(settings)) => {
+            let plugin = start_plugin(settings, PluginHook::LoginClaims, setuid_helper).await?;
             Arc::new(token::PluginHandler::new(plugin))
         }
     };
@@ -357,44 +295,45 @@ async fn build_email_handler(
             Duration::from_secs(*timeout_secs),
             email_verification::TEMPLATES_GLOB,
         )?),
-        Some(EmailHandlerConfig::Webhook { url, timeout_secs }) => {
+        Some(EmailHandlerConfig::Webhook(WebhookConfig { url, timeout_secs })) => {
             Arc::new(email_verification::WebhookHandler::new(
                 url.clone(),
                 Duration::from_secs(*timeout_secs),
             )?)
         }
-        Some(EmailHandlerConfig::Plugin {
-            command,
-            args,
-            env,
-            timeout_secs,
-            startup_timeout_secs,
-            uid,
-            gid,
-        }) => {
-            // Ambient `WA_PLUGIN_EMAIL_ENV_*` first, then the config file.
-            let mut plugin_env: HashMap<_, _> =
-                forwarded_env(std::env::vars_os(), EMAIL_PLUGIN_NAME)
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-                    .collect();
-            plugin_env.extend(env.clone());
-
-            let plugin = PluginProcess::start(PluginConfig {
-                command: command.clone(),
-                args: args.clone(),
-                env: plugin_env,
-                timeout: Duration::from_secs(*timeout_secs),
-                startup_timeout: Duration::from_secs(*startup_timeout_secs),
-                uid: *uid,
-                gid: *gid,
-                setuid_helper: setuid_helper.map(PathBuf::from),
-            })
-            .await?;
+        Some(EmailHandlerConfig::Plugin(settings)) => {
+            let plugin = start_plugin(settings, PluginHook::Email, setuid_helper).await?;
             Arc::new(email_verification::PluginHandler::new(plugin))
         }
     };
     Ok(Some(handler))
+}
+
+/// Starts the plugin for `hook`. The ambient `WA_PLUGIN_<NAME>_ENV_*`
+/// variables go in first, then the config file's `env`, so a deployer can
+/// override an inherited value without unsetting it.
+async fn start_plugin(
+    settings: &PluginSettings,
+    hook: PluginHook,
+    setuid_helper: Option<&str>,
+) -> anyhow::Result<PluginProcess> {
+    let mut env: HashMap<_, _> = forwarded_env(std::env::vars_os(), hook.name())
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+        .collect();
+    env.extend(settings.env.clone());
+
+    PluginProcess::start(PluginConfig {
+        command: settings.command.clone(),
+        args: settings.args.clone(),
+        env,
+        timeout: Duration::from_secs(settings.timeout_secs),
+        startup_timeout: Duration::from_secs(settings.startup_timeout_secs),
+        uid: settings.uid.unwrap_or_else(|| hook.default_id()),
+        gid: settings.gid.unwrap_or_else(|| hook.default_id()),
+        setuid_helper: setuid_helper.map(PathBuf::from),
+    })
+    .await
 }
 
 fn smtp_credentials(
@@ -416,7 +355,7 @@ pub async fn app_start(config: &Config) -> anyhow::Result<()> {
     let state = AppState::new(config).await?;
     spawn_expiry_sweep(
         state.clone(),
-        Duration::from_secs(config.expiry_sweep_interval_secs),
+        Duration::from_secs(common::config::EXPIRY_SWEEP_INTERVAL_SECS),
     );
 
     axum::serve(listener, router(state)).await?;
@@ -525,29 +464,29 @@ mod tests {
         assert_ne!(state.jwt_keys.active_key().await.kid, kid);
     }
 
-    fn webhook_pair() -> (ExtraDataHandlerConfig, LoginClaimsHandlerConfig) {
+    fn webhook_pair() -> (HandlerConfig, HandlerConfig) {
         (
-            ExtraDataHandlerConfig::Webhook {
+            HandlerConfig::Webhook(WebhookConfig {
                 url: "http://localhost:1/hook".to_string(),
                 timeout_secs: 1,
-            },
-            LoginClaimsHandlerConfig::Webhook {
+            }),
+            HandlerConfig::Webhook(WebhookConfig {
                 url: "http://localhost:1/claims".to_string(),
                 timeout_secs: 1,
-            },
+            }),
         )
     }
 
     fn config_with_extra_claims(
-        handler: Option<ExtraDataHandlerConfig>,
-        login_claims: Option<LoginClaimsHandlerConfig>,
+        handler: Option<HandlerConfig>,
+        login_claims: Option<HandlerConfig>,
     ) -> Config {
         let provider = OidcProviderConfig {
             client_id: "id".to_string(),
             client_secret: "secret".to_string().into(),
             // Unreachable: the check under test must fire before discovery.
             issuer: "http://127.0.0.1:1".to_string(),
-            redirect_uri: "http://localhost/callback".to_string(),
+            redirect_uri: Some("http://localhost/callback".to_string()),
             display_name: None,
             extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
             scopes: vec!["email".to_string()],
@@ -580,31 +519,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_start_with_an_email_handler_but_no_login_public_url() {
+    async fn starts_with_a_webhook_email_handler() {
         let config = Config {
-            email_handler: Some(EmailHandlerConfig::Webhook {
+            email_handler: Some(EmailHandlerConfig::Webhook(WebhookConfig {
                 url: "http://localhost:1/email".to_string(),
                 timeout_secs: 1,
-            }),
-            ..Config::default()
-        };
-
-        let error = AppState::new(&config).await.err().expect("startup fails");
-
-        assert!(
-            error.to_string().contains("login_public_url"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn starts_with_an_email_handler_and_a_login_public_url() {
-        let config = Config {
-            email_handler: Some(EmailHandlerConfig::Webhook {
-                url: "http://localhost:1/email".to_string(),
-                timeout_secs: 1,
-            }),
-            login_public_url: Some("http://localhost:8081".to_string()),
+            })),
             ..Config::default()
         };
 
@@ -625,7 +545,6 @@ mod tests {
                 from: "no-reply@example.com".to_string(),
                 timeout_secs: 1,
             }),
-            login_public_url: Some("http://localhost:8081".to_string()),
             ..Config::default()
         };
 
@@ -637,16 +556,15 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_missing_email_plugin_command_at_startup() {
         let config = Config {
-            email_handler: Some(EmailHandlerConfig::Plugin {
+            email_handler: Some(EmailHandlerConfig::Plugin(PluginSettings {
                 command: "/nonexistent/mailer".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 timeout_secs: 1,
                 startup_timeout_secs: 1,
-                uid: 1003,
-                gid: 1003,
-            }),
-            login_public_url: Some("http://localhost:8081".to_string()),
+                uid: Some(1003),
+                gid: Some(1003),
+            })),
             ..Config::default()
         };
 
@@ -665,7 +583,6 @@ mod tests {
                 from: "no-reply@example.com".to_string(),
                 timeout_secs: 1,
             }),
-            login_public_url: Some("http://localhost:8081".to_string()),
             ..Config::default()
         };
 

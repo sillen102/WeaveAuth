@@ -41,9 +41,8 @@ fn test_config(backend_url: String, routes: Vec<RouteConfig>) -> Config {
         routes,
         trusted_origins: vec!["http://login.test".into()],
         rate_limit_max_attempts: 1000,
-        rate_limit_window_secs: 60,
-        expiry_sweep_interval_secs: 60,
         docs_enabled: false,
+        login_public_url: "http://login.test".into(),
     }
 }
 
@@ -411,7 +410,6 @@ async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
     let (backend, _bh) = stub_backend().await?;
     let mut config = test_config(backend, vec![]);
     config.rate_limit_max_attempts = 1;
-    config.rate_limit_window_secs = 60;
     let app = app(config).unwrap();
 
     for _ in 0..5 {
@@ -431,7 +429,6 @@ async fn proxy_rate_limit_is_independent_from_the_auth_bucket() -> anyhow::Resul
     let (backend, _bh) = stub_backend().await?;
     let mut config = test_config(backend, vec![]);
     config.rate_limit_max_attempts = 1;
-    config.rate_limit_window_secs = 60;
     let app = app(config).unwrap();
 
     let first_proxy_hit = app

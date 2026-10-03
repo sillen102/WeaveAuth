@@ -3,36 +3,37 @@
 
 use std::collections::HashMap;
 
-use weaveauth::config::{ExtraDataHandlerConfig, LoginClaimsHandlerConfig};
+use weaveauth::config::{HandlerConfig, PluginSettings};
+
+/// A plugin running `command` as this process's own user.
+pub fn plugin_settings(
+    command: &str,
+    env: HashMap<String, String>,
+    timeout_secs: u64,
+) -> PluginSettings {
+    PluginSettings {
+        command: command.to_string(),
+        args: vec![],
+        env,
+        timeout_secs,
+        startup_timeout_secs: 10,
+        uid: Some(current_id("-u")),
+        gid: Some(current_id("-g")),
+    }
+}
 
 /// A backend `extra_data_handler` running `command`.
 pub fn plugin_handler(
     command: &str,
     env: HashMap<String, String>,
     timeout_secs: u64,
-) -> ExtraDataHandlerConfig {
-    ExtraDataHandlerConfig::Plugin {
-        command: command.to_string(),
-        args: vec![],
-        env,
-        timeout_secs,
-        startup_timeout_secs: 10,
-        uid: current_id("-u"),
-        gid: current_id("-g"),
-    }
+) -> HandlerConfig {
+    HandlerConfig::Plugin(plugin_settings(command, env, timeout_secs))
 }
 
 /// A backend `login_claims_handler` running `command`.
-pub fn login_claims_handler(command: &str, timeout_secs: u64) -> LoginClaimsHandlerConfig {
-    LoginClaimsHandlerConfig::Plugin {
-        command: command.to_string(),
-        args: vec![],
-        env: HashMap::new(),
-        timeout_secs,
-        startup_timeout_secs: 10,
-        uid: current_id("-u"),
-        gid: current_id("-g"),
-    }
+pub fn login_claims_handler(command: &str, timeout_secs: u64) -> HandlerConfig {
+    plugin_handler(command, HashMap::new(), timeout_secs)
 }
 
 /// This process's own uid (`-u`) or gid (`-g`): a plugin is always spawned

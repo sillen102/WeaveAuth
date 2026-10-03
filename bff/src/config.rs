@@ -1,7 +1,4 @@
-use std::env;
-
-use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Yaml};
+use common::config::{EnvTable, Profile, PublicUrl};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,8 +10,12 @@ pub struct RouteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
+    /// Bff's own public origin.
     pub bff_url: String,
     pub backend_url: String,
+    /// Login's public origin: the one origin trusted to POST to `/login` and
+    /// `/register` unless `trusted_origins` says otherwise.
+    pub login_public_url: String,
     pub session_cookie_name: String,
     /// Proxy routes: incoming requests whose path starts with `path_prefix` are
     /// forwarded to `upstream_url` (prefix stripped) with the session's access
@@ -25,23 +26,23 @@ pub struct Config {
     /// request's `Origin` header, falling back to `Referer`) -- these are plain
     /// cross-origin form POSTs by design, so without this check any site could
     /// auto-submit one and log a victim into an attacker-controlled account
-    /// ("login CSRF").
+    /// ("login CSRF"). Unset: just `login_public_url`.
     pub trusted_origins: Vec<String>,
     /// Max `/login` or `/register` attempts a single client IP gets within
-    /// `rate_limit_window_secs`, independently for each endpoint -- Argon2 raises
+    /// [`RATE_LIMIT_WINDOW_SECS`], independently for each endpoint -- Argon2 raises
     /// the cost of a single guess, but doesn't stop a flood of guesses or
-    /// registration spam on its own.
+    /// registration spam on its own. Unset: 10 for prod, 100 for dev.
     pub rate_limit_max_attempts: u32,
-    pub rate_limit_window_secs: u64,
-    /// How often the background task sweeps expired sessions out of the
-    /// session store. Bounds how long a dead session's leftovers linger.
-    pub expiry_sweep_interval_secs: u64,
     /// Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`).
-    /// Off by default: bff is the internet-facing service, and these are
-    /// unauthenticated endpoints describing the auth surface, so a
-    /// deployment has to opt in rather than opt out.
+    /// Unset: on for dev only. bff is the internet-facing service, and these
+    /// are unauthenticated endpoints describing the auth surface, so a
+    /// production deployment has to opt in.
     pub docs_enabled: bool,
 }
+
+/// The window [`Config::rate_limit_max_attempts`] applies over; the bucket
+/// replenishes at `max_attempts / window` per second.
+pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 impl Default for Config {
     fn default() -> Self {
@@ -49,16 +50,29 @@ impl Default for Config {
             port: 8080,
             bff_url: "http://localhost:8080".to_string(),
             backend_url: "http://localhost:1983".to_string(),
+            login_public_url: "http://localhost:8081".to_string(),
             session_cookie_name: "wa_session".to_string(),
             routes: Vec::new(),
             trusted_origins: vec!["http://localhost:8081".to_string()],
             rate_limit_max_attempts: 10,
-            rate_limit_window_secs: 60,
-            expiry_sweep_interval_secs: 60,
             docs_enabled: false,
         }
     }
 }
+
+/// The scalar settings that have an env var; `WA_TRUSTED_ORIGINS` is a list.
+const ENV: EnvTable = &[
+    ("WA_PROFILE", "profile"),
+    ("WA_BFF_PORT", "port"),
+    ("WA_BFF_URL", "bff_url"),
+    ("WA_BACKEND_URL", "backend_url"),
+    ("WA_LOGIN_PUBLIC_URL", "login_public_url"),
+    ("WA_SESSION_COOKIE_NAME", "session_cookie_name"),
+    ("WA_RATE_LIMIT_MAX_ATTEMPTS", "rate_limit_max_attempts"),
+    ("WA_DOCS_ENABLED", "docs_enabled"),
+];
+
+const ENV_LISTS: EnvTable = &[("WA_TRUSTED_ORIGINS", "trusted_origins")];
 
 impl Config {
     /// Whether cookies should carry the `Secure` flag -- derived from `bff_url`
@@ -70,64 +84,36 @@ impl Config {
     /// Loads config, layering (highest precedence last): built-in defaults,
     /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`; a
     /// missing file is not an error, one that exists but can't be read is),
-    /// then `WA_*` env vars.
+    /// then the `WA_*` env vars in [`ENV`]. What the deployer left unset is
+    /// then derived: `trusted_origins` from `login_public_url`, and the rate
+    /// limit and `docs_enabled` from the profile.
     pub fn load() -> Result<Self, anyhow::Error> {
-        // A missing .env is normal; a present but malformed one would otherwise be dropped silently.
-        if let Err(error) = dotenvy::dotenv()
-            && !error.not_found()
-        {
-            anyhow::bail!("could not load .env: {error}");
+        common::config::load_dotenv()?;
+        let user = common::config::user_settings(true, ENV, ENV_LISTS)?;
+        let profile = common::config::profile(&user)?;
+        let mut config: Config = common::config::extract(Config::default(), &user)?;
+        common::config::require_https_in_prod(
+            profile,
+            &[
+                ("WA_BFF_URL", &config.bff_url, PublicUrl::Base),
+                (
+                    "WA_LOGIN_PUBLIC_URL",
+                    &config.login_public_url,
+                    PublicUrl::Origin,
+                ),
+            ],
+        )?;
+        // Compared verbatim with browsers' `Origin` header, which has no trailing `/`.
+        config.login_public_url = config.login_public_url.trim_end_matches('/').to_string();
+
+        if !user.contains("trusted_origins") {
+            config.trusted_origins = vec![config.login_public_url.clone()];
         }
-
-        let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
-        // Figment treats a file it can't open like a missing one. Missing is
-        // fine (no overlay); present but unreadable is a deployment mistake
-        // that would otherwise run on defaults, dropping every setting in it.
-        if let Err(error) = std::fs::File::open(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            anyhow::bail!("could not read config file {path:?}: {error}");
+        if !user.contains("rate_limit_max_attempts") && profile == Profile::Dev {
+            config.rate_limit_max_attempts = 100;
         }
-
-        // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
-        // `login::Config::own_origin`) -- when the two run side by side, it's
-        // also the one bff should trust by default, so seed the built-in
-        // default from it before the YAML file/`WA_TRUSTED_ORIGINS` env var
-        // (below) get a chance to override it.
-        let mut defaults = Config::default();
-        if let Ok(login_url) = env::var("WA_LOGIN_PUBLIC_URL") {
-            defaults.trusted_origins = vec![login_url];
-        }
-
-        let mut config: Config = Figment::from(Serialized::defaults(defaults))
-            .merge(Yaml::file(&path))
-            // `WA_BFF_PORT`/`WA_BACKEND_URL` etc don't map 1:1 to their field
-            // names, and `routes`/`trusted_origins` need custom handling below
-            // (routes has no env shape at all; trusted_origins is a
-            // comma-separated string, not Figment's `[a, b]` array syntax).
-            .merge(
-                Env::raw()
-                    .map(|k| match k.as_str() {
-                        "WA_BFF_PORT" => "port".into(),
-                        "WA_BFF_URL" => "bff_url".into(),
-                        "WA_BACKEND_URL" => "backend_url".into(),
-                        "WA_SESSION_COOKIE_NAME" => "session_cookie_name".into(),
-                        "WA_RATE_LIMIT_MAX_ATTEMPTS" => "rate_limit_max_attempts".into(),
-                        "WA_RATE_LIMIT_WINDOW_SECS" => "rate_limit_window_secs".into(),
-                        "WA_EXPIRY_SWEEP_INTERVAL_SECS" => "expiry_sweep_interval_secs".into(),
-                        "WA_DOCS_ENABLED" => "docs_enabled".into(),
-                        _ => "_ignored".into(),
-                    })
-                    .ignore(&["_ignored"]),
-            )
-            .extract()?;
-
-        if let Ok(raw) = env::var("WA_TRUSTED_ORIGINS") {
-            config.trusted_origins = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+        if !user.contains("docs_enabled") {
+            config.docs_enabled = profile == Profile::Dev;
         }
 
         Ok(config)
@@ -142,44 +128,23 @@ mod tests {
     use super::*;
     use figment::Jail;
 
-    // A file that exists but can't be read is a deployment mistake, and
-    // running on defaults instead would quietly drop every setting in it. A
-    // path through a regular file can't be opened even by root, unlike a
-    // `chmod 000` file.
-    #[test]
-    fn refuses_a_config_file_it_cannot_read() {
-        Jail::expect_with(|jail| {
-            jail.create_file("config.yaml", "port: 1984\n")?;
-            jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
-
-            let error =
-                Config::load().expect_err("an unreadable config must not fall back to defaults");
-
-            assert!(
-                error.to_string().contains("config.yaml/nested.yaml"),
-                "unhelpful error: {error}"
-            );
-            Ok(())
-        });
-    }
-
     #[test]
     fn defaults_when_no_env_and_no_file() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
 
             let config = Config::load().unwrap();
             assert_eq!(config.port, 8080);
-            assert_eq!(config.bff_url, "http://localhost:8080");
             assert_eq!(config.backend_url, "http://localhost:1983");
             assert_eq!(config.session_cookie_name, "wa_session");
             assert!(config.routes.is_empty());
             assert_eq!(
                 config.trusted_origins,
-                vec!["http://localhost:8081".to_string()]
+                vec!["https://login.test".to_string()]
             );
             assert_eq!(config.rate_limit_max_attempts, 10);
-            assert_eq!(config.rate_limit_window_secs, 60);
             assert!(
                 !config.docs_enabled,
                 "docs must stay off unless explicitly enabled"
@@ -204,10 +169,10 @@ routes:
 trusted_origins:
   - "http://file-login.test"
 rate_limit_max_attempts: 5
-rate_limit_window_secs: 30
 "#,
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert_eq!(config.port, 9999);
@@ -226,7 +191,6 @@ rate_limit_window_secs: 30
                 vec!["http://file-login.test".to_string()]
             );
             assert_eq!(config.rate_limit_max_attempts, 5);
-            assert_eq!(config.rate_limit_window_secs, 30);
             Ok(())
         });
     }
@@ -245,6 +209,7 @@ routes:
 "#,
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_BFF_PORT", "7000");
             jail.set_env("WA_BFF_URL", "http://env.test:7000");
 
@@ -261,6 +226,7 @@ routes:
     fn missing_file_falls_back_to_defaults_even_with_other_env_set() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_SESSION_COOKIE_NAME", "custom_cookie");
 
             let config = Config::load().unwrap();
@@ -281,6 +247,7 @@ trusted_origins:
 "#,
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_TRUSTED_ORIGINS", "http://a.test , http://b.test,,");
 
             let config = Config::load().unwrap();
@@ -295,6 +262,7 @@ trusted_origins:
     #[test]
     fn trusted_origins_defaults_to_login_public_url_when_unset() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
 
             let config = Config::load().unwrap();
@@ -309,6 +277,7 @@ trusted_origins:
     #[test]
     fn explicit_trusted_origins_still_wins_over_login_public_url() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
             jail.set_env("WA_TRUSTED_ORIGINS", "https://other.test");
 
@@ -322,22 +291,120 @@ trusted_origins:
     }
 
     #[test]
+    fn a_trailing_slash_on_the_login_public_url_is_not_carried_into_trusted_origins() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test/");
+
+            assert_eq!(
+                Config::load().unwrap().trusted_origins,
+                vec!["https://login.env.test".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_refuses_to_start_on_localhost_defaults() {
+        for (bff_url, login_url, missing) in [
+            (None, Some("https://login.test"), "WA_BFF_URL"),
+            (Some("https://bff.test"), None, "WA_LOGIN_PUBLIC_URL"),
+            (
+                Some("http://bff.test"),
+                Some("https://login.test"),
+                "WA_BFF_URL",
+            ),
+        ] {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                if let Some(url) = bff_url {
+                    jail.set_env("WA_BFF_URL", url);
+                }
+                if let Some(url) = login_url {
+                    jail.set_env("WA_LOGIN_PUBLIC_URL", url);
+                }
+
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains(missing), "{error}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn prod_starts_once_its_public_urls_are_set() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+
+            let config = Config::load().unwrap();
+            assert!(config.secure_cookies());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_dev_profile_loosens_the_rate_limit_and_turns_docs_on() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_PROFILE", "dev");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.rate_limit_max_attempts, 100);
+            assert!(config.docs_enabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn explicit_values_win_over_the_dev_profile() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_RATE_LIMIT_MAX_ATTEMPTS", "7");
+            jail.set_env("WA_DOCS_ENABLED", "false");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.rate_limit_max_attempts, 7);
+            assert!(!config.docs_enabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn trusted_origins_follow_a_login_public_url_set_in_the_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "login_public_url: https://login.file.test\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+
+            assert_eq!(
+                Config::load().unwrap().trusted_origins,
+                vec!["https://login.file.test".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn rate_limit_env_vars_override_file_values() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
                 r#"
 rate_limit_max_attempts: 5
-rate_limit_window_secs: 30
 "#,
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_RATE_LIMIT_MAX_ATTEMPTS", "3");
-            jail.set_env("WA_RATE_LIMIT_WINDOW_SECS", "15");
 
             let config = Config::load().unwrap();
             assert_eq!(config.rate_limit_max_attempts, 3);
-            assert_eq!(config.rate_limit_window_secs, 15);
             Ok(())
         });
     }

@@ -34,7 +34,7 @@ fn backend_config_for(providers: Vec<(&str, String, String)>) -> weaveauth::conf
                     client_id: fake_idp::CLIENT_ID.to_string(),
                     client_secret: fake_idp::CLIENT_SECRET.to_string().into(),
                     issuer,
-                    redirect_uri,
+                    redirect_uri: Some(redirect_uri),
                     display_name: None,
                     extra_claims: Default::default(),
                     scopes: vec!["email".to_string(), "profile".to_string()],

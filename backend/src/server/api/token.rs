@@ -1,6 +1,6 @@
 pub(crate) use controller::issue_token;
 pub(crate) use controller::issue_token_doc;
-pub(crate) use login_claims::{LoginClaimsHandler, PLUGIN_NAME, PluginHandler, WebhookHandler};
+pub(crate) use login_claims::{LoginClaimsHandler, PluginHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -369,10 +369,6 @@ mod login_claims {
 
     use crate::plugin::{self, PluginProcess};
 
-    /// Names this plugin surface in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables a
-    /// deployer sets. Upper case because environment variables are.
-    pub(crate) const PLUGIN_NAME: &str = "LOGIN_CLAIMS";
-
     /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
     const HOOK: &str = "login_claims";
 
@@ -385,7 +381,7 @@ mod login_claims {
     pub(crate) struct LoginClaimsError(pub(crate) String);
 
     /// Implemented by whatever a deployer configures to supply extra JWT
-    /// claims at token issuance (see `config::LoginClaimsHandlerConfig`).
+    /// claims at token issuance (see `config::HandlerConfig`).
     /// Called on every token mint (both `authorization_code` and
     /// `refresh_token` grants). An error fails the whole request -- no token
     /// is issued.

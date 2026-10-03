@@ -1,19 +1,24 @@
-use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Yaml};
+use common::config::{EnvTable, Profile, PublicUrl};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 
+/// Deployer-facing settings. Everything else a deployment might want to tune
+/// is either derived from these (see [`Config::load`]) or fixed in [`Tuning`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
+    /// Bff's public origin: where an OIDC provider's callback lands, so the
+    /// default `redirect_uri` of each provider is built from it.
+    pub bff_url: String,
+    /// Login's public origin: the default `redirect_uri_allowlist` and where
+    /// the verification link in an email points. Stored without a trailing `/`
+    /// (see [`Config::load`]); a hand-built `Config` must keep that.
+    pub login_public_url: String,
+    /// Valid `redirect_uri` values for `/oauth/authorize`. Unset: login's
+    /// own origin with a trailing `/` (the check is an exact string match).
     pub redirect_uri_allowlist: Vec<String>,
-    pub pkce_code_ttl_secs: i64,
-    /// How long a `/oauth/login` session token stays valid for the follow-up
-    /// `/oauth/authorize` call -- just a server-to-server hop, so this is
-    /// deliberately short-lived.
-    pub login_session_ttl_secs: i64,
     /// How long an access token issued by `/oauth/token` stays valid for.
     pub access_token_ttl_secs: i64,
     /// How long a refresh token stays redeemable before it must be re-issued
@@ -24,44 +29,17 @@ pub struct Config {
     /// [`jwt_key_grace_secs()`] after that, and the next key is published
     /// [`JWT_KEY_PUBLISH_AHEAD_SECS`] before it starts signing. The grace
     /// plus that lead must fit inside this interval, so at most two keys
-    /// are published at once.
-    pub jwt_key_rotation_interval_secs: i64,
+    /// are published at once. Unset: [`Config::rotation_interval_secs`].
+    #[serde(default)]
+    pub jwt_key_rotation_interval_secs: Option<i64>,
     /// The `iss` claim on access tokens, and the base URL verifiers fetch
     /// `/.well-known/openid-configuration` from, so it must be backend's
-    /// address as they reach it. Validated at load (http(s), no user info,
-    /// path, query or fragment) and stored normalized: scheme and host
-    /// lowercased, default port and trailing `/` dropped. That normalized
-    /// form is what `iss` carries.
+    /// address as they reach it (`WA_BACKEND_URL`, the same value bff uses to
+    /// reach it). Unset: `http://localhost:{port}`. Validated at load (http(s),
+    /// no user info, path, query or fragment) and stored normalized: scheme
+    /// and host lowercased, default port and trailing `/` dropped. That
+    /// normalized form is what `iss` carries.
     pub issuer: String,
-    /// How long a state entry for an in-flight `/oauth/oidc/login`
-    /// redirect stays valid while the user is off at the provider's consent
-    /// screen.
-    pub oidc_state_ttl_secs: i64,
-    /// How long a pending OIDC-to-password-account link (see
-    /// `/oauth/oidc/confirm-link`) stays valid while waiting for the caller
-    /// to supply the existing account's password. Deliberately roomier than
-    /// `oidc_state_ttl_secs` -- this one waits on a human reading a prompt
-    /// and typing a password, not just a redirect round-trip.
-    pub pending_oidc_link_ttl_secs: i64,
-    /// How long a `/oauth/password-reset/request` token stays redeemable via
-    /// `/oauth/password-reset/confirm`. Deliberately roomier than
-    /// `oidc_state_ttl_secs` -- this one waits on a human reading an email
-    /// and clicking a link, not just a redirect round-trip.
-    pub password_reset_token_ttl_secs: i64,
-    /// How long an emailed verification code stays valid. Short, since a
-    /// 9-digit code is guessable (it also dies after a few wrong attempts).
-    pub email_verification_code_ttl_secs: i64,
-    /// Minimum time between two verification emails to the same user, so the
-    /// resend endpoint can't be used to flood an inbox or to keep replacing
-    /// the code the user is about to type.
-    pub email_verification_resend_cooldown_secs: i64,
-    /// How long the restricted session `/oauth/login` hands an unverified
-    /// account (good only for entering the code) stays valid.
-    pub email_verification_session_ttl_secs: i64,
-    /// How often the background task sweeps expired entries out of the
-    /// TTL'd stores (PKCE challenges, OIDC state, login sessions, ...).
-    /// Bounds how long an abandoned flow's leftovers linger.
-    pub expiry_sweep_interval_secs: u64,
     /// Third-party OIDC login providers, keyed by a short name used in the
     /// `provider` query param (e.g. "google" for `/oauth/oidc/login?provider=google`). Empty by
     /// default -- third-party login is a no-op unless a provider is
@@ -70,23 +48,19 @@ pub struct Config {
     /// `skip_serializing` because `OidcProviderConfig` doesn't derive
     /// `Serialize` (it holds a `SecretString`, and serializing it would
     /// expose the client secret) -- `default` fills it back in from
-    /// `Config::default()` on the deserialize side, since `Config::load`'s
-    /// defaults layer never sees it.
+    /// `Config::default()` on the deserialize side, since the defaults layer
+    /// never sees it.
     #[serde(default, skip_serializing)]
     pub oidc_providers: HashMap<String, OidcProviderConfig>,
-    /// Highest bcrypt cost factor accepted when verifying an imported
-    /// legacy-user hash (see `crypto::verify_password`) -- caps how long a
-    /// single login can tie up a blocking-pool thread.
-    pub max_bcrypt_cost: u32,
     /// How extra fields on a register request (anything beyond
     /// `email`/`password`) are handled. `None` means extra fields aren't
     /// supported -- a register request carrying any is rejected.
     #[serde(default)]
-    pub extra_data_handler: Option<ExtraDataHandlerConfig>,
+    pub extra_data_handler: Option<HandlerConfig>,
     /// Where extra JWT claims are fetched from on every token mint. `None`
     /// means no extra claims are added.
     #[serde(default)]
-    pub login_claims_handler: Option<LoginClaimsHandlerConfig>,
+    pub login_claims_handler: Option<HandlerConfig>,
     /// The `weaveauth-plugin-exec` binary to start plugins through. It is
     /// the one that holds `CAP_SETUID`/`CAP_SETGID`, so this process needs
     /// none. Unset, backend switches users itself, which needs
@@ -98,13 +72,65 @@ pub struct Config {
     /// means no email is sent (the resend endpoint then does nothing).
     #[serde(default, skip_serializing)]
     pub email_handler: Option<EmailHandlerConfig>,
-    /// Login's public origin (`WA_LOGIN_PUBLIC_URL`), where the verification
-    /// link points. Required when `email_handler` is set.
-    #[serde(default)]
-    pub login_public_url: Option<String>,
     /// Refuse `/oauth/login` for accounts whose email isn't verified yet.
+    /// Unset: on for the prod profile when an `email_handler` is configured.
     #[serde(default)]
     pub require_verified_email: bool,
+    /// Code-only; a `tuning:` key in YAML is ignored.
+    #[serde(skip)]
+    pub tuning: Tuning,
+}
+
+/// Lifetimes and limits nobody needs to tune per deployment: not settable from
+/// YAML or the environment, only from code (tests shorten them).
+#[derive(Debug, Clone)]
+pub struct Tuning {
+    /// How long an issued PKCE auth code stays redeemable.
+    pub pkce_code_ttl_secs: i64,
+    /// How long a `/oauth/login` session token stays valid for the follow-up
+    /// `/oauth/authorize` call -- just a server-to-server hop, so deliberately short.
+    pub login_session_ttl_secs: i64,
+    /// How long a state entry for an in-flight `/oauth/oidc/login` redirect
+    /// stays valid while the user is off at the provider's consent screen.
+    pub oidc_state_ttl_secs: i64,
+    /// How long a pending OIDC-to-password-account link (see
+    /// `/oauth/oidc/confirm-link`) waits for the caller to supply the existing
+    /// account's password. Roomier than `oidc_state_ttl_secs`: it waits on a
+    /// human typing, not a redirect round-trip.
+    pub pending_oidc_link_ttl_secs: i64,
+    /// How long a `/oauth/password-reset/request` token stays redeemable.
+    /// Roomy: it waits on a human reading an email and clicking a link.
+    pub password_reset_token_ttl_secs: i64,
+    /// How long an emailed verification code stays valid. Short, since a
+    /// 9-digit code is guessable (it also dies after a few wrong attempts).
+    pub email_verification_code_ttl_secs: i64,
+    /// Minimum time between two verification emails to the same user, so the
+    /// resend endpoint can't flood an inbox or keep replacing the code the
+    /// user is about to type.
+    pub email_verification_resend_cooldown_secs: i64,
+    /// How long the restricted session `/oauth/login` hands an unverified
+    /// account (good only for entering the code) stays valid.
+    pub email_verification_session_ttl_secs: i64,
+    /// Highest bcrypt cost factor accepted when verifying an imported
+    /// legacy-user hash (see `crypto::verify_password`) -- caps how long a
+    /// single login can tie up a blocking-pool thread.
+    pub max_bcrypt_cost: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            pkce_code_ttl_secs: 300,
+            login_session_ttl_secs: 60,
+            oidc_state_ttl_secs: 300,
+            pending_oidc_link_ttl_secs: 600,
+            password_reset_token_ttl_secs: 1_800,
+            email_verification_code_ttl_secs: 900,
+            email_verification_resend_cooldown_secs: 60,
+            email_verification_session_ttl_secs: 1_800,
+            max_bcrypt_cost: bcrypt::DEFAULT_COST,
+        }
+    }
 }
 
 /// How a verification email is delivered. An error from any kind is logged
@@ -130,30 +156,10 @@ pub enum EmailHandlerConfig {
         timeout_secs: u64,
     },
     /// POSTs `{user_id, email, token, verify_url, expires_at}` as JSON to
-    /// this URL; the downstream service sends the email. Same https rule as
-    /// [`ExtraDataHandlerConfig::Webhook`].
-    Webhook {
-        url: String,
-        #[serde(default = "default_webhook_timeout_secs")]
-        timeout_secs: u64,
-    },
+    /// this URL; the downstream service sends the email.
+    Webhook(WebhookConfig),
     /// Calls a plugin process with the `email_verification` hook.
-    Plugin {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-        #[serde(default)]
-        env: HashMap<String, String>,
-        #[serde(default = "default_plugin_timeout_secs")]
-        timeout_secs: u64,
-        #[serde(default = "default_plugin_startup_timeout_secs")]
-        startup_timeout_secs: u64,
-        /// The user the plugin runs as, see [`default_email_plugin_id`].
-        #[serde(default = "default_email_plugin_id")]
-        uid: u32,
-        #[serde(default = "default_email_plugin_id")]
-        gid: u32,
-    },
+    Plugin(PluginSettings),
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
@@ -168,99 +174,92 @@ pub enum SmtpTls {
     None,
 }
 
-/// Where extra registration fields are forwarded. An error from either kind
-/// fails the whole registration; nothing is ever persisted by WeaveAuth
-/// itself -- see `extra_data`.
+/// Where a hook's data goes: the extra registration fields
+/// (`extra_data_handler`, an error fails the registration; nothing is ever
+/// persisted by WeaveAuth itself, see `extra_data`) or the claims lookup on
+/// every token mint (`login_claims_handler`, both `authorization_code` and
+/// `refresh_token` grants; an error fails the token request, so no token is
+/// issued without the claims it's configured to carry, see `login_claims`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ExtraDataHandlerConfig {
-    /// POSTs the extra fields as JSON to this URL. Must be `https://` unless
-    /// the host is loopback (`localhost`/127.0.0.1/::1) -- registration
-    /// fields include the user's email and whatever the deployer's form
-    /// collects, so a plaintext `http://` hop to a non-local host would ship
-    /// that over the wire in the clear.
-    Webhook {
-        url: String,
-        /// How long to wait for the webhook before failing the
-        /// registration -- a hung endpoint must not hold the request open
-        /// indefinitely.
-        #[serde(default = "default_webhook_timeout_secs")]
-        timeout_secs: u64,
-    },
-    /// Runs the executable at `command` as a child process and calls it
-    /// over gRPC (see `plugin`).
-    Plugin {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-        /// The plugin's entire environment -- it inherits nothing from
-        /// WeaveAuth, so a database URL or an API token the plugin needs
-        /// goes here.
-        #[serde(default)]
-        env: HashMap<String, String>,
-        /// How long a single call to the plugin may take before the
-        /// registration fails.
-        #[serde(default = "default_plugin_timeout_secs")]
-        timeout_secs: u64,
-        /// How long the plugin has to start listening at startup. A plugin
-        /// that misses it stops the server from booting, rather than
-        /// surfacing as failed registrations later.
-        #[serde(default = "default_plugin_startup_timeout_secs")]
-        startup_timeout_secs: u64,
-        /// The user the plugin runs as, see [`default_registration_plugin_id`].
-        #[serde(default = "default_registration_plugin_id")]
-        uid: u32,
-        #[serde(default = "default_registration_plugin_id")]
-        gid: u32,
-    },
+pub enum HandlerConfig {
+    Webhook(WebhookConfig),
+    Plugin(PluginSettings),
 }
 
-/// Where extra JWT claims are fetched from on every token mint (both
-/// `authorization_code` and `refresh_token` grants). An error from either
-/// kind fails the token request -- no token is ever issued without the
-/// claims it's configured to carry. See `login_claims`.
+/// POSTs the hook's JSON to `url`. Must be `https://` unless the host is
+/// loopback (`localhost`/127.0.0.1/::1) -- the payload carries the user's
+/// email and whatever the deployer's form collects, so a plaintext `http://`
+/// hop to a non-local host would ship that over the wire in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LoginClaimsHandlerConfig {
-    /// POSTs `{user_id, email}` as JSON to this URL and expects a JSON
-    /// object of claims back. Must be `https://` unless the host is
-    /// loopback (`localhost`/127.0.0.1/::1) -- the request carries the
-    /// user's email, so a plaintext `http://` hop to a non-local host would
-    /// ship that over the wire in the clear.
-    Webhook {
-        url: String,
-        /// How long to wait for the webhook before failing the token
-        /// request -- a hung endpoint must not hold the request open
-        /// indefinitely.
-        #[serde(default = "default_webhook_timeout_secs")]
-        timeout_secs: u64,
-    },
-    /// Runs the executable at `command` as a child process and calls it
-    /// over gRPC (see `plugin`).
-    Plugin {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-        /// The plugin's entire environment -- it inherits nothing from
-        /// WeaveAuth, so a database URL or an API token the plugin needs
-        /// goes here.
-        #[serde(default)]
-        env: HashMap<String, String>,
-        /// How long a single call to the plugin may take before the token
-        /// request fails.
-        #[serde(default = "default_plugin_timeout_secs")]
-        timeout_secs: u64,
-        /// How long the plugin has to start listening at startup. A plugin
-        /// that misses it stops the server from booting, rather than
-        /// surfacing as failed logins later.
-        #[serde(default = "default_plugin_startup_timeout_secs")]
-        startup_timeout_secs: u64,
-        /// The user the plugin runs as, see [`default_login_claims_plugin_id`].
-        #[serde(default = "default_login_claims_plugin_id")]
-        uid: u32,
-        #[serde(default = "default_login_claims_plugin_id")]
-        gid: u32,
-    },
+pub struct WebhookConfig {
+    pub url: String,
+    /// How long to wait before the hook fails -- a hung endpoint must not
+    /// hold the request open indefinitely.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// Runs the executable at `command` as a child process and calls it over gRPC
+/// (see `plugin`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSettings {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The plugin's entire environment -- it inherits nothing from
+    /// WeaveAuth, so a database URL or an API token the plugin needs
+    /// goes here.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// How long a single call to the plugin may take before the hook fails.
+    #[serde(default = "default_plugin_timeout_secs")]
+    pub timeout_secs: u64,
+    /// How long the plugin has to start listening at startup. A plugin
+    /// that misses it stops the server from booting, rather than
+    /// surfacing as failed requests later.
+    #[serde(default = "default_plugin_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+    /// The user the plugin runs as. Unset: the hook's own user, see
+    /// [`PluginHook::default_id`]. Every plugin runs as a user of its own --
+    /// not WeaveAuth's, and not another plugin's -- so it can't read their
+    /// memory or environment. Switching needs `CAP_SETUID`/`CAP_SETGID` (held
+    /// by `Config::setuid_helper` in the image), which a local run without
+    /// them avoids by setting `uid`/`gid` to its own.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+}
+
+/// The three places a plugin can be plugged in, each with its own user in the image.
+#[derive(Debug, Clone, Copy)]
+pub enum PluginHook {
+    Registration,
+    LoginClaims,
+    Email,
+}
+
+impl PluginHook {
+    /// Names this hook in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables a deployer
+    /// sets. Upper case because environment variables are.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Registration => "REGISTRATION",
+            Self::LoginClaims => "LOGIN_CLAIMS",
+            Self::Email => "EMAIL",
+        }
+    }
+
+    /// The uid and gid of the image's `wa-registration`, `wa-login-claims`
+    /// and `wa-email` users.
+    pub fn default_id(self) -> u32 {
+        match self {
+            Self::Registration => 1001,
+            Self::LoginClaims => 1002,
+            Self::Email => 1003,
+        }
+    }
 }
 
 fn default_webhook_timeout_secs() -> u64 {
@@ -279,27 +278,6 @@ fn default_plugin_startup_timeout_secs() -> u64 {
     10
 }
 
-/// The uid and gid of the image's `wa-registration` user. Every plugin runs
-/// as a user of its own -- not WeaveAuth's, and not another plugin's -- so it
-/// can't read their memory or environment. Switching to it needs
-/// `CAP_SETUID`/`CAP_SETGID` (held by `Config::setuid_helper` in the image),
-/// which a local run without them avoids by setting `uid`/`gid` to its own.
-fn default_registration_plugin_id() -> u32 {
-    1001
-}
-
-/// The uid and gid of the image's `wa-login-claims` user; see
-/// [`default_registration_plugin_id`].
-fn default_login_claims_plugin_id() -> u32 {
-    1002
-}
-
-/// The uid and gid of the image's `wa-email` user; see
-/// [`default_registration_plugin_id`].
-fn default_email_plugin_id() -> u32 {
-    1003
-}
-
 /// Config for a single third-party OIDC login provider. Discovered at
 /// startup via `{issuer}/.well-known/openid-configuration`, so only the
 /// issuer and this app's own client registration need to be given here.
@@ -308,12 +286,13 @@ pub struct OidcProviderConfig {
     pub client_id: String,
     pub client_secret: SecretString,
     pub issuer: String,
-    /// This provider's callback redirect URL, as registered with it --
-    /// backend isn't meant to be internet-exposed, so this must be bff's
-    /// public URL (e.g. "https://bff.example.com/oidc/google/callback"),
-    /// not backend's own address. bff forwards the provider's callback
-    /// request to backend's matching route server-to-server.
-    pub redirect_uri: String,
+    /// This provider's callback redirect URL, as registered with it.
+    /// Backend isn't meant to be internet-exposed, so it must be bff's public
+    /// URL, not backend's own address: bff forwards the provider's callback
+    /// request to backend's matching route server-to-server. Unset:
+    /// `{bff_url}/oidc/{key}/callback`.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
     /// How login pages name this provider ("Continue with LinkedIn"); served
     /// at `/oauth/oidc/providers`. Unset: the key with its first letter capitalized.
     #[serde(default)]
@@ -373,6 +352,13 @@ impl OidcProviderConfig {
                 .unwrap_or_default()
         })
     }
+
+    /// `redirect_uri`, or bff's callback route for `key` under `bff_url`.
+    pub fn redirect_uri_for(&self, key: &str, bff_url: &str) -> String {
+        self.redirect_uri
+            .clone()
+            .unwrap_or_else(|| format!("{}/oidc/{key}/callback", bff_url.trim_end_matches('/')))
+    }
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -383,28 +369,20 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 1983,
+            bff_url: "http://localhost:8080".to_string(),
+            login_public_url: "http://localhost:8081".to_string(),
             redirect_uri_allowlist: vec!["http://localhost:8081/".to_string()],
-            pkce_code_ttl_secs: 300,
-            login_session_ttl_secs: 60,
             access_token_ttl_secs: 900,
             refresh_token_ttl_secs: 2_592_000,
-            jwt_key_rotation_interval_secs: 2_592_000,
+            jwt_key_rotation_interval_secs: None,
             issuer: "http://localhost:1983".to_string(),
-            oidc_state_ttl_secs: 300,
-            pending_oidc_link_ttl_secs: 600,
-            password_reset_token_ttl_secs: 1_800,
-            email_verification_code_ttl_secs: 900,
-            email_verification_resend_cooldown_secs: 60,
-            email_verification_session_ttl_secs: 1_800,
-            expiry_sweep_interval_secs: 60,
             oidc_providers: HashMap::new(),
-            max_bcrypt_cost: bcrypt::DEFAULT_COST,
             extra_data_handler: None,
             login_claims_handler: None,
             setuid_helper: None,
             email_handler: None,
-            login_public_url: None,
             require_verified_email: false,
+            tuning: Tuning::default(),
         }
     }
 }
@@ -418,6 +396,9 @@ pub const JWT_KEY_PUBLISH_AHEAD_SECS: i64 = 86_400;
 /// cover verifiers' `exp` leeway (jsonwebtoken defaults to 60s) and clock skew.
 pub const JWT_KEY_GRACE_MARGIN_SECS: i64 = 3_600;
 
+/// Rotation interval used unless the access token TTL needs a longer one.
+const DEFAULT_ROTATION_INTERVAL_SECS: i64 = 2_592_000;
+
 /// Largest accepted TTL or rotation interval (10 years): keeps the time
 /// arithmetic on these far from overflow.
 const MAX_SECS: i64 = 315_360_000;
@@ -428,60 +409,83 @@ pub fn jwt_key_grace_secs(access_token_ttl_secs: i64) -> i64 {
     access_token_ttl_secs.saturating_add(JWT_KEY_GRACE_MARGIN_SECS)
 }
 
+/// The scalar settings that have an env var. Lists are in [`ENV_LISTS`]; the
+/// per-provider secrets are read in [`Config::load`], the per-plugin
+/// `WA_PLUGIN_*` variables by the plugin start.
+const ENV: EnvTable = &[
+    ("WA_PROFILE", "profile"),
+    ("WA_PORT", "port"),
+    ("WA_BFF_URL", "bff_url"),
+    ("WA_LOGIN_PUBLIC_URL", "login_public_url"),
+    ("WA_BACKEND_URL", "issuer"),
+    ("WA_ACCESS_TOKEN_TTL_SECS", "access_token_ttl_secs"),
+    ("WA_REFRESH_TOKEN_TTL_SECS", "refresh_token_ttl_secs"),
+    (
+        "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
+        "jwt_key_rotation_interval_secs",
+    ),
+    ("WA_REQUIRE_VERIFIED_EMAIL", "require_verified_email"),
+    ("WA_SETUID_HELPER", "setuid_helper"),
+];
+
+const ENV_LISTS: EnvTable = &[("WA_REDIRECT_URI_ALLOWLIST", "redirect_uri_allowlist")];
+
 impl Config {
+    /// The rotation interval in effect: the configured one, else 30 days or,
+    /// when the access token TTL needs more room than that, the least that
+    /// satisfies [`Config::load`]'s check.
+    pub fn rotation_interval_secs(&self) -> i64 {
+        self.jwt_key_rotation_interval_secs.unwrap_or_else(|| {
+            DEFAULT_ROTATION_INTERVAL_SECS.max(
+                jwt_key_grace_secs(self.access_token_ttl_secs)
+                    .saturating_add(JWT_KEY_PUBLISH_AHEAD_SECS),
+            )
+        })
+    }
+
     /// Loads config, layering (highest precedence last): built-in defaults,
     /// then the YAML file at `WA_CONFIG_FILE` (default `config.yaml`; a
     /// missing file is not an error, one that exists but can't be read is),
-    /// then `WA_*` env vars.
+    /// then the `WA_*` env vars in [`ENV`]. What the deployer left unset is
+    /// then derived from what they did set: the allowlist from
+    /// `login_public_url` (stored without a trailing `/`), `issuer` from `port`
+    /// (dev only; prod requires `WA_BACKEND_URL`), each provider's
+    /// `redirect_uri` from `bff_url`, and the profile's defaults. Prod also
+    /// requires `bff_url` to be https and `login_public_url` an https origin.
     pub fn load() -> Result<Self, anyhow::Error> {
-        // A missing .env is normal; a present but malformed one would otherwise be dropped silently.
-        if let Err(error) = dotenvy::dotenv()
-            && !error.not_found()
-        {
-            anyhow::bail!("could not load .env: {error}");
+        common::config::load_dotenv()?;
+        let user = common::config::user_settings(true, ENV, ENV_LISTS)?;
+        let profile = common::config::profile(&user)?;
+        // Backend's own address is internal, so http is fine there; it just can't be localhost.
+        if profile == Profile::Prod && !user.contains("issuer") {
+            anyhow::bail!(
+                "WA_BACKEND_URL (or `issuer` in the config file) must be set for the prod profile; its default is a localhost address. Set WA_PROFILE=dev for local development"
+            );
         }
+        let mut config: Config = common::config::extract(Config::default(), &user)?;
+        common::config::require_https_in_prod(
+            profile,
+            &[
+                ("WA_BFF_URL", &config.bff_url, PublicUrl::Base),
+                (
+                    "WA_LOGIN_PUBLIC_URL",
+                    &config.login_public_url,
+                    PublicUrl::Origin,
+                ),
+            ],
+        )?;
+        // Every URL derived from it appends a path.
+        config.login_public_url = config.login_public_url.trim_end_matches('/').to_string();
 
-        let path = env::var("WA_CONFIG_FILE").unwrap_or_else(|_| "config.yaml".into());
-        // Figment treats a file it can't open like a missing one. Missing is
-        // fine (no overlay); present but unreadable is a deployment mistake
-        // that would otherwise run on defaults, dropping every setting in it.
-        if let Err(error) = std::fs::File::open(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            anyhow::bail!("could not read config file {path:?}: {error}");
+        if !user.contains("redirect_uri_allowlist") {
+            config.redirect_uri_allowlist = vec![format!("{}/", config.login_public_url)];
         }
-
-        // `WA_LOGIN_PUBLIC_URL` is login's own public origin (see
-        // `login::Config::own_origin`) -- when the two run side by side, it's
-        // also the redirect_uri login sends by default (with a trailing `/`,
-        // matching login's own fallback), so seed the built-in default from
-        // it before the YAML file/`WA_REDIRECT_URI_ALLOWLIST` env var (below)
-        // get a chance to override it. The allowlist check is an exact
-        // string match, so the trailing slash isn't optional here.
-        let mut defaults = Config::default();
-        if let Ok(login_url) = env::var("WA_LOGIN_PUBLIC_URL") {
-            defaults.redirect_uri_allowlist = vec![format!("{login_url}/")];
+        if !user.contains("issuer") {
+            config.issuer = format!("http://localhost:{}", config.port);
         }
-
-        let mut config: Config = Figment::from(Serialized::defaults(defaults))
-            .merge(Yaml::file(&path))
-            // `WA_PLUGIN_*` belongs to the plugin process, not to this
-            // config -- see `plugin::forwarded_env`. Filtered rather than
-            // merely unmatched, so adding a `plugin` field here later can't
-            // silently start capturing a deployer's plugin variables.
-            .merge(
-                Env::prefixed("WA_")
-                    .ignore(&["config_file", "redirect_uri_allowlist"])
-                    .filter(|key| !key.starts_with("plugin_")),
-            )
-            .extract()?;
-
-        if let Ok(raw) = env::var("WA_REDIRECT_URI_ALLOWLIST") {
-            config.redirect_uri_allowlist = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+        if !user.contains("require_verified_email") {
+            config.require_verified_email =
+                profile == Profile::Prod && config.email_handler.is_some();
         }
 
         for (name, provider) in config.oidc_providers.iter_mut() {
@@ -501,47 +505,37 @@ impl Config {
             *slot = Some(password.into());
         }
 
-        // bcrypt's own hard cap on the cost factor -- not exported by the
-        // `bcrypt` crate, so mirrored here. Anything above it would make the
-        // configured cap inert (bcrypt would refuse to hash at that cost anyway).
-        const BCRYPT_MAX_COST: u32 = 31;
-        if config.max_bcrypt_cost > BCRYPT_MAX_COST {
-            tracing::warn!(
-                configured = config.max_bcrypt_cost,
-                clamped_to = BCRYPT_MAX_COST,
-                "WA_MAX_BCRYPT_COST exceeds bcrypt's own maximum cost; clamping"
-            );
-            config.max_bcrypt_cost = BCRYPT_MAX_COST;
-        }
-
         for (name, value) in [
             ("WA_ACCESS_TOKEN_TTL_SECS", config.access_token_ttl_secs),
             ("WA_REFRESH_TOKEN_TTL_SECS", config.refresh_token_ttl_secs),
-            (
-                "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
-                config.jwt_key_rotation_interval_secs,
-            ),
         ] {
             if !(1..=MAX_SECS).contains(&value) {
                 anyhow::bail!("{name} must be between 1 and {MAX_SECS} seconds");
             }
         }
+        if let Some(interval) = config.jwt_key_rotation_interval_secs
+            && !(1..=MAX_SECS).contains(&interval)
+        {
+            anyhow::bail!(
+                "WA_JWT_KEY_ROTATION_INTERVAL_SECS must be between 1 and {MAX_SECS} seconds"
+            );
+        }
         // The replaced key must be pruned before the next one is staged, so at most two are published.
         if jwt_key_grace_secs(config.access_token_ttl_secs)
             .saturating_add(JWT_KEY_PUBLISH_AHEAD_SECS)
-            > config.jwt_key_rotation_interval_secs
+            > config.rotation_interval_secs()
         {
             anyhow::bail!(
                 "WA_ACCESS_TOKEN_TTL_SECS ({}) plus {}s (key grace margin and publish-ahead) must not exceed WA_JWT_KEY_ROTATION_INTERVAL_SECS ({})",
                 config.access_token_ttl_secs,
                 JWT_KEY_GRACE_MARGIN_SECS + JWT_KEY_PUBLISH_AHEAD_SECS,
-                config.jwt_key_rotation_interval_secs
+                config.rotation_interval_secs()
             );
         }
 
         // The value isn't echoed in these errors: it may carry credentials.
         let issuer = url::Url::parse(&config.issuer)
-            .map_err(|e| anyhow::anyhow!("invalid WA_ISSUER: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid WA_BACKEND_URL: {e}"))?;
         if !matches!(issuer.scheme(), "http" | "https")
             || !issuer.username().is_empty()
             || issuer.password().is_some()
@@ -551,7 +545,7 @@ impl Config {
             || issuer.fragment().is_some()
         {
             anyhow::bail!(
-                "WA_ISSUER must be an http(s) URL without user info, path, query or fragment"
+                "WA_BACKEND_URL must be an http(s) URL without user info, path, query or fragment"
             );
         }
         config.issuer = issuer.origin().ascii_serialization();
@@ -612,7 +606,7 @@ mod tests {
             client_id: String::new(),
             client_secret: SecretString::from(String::new()),
             issuer: String::new(),
-            redirect_uri: String::new(),
+            redirect_uri: None,
             display_name: display_name.map(str::to_string),
             extra_claims: HashMap::new(),
             scopes: Vec::new(),
@@ -638,6 +632,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file("config.yaml", "port: 1984\n")?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml/nested.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let error =
                 Config::load().expect_err("an unreadable config must not fall back to defaults");
@@ -679,6 +674,7 @@ mod tests {
     fn defaults_when_no_env_and_no_file() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert_eq!(config.port, 1983);
@@ -686,12 +682,12 @@ mod tests {
                 config.redirect_uri_allowlist,
                 vec!["http://localhost:8081/".to_string()]
             );
-            assert_eq!(config.pkce_code_ttl_secs, 300);
-            assert_eq!(config.login_session_ttl_secs, 60);
             assert_eq!(config.access_token_ttl_secs, 900);
             assert_eq!(config.refresh_token_ttl_secs, 2_592_000);
-            assert_eq!(config.jwt_key_rotation_interval_secs, 2_592_000);
-            assert_eq!(config.max_bcrypt_cost, bcrypt::DEFAULT_COST);
+            assert_eq!(config.rotation_interval_secs(), 2_592_000);
+            assert_eq!(config.issuer, "http://localhost:1983");
+            assert_eq!(config.tuning.pkce_code_ttl_secs, 300);
+            assert_eq!(config.tuning.max_bcrypt_cost, bcrypt::DEFAULT_COST);
             Ok(())
         });
     }
@@ -700,10 +696,11 @@ mod tests {
     fn rotation_interval_can_be_set_from_env() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "1209600");
 
             let config = Config::load().unwrap();
-            assert_eq!(config.jwt_key_rotation_interval_secs, 1_209_600);
+            assert_eq!(config.rotation_interval_secs(), 1_209_600);
             Ok(())
         });
     }
@@ -712,6 +709,7 @@ mod tests {
     fn access_ttl_plus_grace_margin_and_publish_ahead_longer_than_rotation_interval_is_rejected() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1001");
             jail.set_env(
                 "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
@@ -728,6 +726,7 @@ mod tests {
     fn access_ttl_plus_grace_margin_and_publish_ahead_equal_to_rotation_interval_is_accepted() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1000");
             jail.set_env(
                 "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
@@ -743,6 +742,7 @@ mod tests {
     fn refresh_ttl_may_outlast_the_rotation_interval() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "172800");
             jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "864000");
 
@@ -755,7 +755,8 @@ mod tests {
     fn issuer_is_set_from_env_without_its_trailing_slash() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-            jail.set_env("WA_ISSUER", "https://auth.internal:1983/");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_BACKEND_URL", "https://auth.internal:1983/");
 
             let config = Config::load().unwrap();
             assert_eq!(config.issuer, "https://auth.internal:1983");
@@ -767,7 +768,8 @@ mod tests {
     fn issuer_is_stored_in_its_normalized_form() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-            jail.set_env("WA_ISSUER", "HTTP:Auth.Internal");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_BACKEND_URL", "HTTP:Auth.Internal");
 
             let config = Config::load().unwrap();
             assert_eq!(config.issuer, "http://auth.internal");
@@ -783,7 +785,8 @@ mod tests {
         ] {
             Jail::expect_with(|jail| {
                 jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-                jail.set_env("WA_ISSUER", issuer);
+                jail.set_env("WA_PROFILE", "dev");
+                jail.set_env("WA_BACKEND_URL", issuer);
 
                 assert_eq!(Config::load().unwrap().issuer, stored);
                 Ok(())
@@ -804,10 +807,11 @@ mod tests {
         ] {
             Jail::expect_with(|jail| {
                 jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-                jail.set_env("WA_ISSUER", issuer);
+                jail.set_env("WA_PROFILE", "dev");
+                jail.set_env("WA_BACKEND_URL", issuer);
 
                 let error = Config::load().unwrap_err().to_string();
-                assert!(error.contains("WA_ISSUER"), "{issuer}: {error}");
+                assert!(error.contains("WA_BACKEND_URL"), "{issuer}: {error}");
                 Ok(())
             });
         }
@@ -825,6 +829,7 @@ mod tests {
         ] {
             Jail::expect_with(|jail| {
                 jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                jail.set_env("WA_PROFILE", "dev");
                 jail.set_env(name, value);
 
                 let error = Config::load().unwrap_err().to_string();
@@ -838,6 +843,7 @@ mod tests {
     fn ttls_and_rotation_interval_are_accepted_at_the_upper_bound() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "315360000");
             jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "315360000");
 
@@ -847,37 +853,14 @@ mod tests {
     }
 
     #[test]
-    fn max_bcrypt_cost_is_overridable_from_env() {
-        Jail::expect_with(|jail| {
-            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-            jail.set_env("WA_MAX_BCRYPT_COST", "10");
-
-            let config = Config::load().unwrap();
-            assert_eq!(config.max_bcrypt_cost, 10);
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn max_bcrypt_cost_above_bcrypts_own_maximum_is_clamped() {
-        Jail::expect_with(|jail| {
-            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-            jail.set_env("WA_MAX_BCRYPT_COST", "99");
-
-            let config = Config::load().unwrap();
-            assert_eq!(config.max_bcrypt_cost, 31);
-            Ok(())
-        });
-    }
-
-    #[test]
     fn file_values_are_used_when_no_env_override() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
+                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert_eq!(config.port, 9999);
@@ -885,8 +868,6 @@ mod tests {
                 config.redirect_uri_allowlist,
                 vec!["http://file.test/callback".to_string()]
             );
-            assert_eq!(config.pkce_code_ttl_secs, 42);
-            assert_eq!(config.login_session_ttl_secs, 30);
             assert_eq!(config.access_token_ttl_secs, 120);
             assert_eq!(config.refresh_token_ttl_secs, 86400);
             Ok(())
@@ -898,13 +879,12 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "config.yaml",
-                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\npkce_code_ttl_secs: 42\nlogin_session_ttl_secs: 30\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
+                "port: 9999\nredirect_uri_allowlist:\n  - http://file.test/callback\naccess_token_ttl_secs: 120\nrefresh_token_ttl_secs: 86400\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_PORT", "7000");
             jail.set_env("WA_REDIRECT_URI_ALLOWLIST", "http://env.test/callback");
-            jail.set_env("WA_PKCE_CODE_TTL_SECS", "11");
-            jail.set_env("WA_LOGIN_SESSION_TTL_SECS", "5");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "3");
             jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "7");
 
@@ -914,8 +894,6 @@ mod tests {
                 config.redirect_uri_allowlist,
                 vec!["http://env.test/callback".to_string()]
             );
-            assert_eq!(config.pkce_code_ttl_secs, 11);
-            assert_eq!(config.login_session_ttl_secs, 5);
             assert_eq!(config.access_token_ttl_secs, 3);
             assert_eq!(config.refresh_token_ttl_secs, 7);
             Ok(())
@@ -926,6 +904,7 @@ mod tests {
     fn defaults_to_no_oidc_providers() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert!(config.oidc_providers.is_empty());
@@ -946,6 +925,7 @@ mod tests {
                  redirect_uri: http://bff.test/oidc/google/callback\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             let google = config
@@ -955,7 +935,10 @@ mod tests {
             assert_eq!(google.client_id, "my-client-id");
             assert_eq!(google.client_secret.expose_secret(), "my-client-secret");
             assert_eq!(google.issuer, "https://accounts.google.com");
-            assert_eq!(google.redirect_uri, "http://bff.test/oidc/google/callback");
+            assert_eq!(
+                google.redirect_uri.as_deref(),
+                Some("http://bff.test/oidc/google/callback")
+            );
             assert!(google.extra_claims.is_empty());
             assert_eq!(
                 google.scopes,
@@ -988,6 +971,7 @@ mod tests {
                  nickname: /nick\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             let apis = &config
@@ -1024,6 +1008,7 @@ mod tests {
                  - email\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             let google = config
@@ -1050,6 +1035,7 @@ mod tests {
                  last_name: family_name\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             let google = config
@@ -1077,6 +1063,7 @@ mod tests {
                  redirect_uri: http://bff.test/oidc/google/callback\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_OIDC_GOOGLE_CLIENT_ID", "env-client-id");
             jail.set_env("WA_OIDC_GOOGLE_CLIENT_SECRET", "env-client-secret");
 
@@ -1097,6 +1084,7 @@ mod tests {
     fn defaults_to_no_extra_data_handler() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert!(config.extra_data_handler.is_none());
@@ -1112,10 +1100,11 @@ mod tests {
                 "extra_data_handler:\n  kind: webhook\n  url: https://internal.test/hook\n  timeout_secs: 3\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Webhook { url, timeout_secs } => {
+                HandlerConfig::Webhook(WebhookConfig { url, timeout_secs }) => {
                     assert_eq!(url, "https://internal.test/hook");
                     assert_eq!(timeout_secs, 3);
                 }
@@ -1133,10 +1122,11 @@ mod tests {
                 "extra_data_handler:\n  kind: webhook\n  url: https://internal.test/hook\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Webhook { timeout_secs, .. } => {
+                HandlerConfig::Webhook(WebhookConfig { timeout_secs, .. }) => {
                     assert_eq!(timeout_secs, 10)
                 }
                 other => unreachable!("only a webhook handler was configured, got {other:?}"),
@@ -1149,6 +1139,7 @@ mod tests {
     fn reads_the_setuid_helper_from_the_environment() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_SETUID_HELPER", "/usr/local/bin/weaveauth-plugin-exec");
 
             let config = Config::load().unwrap();
@@ -1168,10 +1159,11 @@ mod tests {
                 "extra_data_handler:\n  kind: plugin\n  command: /opt/plugins/register\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Plugin {
+                HandlerConfig::Plugin(PluginSettings {
                     command,
                     args,
                     env,
@@ -1179,11 +1171,11 @@ mod tests {
                     startup_timeout_secs,
                     uid,
                     gid,
-                } => {
+                }) => {
                     assert_eq!(command, "/opt/plugins/register");
                     assert_eq!(
                         (uid, gid),
-                        (1001, 1001),
+                        (None, None),
                         "a plugin runs as its own user unless told otherwise"
                     );
                     assert_eq!(timeout_secs, 5);
@@ -1208,18 +1200,19 @@ mod tests {
                 "extra_data_handler:\n  kind: plugin\n  command: /opt/plugins/register\n  args:\n    - --verbose\n  env:\n    DATABASE_URL: postgres://plugin@db/appdata\n  timeout_secs: 20\n  uid: 2000\n  gid: 2001\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.extra_data_handler.expect("handler configured") {
-                ExtraDataHandlerConfig::Plugin {
+                HandlerConfig::Plugin(PluginSettings {
                     args,
                     env,
                     timeout_secs,
                     uid,
                     gid,
                     ..
-                } => {
-                    assert_eq!((uid, gid), (2000, 2001));
+                }) => {
+                    assert_eq!((uid, gid), (Some(2000), Some(2001)));
                     assert_eq!(args, vec!["--verbose".to_string()]);
                     assert_eq!(
                         env.get("DATABASE_URL").map(String::as_str),
@@ -1237,6 +1230,7 @@ mod tests {
     fn defaults_to_no_login_claims_handler() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert!(config.login_claims_handler.is_none());
@@ -1252,10 +1246,11 @@ mod tests {
                 "login_claims_handler:\n  kind: webhook\n  url: https://internal.test/claims\n  timeout_secs: 3\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.login_claims_handler.expect("handler configured") {
-                LoginClaimsHandlerConfig::Webhook { url, timeout_secs } => {
+                HandlerConfig::Webhook(WebhookConfig { url, timeout_secs }) => {
                     assert_eq!(url, "https://internal.test/claims");
                     assert_eq!(timeout_secs, 3);
                 }
@@ -1273,10 +1268,11 @@ mod tests {
                 "login_claims_handler:\n  kind: plugin\n  command: /opt/plugins/claims\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.login_claims_handler.expect("handler configured") {
-                LoginClaimsHandlerConfig::Plugin {
+                HandlerConfig::Plugin(PluginSettings {
                     command,
                     args,
                     env,
@@ -1284,11 +1280,11 @@ mod tests {
                     startup_timeout_secs,
                     uid,
                     gid,
-                } => {
+                }) => {
                     assert_eq!(command, "/opt/plugins/claims");
                     assert_eq!(
                         (uid, gid),
-                        (1002, 1002),
+                        (None, None),
                         "a plugin runs as its own user unless told otherwise"
                     );
                     assert_eq!(timeout_secs, 5);
@@ -1309,6 +1305,7 @@ mod tests {
     fn redirect_uri_allowlist_env_splits_trims_and_drops_empties() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env(
                 "WA_REDIRECT_URI_ALLOWLIST",
                 "http://a.test , http://b.test,,",
@@ -1327,6 +1324,7 @@ mod tests {
     fn redirect_uri_allowlist_defaults_to_login_public_url_with_trailing_slash() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
 
             let config = Config::load().unwrap();
@@ -1342,6 +1340,7 @@ mod tests {
     fn explicit_redirect_uri_allowlist_still_wins_over_login_public_url() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
             jail.set_env("WA_REDIRECT_URI_ALLOWLIST", "https://other.test/callback");
 
@@ -1358,12 +1357,11 @@ mod tests {
     fn defaults_to_no_email_handler_and_no_enforcement() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             assert!(config.email_handler.is_none());
             assert!(!config.require_verified_email);
-            assert_eq!(config.email_verification_code_ttl_secs, 900);
-            assert_eq!(config.email_verification_resend_cooldown_secs, 60);
             Ok(())
         });
     }
@@ -1376,6 +1374,7 @@ mod tests {
                 "email_handler:\n  kind: smtp\n  host: mail.test\n  port: 465\n  tls: implicit\n  username: u\n  password: from-file\n  from: no-reply@example.com\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_EMAIL_SMTP_PASSWORD", "from-env");
 
             let config = Config::load().unwrap();
@@ -1411,11 +1410,12 @@ mod tests {
                 "email_handler:\n  kind: plugin\n  command: /bin/mailer\n",
             )?;
             jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
 
             let config = Config::load().unwrap();
             match config.email_handler.expect("handler configured") {
-                EmailHandlerConfig::Plugin { uid, gid, .. } => {
-                    assert_eq!((uid, gid), (1003, 1003));
+                EmailHandlerConfig::Plugin(PluginSettings { uid, gid, .. }) => {
+                    assert_eq!((uid, gid), (None, None));
                 }
                 other => unreachable!("expected plugin, got {other:?}"),
             }
@@ -1427,17 +1427,230 @@ mod tests {
     fn login_public_url_and_require_verified_email_load_from_the_environment() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
             jail.set_env("WA_REQUIRE_VERIFIED_EMAIL", "true");
 
             let config = Config::load().unwrap();
-            assert_eq!(
-                config.login_public_url.as_deref(),
-                Some("https://login.env.test")
-            );
+            assert_eq!(config.login_public_url, "https://login.env.test");
             assert!(config.require_verified_email);
             Ok(())
         });
+    }
+
+    #[test]
+    fn issuer_defaults_to_localhost_on_the_configured_port() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_PORT", "2000");
+
+            assert_eq!(Config::load().unwrap().issuer, "http://localhost:2000");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_explicit_issuer_beats_the_port_derived_one() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_PORT", "2000");
+            jail.set_env("WA_BACKEND_URL", "https://auth.internal");
+
+            assert_eq!(Config::load().unwrap().issuer, "https://auth.internal");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_allowlist_follows_a_login_public_url_set_in_the_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "login_public_url: https://login.file.test\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+
+            assert_eq!(
+                Config::load().unwrap().redirect_uri_allowlist,
+                vec!["https://login.file.test/".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_login_public_url_is_not_doubled_in_the_allowlist() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test/");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.login_public_url, "https://login.env.test");
+            assert_eq!(
+                config.redirect_uri_allowlist,
+                vec!["https://login.env.test/".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_refuses_to_start_on_localhost_defaults() {
+        let all = [
+            ("WA_BFF_URL", "https://bff.test"),
+            ("WA_LOGIN_PUBLIC_URL", "https://login.test"),
+            ("WA_BACKEND_URL", "https://backend.test"),
+        ];
+        for missing in 0..all.len() {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                for (i, (var, value)) in all.iter().enumerate() {
+                    if i != missing {
+                        jail.set_env(var, value);
+                    }
+                }
+
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains(all[missing].0), "{error}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn prod_refuses_a_public_url_on_plain_http_but_not_an_internal_backend_url() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "http://login.test");
+            jail.set_env("WA_BACKEND_URL", "http://backend.internal");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_LOGIN_PUBLIC_URL"), "{error}");
+
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            Config::load().unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_starts_once_its_public_urls_are_set() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            for (var, value) in [
+                ("WA_BFF_URL", "https://bff.test"),
+                ("WA_LOGIN_PUBLIC_URL", "https://login.test"),
+                ("WA_BACKEND_URL", "https://backend.test"),
+            ] {
+                jail.set_env(var, value);
+            }
+
+            Config::load().unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_providers_redirect_uri_defaults_to_bffs_callback_route() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.yaml",
+                "oidc_providers:\n  google:\n    client_id: id\n    client_secret: secret\n    issuer: https://accounts.google.com\n  other:\n    client_id: id\n    client_secret: secret\n    issuer: https://other.test\n    redirect_uri: https://elsewhere.test/cb\n",
+            )?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_BFF_URL", "https://bff.env.test/");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.oidc_providers["google"].redirect_uri_for("google", &config.bff_url),
+                "https://bff.env.test/oidc/google/callback"
+            );
+            assert_eq!(
+                config.oidc_providers["other"].redirect_uri_for("other", &config.bff_url),
+                "https://elsewhere.test/cb"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_long_access_ttl_widens_the_default_rotation_interval_instead_of_failing() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "3000000");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.rotation_interval_secs(),
+                3_000_000 + JWT_KEY_GRACE_MARGIN_SECS + JWT_KEY_PUBLISH_AHEAD_SECS
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn verification_is_required_by_default_only_in_prod_with_an_email_handler() {
+        let email = "email_handler:\n  kind: webhook\n  url: https://mail.test/hook\n";
+        for (profile, yaml, required) in [
+            ("prod", email, true),
+            ("dev", email, false),
+            ("prod", "", false),
+            (
+                "prod",
+                "require_verified_email: false\nemail_handler:\n  kind: webhook\n  url: https://mail.test/hook\n",
+                false,
+            ),
+        ] {
+            Jail::expect_with(|jail| {
+                jail.create_file("config.yaml", yaml)?;
+                jail.set_env("WA_CONFIG_FILE", "config.yaml");
+                jail.set_env("WA_PROFILE", profile);
+                jail.set_env("WA_BFF_URL", "https://bff.test");
+                jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+                jail.set_env("WA_BACKEND_URL", "https://backend.test");
+
+                assert_eq!(
+                    Config::load().unwrap().require_verified_email,
+                    required,
+                    "{profile}: {yaml}"
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn tuning_values_are_not_settable_from_the_environment() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_PKCE_CODE_TTL_SECS", "1");
+            jail.set_env("WA_MAX_BCRYPT_COST", "4");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.tuning.pkce_code_ttl_secs, 300);
+            assert_eq!(config.tuning.max_bcrypt_cost, bcrypt::DEFAULT_COST);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn each_hook_runs_its_plugin_as_its_own_user_unless_told_otherwise() {
+        assert_eq!(PluginHook::Registration.default_id(), 1001);
+        assert_eq!(PluginHook::LoginClaims.default_id(), 1002);
+        assert_eq!(PluginHook::Email.default_id(), 1003);
+    }
+
+    // Deployers name these in `WA_PLUGIN_<PLUGIN>_ENV_*`, so they're a contract.
+    #[test]
+    fn each_hook_has_its_documented_env_name() {
+        assert_eq!(PluginHook::Registration.name(), "REGISTRATION");
+        assert_eq!(PluginHook::LoginClaims.name(), "LOGIN_CLAIMS");
+        assert_eq!(PluginHook::Email.name(), "EMAIL");
     }
 
     #[test]

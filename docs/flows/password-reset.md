@@ -49,7 +49,7 @@ Body: `{"token": "...", "new_password": "..."}`. **200 OK** on success,
 revocation failed.
 
 1. `take_reset_token` hashes the presented token and removes the entry.
-   Missing or older than `password_reset_token_ttl_secs` (default 1800) -> 400.
+   Missing or older than 30 minutes (1800s, fixed) -> 400.
    Single-use: the entry is gone whether or not the rest succeeds.
 2. **Revoke** every refresh token, login session and email-verification session
    ([verify email](verify-email.md)) for the user, and clear their email-verification code state
@@ -84,7 +84,7 @@ there.
 |----------------|----------------------------------------------------------|
 | Entropy        | 32 bytes CSPRNG (`rand::rng()`), base64url, no padding   |
 | At rest        | `sha256(token)` as the map key; plaintext never stored   |
-| TTL            | `password_reset_token_ttl_secs`, default 1800            |
+| TTL            | 30 minutes, fixed            |
 | Reuse          | Single-use, consumed on `/confirm` regardless of outcome |
 | Concurrent     | One live token per user; issuing drops the previous      |
 | Expiry cleanup | `sweep_expired`, run by the background task in `AppState`|

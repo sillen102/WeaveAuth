@@ -5,8 +5,7 @@ pub(crate) use controller::request_email_verification_doc;
 #[cfg(test)]
 pub(crate) use delivery::{EmailDeliveryError, VerificationEmail};
 pub(crate) use delivery::{
-    EmailVerificationHandler, PLUGIN_NAME, PluginHandler, SmtpHandler, TEMPLATES_GLOB,
-    WebhookHandler,
+    EmailVerificationHandler, PluginHandler, SmtpHandler, TEMPLATES_GLOB, WebhookHandler,
 };
 pub(crate) use service::{EmailVerification, send_verification_email};
 
@@ -269,7 +268,7 @@ mod service {
     /// Why no email was sent.
     #[derive(Debug)]
     pub(crate) enum NotSent {
-        /// No email handler (or no `login_public_url` for it) is configured.
+        /// No email handler is configured.
         Disabled,
         CoolingDown {
             retry_after_secs: i64,
@@ -296,8 +295,9 @@ mod service {
         pub(crate) sessions: InMemoryVerificationSessionStorage,
         /// `None`: no email is sent.
         pub(crate) handler: Option<Arc<dyn EmailVerificationHandler>>,
-        /// Login's public origin; the email points at its `/verify-email.html`.
-        pub(crate) login_public_url: Option<String>,
+        /// Login's public origin, without a trailing `/` (see `Config::load`);
+        /// the email points at its `/verify-email.html`.
+        pub(crate) login_public_url: String,
         pub(crate) code_ttl_secs: i64,
         /// Withhold the `login_session` from an unverified account.
         pub(crate) required: bool,
@@ -310,7 +310,7 @@ mod service {
                 codes: InMemoryEmailVerificationCodeStorage::new(60, 0),
                 sessions: InMemoryVerificationSessionStorage::new(60),
                 handler: None,
-                login_public_url: None,
+                login_public_url: String::new(),
                 code_ttl_secs: 60,
                 required: false,
             }
@@ -335,9 +335,7 @@ mod service {
             .handler
             .clone()
             .ok_or(NotSent::Disabled)?;
-        let Some(login_url) = state.email_verification.login_public_url.as_deref() else {
-            return Err(NotSent::Disabled);
-        };
+        let login_url = state.email_verification.login_public_url.as_str();
 
         let code = match state.email_verification.codes.issue_code(user_id).await {
             IssueCodeOutcome::Issued(code) => code,
@@ -366,7 +364,7 @@ mod service {
             user_id,
             email: email.to_string(),
             code,
-            verify_page_url: format!("{}/verify-email.html", login_url.trim_end_matches('/')),
+            verify_page_url: format!("{login_url}/verify-email.html"),
             expires_at: Utc::now()
                 + chrono::Duration::seconds(state.email_verification.code_ttl_secs),
         };
@@ -492,9 +490,6 @@ mod delivery {
 
     use crate::config::SmtpTls;
     use crate::plugin::{self, PluginProcess};
-
-    /// Names this plugin surface in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables.
-    pub(crate) const PLUGIN_NAME: &str = "EMAIL";
 
     /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
     const HOOK: &str = "email_verification";
@@ -775,7 +770,7 @@ pub(crate) mod test_support {
     ) -> mpsc::UnboundedReceiver<Sent> {
         let (tx, rx) = mpsc::unbounded_channel();
         state.email_verification.handler = Some(Arc::new(Recorder { tx, fail }));
-        state.email_verification.login_public_url = Some("https://login.test/".to_string());
+        state.email_verification.login_public_url = "https://login.test".to_string();
         state.email_verification.codes =
             crate::storage::in_memory::InMemoryEmailVerificationCodeStorage::new(900, 0);
         state.email_verification.code_ttl_secs = 900;

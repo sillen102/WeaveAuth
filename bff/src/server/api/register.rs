@@ -329,9 +329,8 @@ mod tests {
             routes: vec![],
             trusted_origins,
             rate_limit_max_attempts: 1000,
-            rate_limit_window_secs: 60,
-            expiry_sweep_interval_secs: 60,
             docs_enabled: false,
+            login_public_url: "http://login.test".into(),
         })
         .expect("valid app state")
     }

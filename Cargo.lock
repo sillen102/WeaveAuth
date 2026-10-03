@@ -545,8 +545,11 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "aide",
+ "anyhow",
  "axum",
  "chrono",
+ "dotenvy",
+ "figment",
  "http",
  "scalar_api_reference",
  "schemars 1.2.2",
@@ -555,6 +558,7 @@ dependencies = [
  "strum",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

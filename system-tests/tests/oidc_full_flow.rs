@@ -33,7 +33,7 @@ fn backend_config_with_provider(
             client_id: fake_idp::CLIENT_ID.to_string(),
             client_secret: fake_idp::CLIENT_SECRET.to_string().into(),
             issuer,
-            redirect_uri: oidc_callback_url,
+            redirect_uri: Some(oidc_callback_url),
             display_name: None,
             extra_claims: Default::default(),
             scopes: vec!["email".to_string(), "profile".to_string()],

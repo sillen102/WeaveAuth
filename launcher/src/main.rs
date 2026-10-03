@@ -9,14 +9,6 @@ const SERVICES: [&str; 3] = ["weaveauth", "weaveauth-bff", "weaveauth-login"];
 
 const POLL: Duration = Duration::from_millis(200);
 
-/// All three services need to agree on where the login page (not bff, not
-/// backend) is publicly reachable. login reads `WA_LOGIN_PUBLIC_URL` itself,
-/// and bff (`WA_TRUSTED_ORIGINS`) and backend (`WA_REDIRECT_URI_ALLOWLIST`)
-/// default from it -- each still wins if the deployer sets it explicitly.
-fn login_public_url(configured: Option<OsString>) -> OsString {
-    configured.unwrap_or_else(|| "http://localhost:8081".into())
-}
-
 /// Where login reaches bff server-side. bff runs in this same container, so
 /// unless the deployer says otherwise that's loopback on bff's own port,
 /// never the public `WA_BFF_URL`, which may not route back in from here.
@@ -32,7 +24,6 @@ fn bff_internal_url(configured: Option<OsString>, bff_port: Option<OsString>) ->
 // ponytail: no SIGTERM forwarding, so `docker stop` waits out its grace
 // period before SIGKILL; run with `docker run --init` if that matters.
 fn main() -> ExitCode {
-    let url = login_public_url(std::env::var_os("WA_LOGIN_PUBLIC_URL"));
     let bff_url = bff_internal_url(
         std::env::var_os("WA_BFF_INTERNAL_URL"),
         std::env::var_os("WA_BFF_PORT"),
@@ -41,7 +32,6 @@ fn main() -> ExitCode {
     let mut children: Vec<(&str, Child)> = Vec::new();
     for service in SERVICES {
         let mut command = Command::new(service);
-        command.env("WA_LOGIN_PUBLIC_URL", &url);
         if service == "weaveauth-login" {
             command.env("WA_BFF_INTERNAL_URL", &bff_url);
         }
@@ -84,14 +74,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_the_login_public_url_when_unset() {
-        assert_eq!(
-            login_public_url(None),
-            OsString::from("http://localhost:8081")
-        );
-    }
-
-    #[test]
     fn points_login_at_the_local_bff_when_no_internal_url_is_set() {
         assert_eq!(
             bff_internal_url(None, None),
@@ -113,14 +95,6 @@ mod tests {
         assert_eq!(
             bff_internal_url(Some("http://bff.internal".into()), Some("9090".into())),
             OsString::from("http://bff.internal")
-        );
-    }
-
-    #[test]
-    fn keeps_a_configured_login_public_url() {
-        assert_eq!(
-            login_public_url(Some("https://login.example".into())),
-            OsString::from("https://login.example")
         );
     }
 }

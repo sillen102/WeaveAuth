@@ -49,7 +49,7 @@ pub(crate) enum PasswordVerifyError {
 
 /// Verifies `password` against a stored, scheme-tagged hash. `max_bcrypt_cost`
 /// caps how expensive a `Bcrypt` hash's own cost factor is allowed to be (see
-/// `Config::max_bcrypt_cost`) -- an imported hash claiming an inflated cost
+/// `Tuning::max_bcrypt_cost`) -- an imported hash claiming an inflated cost
 /// could otherwise tie up a blocking-pool thread for a very long time. Note:
 /// unlike argon2 logins, bcrypt verification time still varies with the
 /// hash's cost, so it isn't covered by the dummy-hash timing guard callers

@@ -2,7 +2,7 @@ pub(crate) use controller::register;
 pub(crate) use controller::register_doc;
 #[cfg(test)]
 pub(crate) use extra_data::ExtraDataError;
-pub(crate) use extra_data::{ExtraDataHandler, PLUGIN_NAME, PluginHandler, WebhookHandler};
+pub(crate) use extra_data::{ExtraDataHandler, PluginHandler, WebhookHandler};
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -26,7 +26,7 @@ mod controller {
         pub(super) email: String,
         pub(super) password: String,
         /// Anything beyond `email`/`password` -- forwarded to the deployer's
-        /// configured extra-data handler (see `config::ExtraDataHandlerConfig`),
+        /// configured extra-data handler (see `config::HandlerConfig`),
         /// never stored by WeaveAuth itself. Rejected with 400 if no handler
         /// is configured.
         #[serde(flatten)]
@@ -239,10 +239,6 @@ mod extra_data {
 
     use crate::plugin::{self, PluginProcess};
 
-    /// Names this plugin surface in the `WA_PLUGIN_<PLUGIN>_ENV_*` variables a
-    /// deployer sets. Upper case because environment variables are.
-    pub(crate) const PLUGIN_NAME: &str = "REGISTRATION";
-
     /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
     const HOOK: &str = "registration";
 
@@ -254,7 +250,7 @@ mod extra_data {
 
     /// Implemented by whatever a deployer configures to receive the fields a
     /// register request carries beyond `email`/`password` (see
-    /// `config::ExtraDataHandlerConfig`). An error fails the whole registration
+    /// `config::HandlerConfig`). An error fails the whole registration
     /// -- no user is created.
     #[async_trait::async_trait]
     pub(crate) trait ExtraDataHandler: Send + Sync {

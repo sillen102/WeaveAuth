@@ -17,6 +17,11 @@ schemars = { workspace = true, features = ["chrono04"] }
 chrono = { workspace = true, features = ["serde"] }
 strum = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
+anyhow = { workspace = true }
+figment = { workspace = true, features = ["yaml", "env"] }
+dotenvy = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "rt"] }

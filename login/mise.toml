@@ -1,5 +1,7 @@
 [tasks.dev]
 description = "Run development in dev mode"
+# Only on this task: login reads no config.yaml, and the tests expect the prod default.
+env = { WA_PROFILE = "dev" }
 run = "cargo run"
 
 [tasks.build]
