@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 axum = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+common = { path = "../common" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tower-http = { workspace = true, features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
 figment = { workspace = true, features = ["yaml", "env", "test"] }
@@ -13,8 +14,10 @@ tera = { workspace = true, features = ["glob_fs"] }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }

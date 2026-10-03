@@ -44,6 +44,8 @@ pub(crate) struct AppState {
     pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
     /// Per provider: scopes requested on the consent screen, besides `openid`.
     pub(crate) oidc_scopes: Arc<HashMap<String, Vec<String>>>,
+    /// Per provider: how login pages name it, ordered by key.
+    pub(crate) oidc_display_names: Arc<std::collections::BTreeMap<String, String>>,
     /// Per provider: calls made with the access token on a first login.
     pub(crate) oidc_profile_apis: Arc<HashMap<String, Vec<ProfileApiConfig>>>,
     pub(crate) oidc_state: InMemoryOidcStateStorage,
@@ -196,6 +198,13 @@ impl AppState {
                     .oidc_providers
                     .iter()
                     .map(|(name, p)| (name.clone(), p.scopes.clone()))
+                    .collect(),
+            ),
+            oidc_display_names: Arc::new(
+                config
+                    .oidc_providers
+                    .iter()
+                    .map(|(name, p)| (name.clone(), p.display_name_for(name)))
                     .collect(),
             ),
             oidc_extra_claims: Arc::new(
@@ -537,6 +546,7 @@ mod tests {
             // Unreachable: the check under test must fire before discovery.
             issuer: "http://127.0.0.1:1".to_string(),
             redirect_uri: "http://localhost/callback".to_string(),
+            display_name: None,
             extra_claims: [("last_name".to_string(), "family_name".to_string())].into(),
             scopes: vec!["email".to_string()],
             profile_apis: Vec::new(),

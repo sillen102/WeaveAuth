@@ -642,6 +642,7 @@ mod tests {
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
+            oidc_display_names: Arc::new(Default::default()),
             oidc_profile_apis: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),

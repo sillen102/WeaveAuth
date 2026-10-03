@@ -4,6 +4,8 @@ pub(crate) use controller::oidc_confirm_link;
 pub(crate) use controller::oidc_confirm_link_doc;
 pub(crate) use controller::oidc_login;
 pub(crate) use controller::oidc_login_doc;
+pub(crate) use controller::oidc_providers;
+pub(crate) use controller::oidc_providers_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
@@ -31,6 +33,9 @@ mod controller {
         pub(super) provider: String,
         pub(super) code: String,
         pub(super) state: String,
+        /// Set when this sign-in confirms a pending link: it must then come
+        /// from an identity already linked to that pending link's account.
+        pub(super) pending_link_token: Option<String>,
     }
 
     #[derive(Deserialize, JsonSchema)]
@@ -43,6 +48,19 @@ mod controller {
     pub(crate) struct OidcConfirmLinkResponse {
         /// Same shape as a successful `/oauth/login` response.
         pub(super) login_session: String,
+    }
+
+    #[derive(Serialize, JsonSchema)]
+    pub(crate) struct OidcProvidersResponse {
+        /// Ordered by key.
+        providers: Vec<OidcProviderEntry>,
+    }
+
+    #[derive(Serialize, JsonSchema)]
+    struct OidcProviderEntry {
+        /// What goes in bff's `/oidc/{provider}/login`.
+        key: String,
+        display_name: String,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
@@ -83,12 +101,20 @@ mod controller {
             details = "a permission this deployment requires was not granted at the oidc provider"
         )]
         ConsentRequired,
+        #[error("this sign-in is not linked to the account being confirmed")]
+        #[error_response(
+            StatusCode::CONFLICT,
+            details = "this sign-in is not linked to the account being confirmed"
+        )]
+        LinkConfirmationFailed,
     }
 
     impl From<service::OidcServiceError> for OidcError {
         fn from(err: service::OidcServiceError) -> Self {
-            if let service::OidcServiceError::ConsentRequired(_) = &err {
-                // The user's choice, not a fault.
+            if let service::OidcServiceError::ConsentRequired(_)
+            | service::OidcServiceError::LinkConfirmationFailed(_) = &err
+            {
+                // A declined permission, or the wrong or a stale sign-in for a link: not a fault.
                 tracing::info!(%err, "oidc callback refused");
             }
             if let service::OidcServiceError::ExchangeFailed(_)
@@ -107,6 +133,9 @@ mod controller {
                 }
                 service::OidcServiceError::ProfileApiFailed(_) => OidcError::ProfileApiFailed,
                 service::OidcServiceError::ConsentRequired(_) => OidcError::ConsentRequired,
+                service::OidcServiceError::LinkConfirmationFailed(_) => {
+                    OidcError::LinkConfirmationFailed
+                }
             }
         }
     }
@@ -137,6 +166,17 @@ mod controller {
         }
     }
 
+    pub(crate) fn oidc_providers_doc(op: TransformOperation) -> TransformOperation {
+        op.tag("Auth")
+            .id("oidc_providers")
+            .summary("List the configured OIDC providers")
+            .description(
+                "Each configured provider's key and the name a login page should show for it \
+                 (`display_name`, default the key capitalized). bff serves this as its own \
+                 /oidc/providers.",
+            )
+    }
+
     pub(crate) fn oidc_login_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("oidc_login")
@@ -158,21 +198,37 @@ mod controller {
                  URL and forwards provider+code+state (all query params) here \
                  server-to-server. Returns either an Authenticated login_session (same shape as \
                  a successful /oauth/login), or a \
-                 PasswordConfirmationRequired response if this email matches an existing but \
-                 unverified account -- see /oauth/oidc/confirm-link.",
+                 LinkConfirmationRequired response if this email matches an existing account \
+                 this identity isn't linked to yet. The link is confirmed either with the \
+                 account's password (/oauth/oidc/confirm-link) or by calling this again for a \
+                 sign-in through one of the account's linked providers, passing \
+                 pending_link_token (409 if that sign-in isn't linked to the account).",
             )
     }
 
     pub(crate) fn oidc_confirm_link_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("oidc_confirm_link")
-            .summary("Finish linking an OIDC identity into an unverified account")
+            .summary("Link an OIDC identity into an existing account with its password")
             .description(
                 "Call after /oauth/oidc/callback returns \
-                 PasswordConfirmationRequired, supplying that account's password. On success, \
-                 the account is marked email_verified and the identity is linked, exactly as if \
-                 the email had already been verified at callback time.",
+                 LinkConfirmationRequired, supplying that account's password. On success, \
+                 the identity is linked and the account is marked email_verified.",
             )
+    }
+
+    pub(crate) async fn oidc_providers(
+        State(state): State<AppState>,
+    ) -> Json<OidcProvidersResponse> {
+        let providers = state
+            .oidc_display_names
+            .iter()
+            .map(|(key, display_name)| OidcProviderEntry {
+                key: key.clone(),
+                display_name: display_name.clone(),
+            })
+            .collect();
+        Json(OidcProvidersResponse { providers })
     }
 
     pub(crate) async fn oidc_login(
@@ -187,14 +243,21 @@ mod controller {
         State(mut state): State<AppState>,
         ApiQuery(query): ApiQuery<OidcCallbackQuery>,
     ) -> Result<Json<service::OidcCallbackResponse>, OidcError> {
+        let purpose = match query.pending_link_token {
+            Some(pending_link_token) => {
+                service::CallbackPurpose::ConfirmLink { pending_link_token }
+            }
+            None => service::CallbackPurpose::SignIn,
+        };
         let response =
-            service::oidc_callback(&mut state, query.provider, query.code, query.state).await?;
+            service::oidc_callback(&mut state, query.provider, query.code, query.state, purpose)
+                .await?;
         Ok(Json(response))
     }
 
     /// Finishes linking an OIDC identity that `oidc_callback` flagged as
-    /// `PasswordConfirmationRequired`, once the caller has supplied the
-    /// existing account's password.
+    /// `LinkConfirmationRequired`, once the caller has supplied the existing
+    /// account's password.
     pub(crate) async fn oidc_confirm_link(
         State(mut state): State<AppState>,
         ApiJson(req): ApiJson<OidcConfirmLinkRequest>,
@@ -250,6 +313,8 @@ mod service {
         ProfileApiFailed(String),
         #[error("the user did not grant required scope '{0}'")]
         ConsentRequired(String),
+        #[error("pending oidc link not confirmed: {0}")]
+        LinkConfirmationFailed(String),
     }
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -266,14 +331,27 @@ mod service {
         /// Same shape as a successful `/oauth/login` response -- single-use
         /// proof of this authentication, required by `/oauth/authorize`.
         Authenticated { login_session: String },
-        /// An account with this email already exists but isn't verified yet
-        /// (see `UserStorage::resolve_oidc_login`). Submit that account's
-        /// password to `/oauth/oidc/confirm-link` along with
-        /// `pending_link_token` to finish linking; the OIDC login isn't
-        /// authenticated yet.
-        PasswordConfirmationRequired {
+        /// An account with this email already exists and this identity isn't
+        /// linked to it (see `UserStorage::resolve_oidc_login`); the OIDC
+        /// login isn't authenticated yet. Confirm with the account's password
+        /// (`/oauth/oidc/confirm-link`, only if `has_password`) or a sign-in
+        /// through one of `linked_providers` (`/oauth/oidc/callback` with
+        /// `pending_link_token`).
+        LinkConfirmationRequired {
             pending_link_token: String,
             email: String,
+            has_password: bool,
+            linked_providers: Vec<String>,
+        },
+    }
+
+    /// What a callback sign-in is for.
+    pub(crate) enum CallbackPurpose {
+        SignIn,
+        /// Confirms this pending link; the sign-in must be through an
+        /// identity already linked to its account.
+        ConfirmLink {
+            pending_link_token: String,
         },
     }
 
@@ -324,6 +402,7 @@ mod service {
         provider: String,
         code: String,
         query_state: String,
+        purpose: CallbackPurpose,
     ) -> Result<OidcCallbackResponse, OidcServiceError> {
         let login_state = state
             .oidc_state
@@ -357,10 +436,9 @@ mod service {
                 "provider '{stored_provider}' returned no id_token"
             ))
         })?;
-        let verifier = client.id_token_verifier();
         let claims = id_token
             .claims(
-                &verifier,
+                &client.id_token_verifier(),
                 &Nonce::new(login_state.nonce.expose_secret().to_string()),
             )
             .map_err(|error| {
@@ -388,6 +466,19 @@ mod service {
             VerifiedEmail::new(email.clone(), claims.email_verified() == Some(true))
                 .ok_or(OidcServiceError::EmailNotVerified)?;
         let subject = claims.subject().as_str();
+        // Before anything can create a user: a confirming sign-in must be an existing one.
+        match purpose {
+            CallbackPurpose::ConfirmLink { pending_link_token } => {
+                return confirm_link_via_linked_identity(
+                    state,
+                    &stored_provider,
+                    subject,
+                    &pending_link_token,
+                )
+                .await;
+            }
+            CallbackPurpose::SignIn => {}
+        }
         let is_new_user = state.users.get_user_by_email(&email).await.is_none();
         let mut profile = profile_fields(id_token, state.oidc_extra_claims.get(&stored_provider));
 
@@ -457,19 +548,66 @@ mod service {
                 let login_session = state.login_sessions.create_session(user.id).await;
                 OidcCallbackResponse::Authenticated { login_session }
             }
-            OidcLinkOutcome::RequiresPasswordConfirmation { existing_user_id } => {
+            OidcLinkOutcome::RequiresLinkConfirmation {
+                existing_user_id,
+                has_password,
+                linked_providers,
+            } => {
                 let pending_link_token = state
                     .pending_oidc_links
                     .save_pending_link(stored_provider, subject.to_string(), existing_user_id)
                     .await;
-                OidcCallbackResponse::PasswordConfirmationRequired {
+                OidcCallbackResponse::LinkConfirmationRequired {
                     pending_link_token,
                     email,
+                    has_password,
+                    linked_providers,
                 }
             }
         };
 
         Ok(response)
+    }
+
+    /// Links the identity waiting under `pending_link_token` once
+    /// `(provider, subject)` -- the sign-in that just completed -- proves to be
+    /// already linked to the same account. The pending link is spent either way.
+    async fn confirm_link_via_linked_identity(
+        state: &mut AppState,
+        provider: &str,
+        subject: &str,
+        pending_link_token: &str,
+    ) -> Result<OidcCallbackResponse, OidcServiceError> {
+        let pending_link = state
+            .pending_oidc_links
+            .take_pending_link(pending_link_token)
+            .await
+            .ok_or_else(|| {
+                OidcServiceError::LinkConfirmationFailed("pending link unknown or expired".into())
+            })?;
+        let owner = state.users.oidc_identity_owner(provider, subject).await;
+        if owner != Some(pending_link.existing_user_id) {
+            return Err(OidcServiceError::LinkConfirmationFailed(format!(
+                "provider '{provider}' sign-in belongs to {owner:?}, not account {}",
+                pending_link.existing_user_id
+            )));
+        }
+        let user = state
+            .users
+            .link_verified_oidc_identity(
+                pending_link.existing_user_id,
+                &pending_link.provider,
+                &pending_link.subject,
+            )
+            .await
+            .ok_or_else(|| {
+                OidcServiceError::LinkConfirmationFailed(format!(
+                    "account {} no longer exists",
+                    pending_link.existing_user_id
+                ))
+            })?;
+        let login_session = state.login_sessions.create_session(user.id).await;
+        Ok(OidcCallbackResponse::Authenticated { login_session })
     }
 
     /// Reads the id_token claims the deployer mapped for this provider
@@ -598,8 +736,8 @@ mod service {
     }
 
     /// Finishes linking an OIDC identity that `oidc_callback` flagged as
-    /// `PasswordConfirmationRequired`, once the caller has supplied the
-    /// existing account's password.
+    /// `LinkConfirmationRequired`, once the caller has supplied the existing
+    /// account's password.
     pub(crate) async fn oidc_confirm_link(
         state: &mut AppState,
         pending_link_token: &str,
@@ -680,6 +818,7 @@ mod tests {
             oidc_providers: Arc::new(HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
+            oidc_display_names: Arc::new(Default::default()),
             oidc_profile_apis: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
@@ -716,6 +855,7 @@ mod tests {
             provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "no-such-state".to_string(),
+            pending_link_token: None,
         };
 
         let result = oidc_callback(State(state), ApiQuery(query)).await;
@@ -739,6 +879,7 @@ mod tests {
             provider: "some-other-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
+            pending_link_token: None,
         };
 
         let result = oidc_callback(State(state), ApiQuery(query)).await;
@@ -762,6 +903,7 @@ mod tests {
             provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
+            pending_link_token: None,
         };
         // First call consumes the state; provider is unknown here (no real
         // client configured in this test), so it fails past the state check
@@ -772,6 +914,7 @@ mod tests {
             provider: "google".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
+            pending_link_token: None,
         };
         let result = oidc_callback(State(state), ApiQuery(replay_query)).await;
 
@@ -894,6 +1037,7 @@ mod tests {
                 client_id: "client-id".to_string(),
                 client_secret: secrecy::SecretString::from("client-secret".to_string()),
                 redirect_uri: "http://localhost/callback".to_string(),
+                display_name: None,
                 extra_claims: HashMap::new(),
                 scopes: vec!["email".to_string()],
                 profile_apis: Vec::new(),
@@ -930,6 +1074,7 @@ mod tests {
             provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
+            pending_link_token: None,
         };
 
         let result = oidc_callback(State(state), ApiQuery(query)).await;
@@ -966,6 +1111,14 @@ mod tests {
     }
 
     async fn run_callback(state: &AppState, csrf: &str) -> Result<(), OidcError> {
+        callback_response(state, csrf, None).await.map(|_| ())
+    }
+
+    async fn callback_response(
+        state: &AppState,
+        csrf: &str,
+        pending_link_token: Option<&str>,
+    ) -> Result<Json<super::service::OidcCallbackResponse>, OidcError> {
         state
             .oidc_state
             .clone()
@@ -980,10 +1133,9 @@ mod tests {
             provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: csrf.to_string(),
+            pending_link_token: pending_link_token.map(str::to_string),
         };
-        oidc_callback(State(state.clone()), ApiQuery(query))
-            .await
-            .map(|_| ())
+        oidc_callback(State(state.clone()), ApiQuery(query)).await
     }
 
     #[tokio::test]
@@ -1485,6 +1637,7 @@ mod tests {
             provider: "test-provider".to_string(),
             code: "irrelevant".to_string(),
             state: "csrf-token".to_string(),
+            pending_link_token: None,
         };
 
         let result = oidc_callback(State(state), ApiQuery(query)).await;
@@ -1593,5 +1746,156 @@ mod tests {
         };
         let result = oidc_confirm_link(State(state), ApiJson(replay)).await;
         assert_eq!(result.err(), Some(ConfirmLinkError::InvalidPendingLink));
+    }
+
+    /// A user already linked to "test-provider" as `provider-subject`, with a
+    /// pending LinkedIn identity waiting to be linked to the same account.
+    async fn state_with_pending_linkedin_link(
+        sign_in_email: &str,
+    ) -> (AppState, uuid::Uuid, String) {
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token(sign_in_email, true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        let user = User {
+            email: "alice@example.com".to_string(),
+            email_verified: true,
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let token = state
+            .pending_oidc_links
+            .save_pending_link("linkedin".to_string(), "li-sub".to_string(), user_id)
+            .await;
+        (state, user_id, token)
+    }
+
+    #[tokio::test]
+    async fn callback_links_a_pending_identity_when_signing_in_through_one_already_linked() {
+        let (mut state, user_id, token) =
+            state_with_pending_linkedin_link("alice@example.com").await;
+        let _ = state
+            .users
+            .link_verified_oidc_identity(user_id, "test-provider", "provider-subject")
+            .await;
+
+        let result = callback_response(&state, "csrf-token", Some(&token)).await;
+
+        let Ok(Json(super::service::OidcCallbackResponse::Authenticated { .. })) = result else {
+            unreachable!("expected Authenticated");
+        };
+        assert_eq!(
+            state.users.oidc_identity_owner("linkedin", "li-sub").await,
+            Some(user_id)
+        );
+        assert!(
+            state
+                .pending_oidc_links
+                .take_pending_link(&token)
+                .await
+                .is_none(),
+            "the pending link is single-use"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_refuses_a_pending_link_when_the_sign_in_is_not_linked_to_that_account() {
+        let (state, _user_id, token) = state_with_pending_linkedin_link("other@example.com").await;
+
+        let result = callback_response(&state, "csrf-token", Some(&token)).await;
+
+        assert_eq!(result.err(), Some(OidcError::LinkConfirmationFailed));
+        assert_eq!(
+            state.users.oidc_identity_owner("linkedin", "li-sub").await,
+            None
+        );
+        assert!(
+            state
+                .users
+                .get_user_by_email("other@example.com")
+                .await
+                .is_none(),
+            "no account is created for the sign-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_refuses_a_pending_link_when_the_sign_in_is_linked_to_another_account() {
+        let (mut state, _user_id, token) =
+            state_with_pending_linkedin_link("bob@example.com").await;
+        let bob = User {
+            email: "bob@example.com".to_string(),
+            email_verified: true,
+            ..User::default()
+        };
+        let bob_id = bob.id;
+        let _ = state.users.create_user(bob).await;
+        let _ = state
+            .users
+            .link_verified_oidc_identity(bob_id, "test-provider", "provider-subject")
+            .await;
+
+        let result = callback_response(&state, "csrf-token", Some(&token)).await;
+
+        assert_eq!(result.err(), Some(OidcError::LinkConfirmationFailed));
+        assert_eq!(
+            state.users.oidc_identity_owner("linkedin", "li-sub").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_for_an_existing_account_lists_how_the_link_can_be_confirmed() {
+        let (_issuer, providers, _id_token) =
+            provider_and_id_token("alice@example.com", true, "test-nonce").await;
+        let mut state = state_with_no_providers().await;
+        state.oidc_providers = providers;
+        let user = User {
+            email: "alice@example.com".to_string(),
+            password: Some(PasswordHash::Argon2("hash".into())),
+            email_verified: true,
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let _ = state
+            .users
+            .link_verified_oidc_identity(user_id, "linkedin", "li-sub")
+            .await;
+
+        let result = callback_response(&state, "csrf-token", None).await;
+
+        let Ok(Json(super::service::OidcCallbackResponse::LinkConfirmationRequired {
+            email,
+            has_password,
+            linked_providers,
+            ..
+        })) = result
+        else {
+            unreachable!("expected LinkConfirmationRequired");
+        };
+        assert_eq!(email, "alice@example.com");
+        assert!(has_password);
+        assert_eq!(linked_providers, vec!["linkedin".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn providers_lists_each_configured_provider_with_its_display_name() {
+        let mut state = state_with_no_providers().await;
+        state.oidc_display_names = Arc::new(std::collections::BTreeMap::from([
+            ("google".to_string(), "Google".to_string()),
+            ("linkedin".to_string(), "LinkedIn".to_string()),
+        ]));
+
+        let Json(body) = oidc_providers(State(state)).await;
+
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({"providers": [
+                {"key": "google", "display_name": "Google"},
+                {"key": "linkedin", "display_name": "LinkedIn"},
+            ]})
+        );
     }
 }

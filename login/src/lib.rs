@@ -24,7 +24,10 @@ use axum::routing::get;
 use figment::Figment;
 use figment::providers::{Env, Serialized};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tera::{Context, Tera};
 use tower_http::services::ServeDir;
 
@@ -51,6 +54,10 @@ pub struct Config {
     /// when it was opened without a `redirect_uri` (the link in the email).
     /// Must be on backend's redirect allowlist. Unset: login's own origin.
     pub verify_default_redirect_uri: Option<String>,
+    /// Where login itself reaches bff (for `/oidc/providers`), when
+    /// `bff_url` -- the browser-facing address -- doesn't resolve from
+    /// login's network. Unset: `bff_url`.
+    pub bff_internal_url: Option<String>,
 }
 
 impl Default for Config {
@@ -60,6 +67,7 @@ impl Default for Config {
             bff_url: "http://localhost:8080".to_string(),
             own_origin: "http://localhost:8081".to_string(),
             verify_default_redirect_uri: None,
+            bff_internal_url: None,
         }
     }
 }
@@ -82,6 +90,7 @@ impl Config {
                         "WA_BFF_URL" => "bff_url".into(),
                         "WA_LOGIN_PUBLIC_URL" => "own_origin".into(),
                         "WA_VERIFY_DEFAULT_REDIRECT_URI" => "verify_default_redirect_uri".into(),
+                        "WA_BFF_INTERNAL_URL" => "bff_internal_url".into(),
                         _ => "_ignored".into(),
                     })
                     .ignore(&["_ignored"]),
@@ -98,6 +107,7 @@ impl Config {
         config.verify_default_redirect_uri = config
             .verify_default_redirect_uri
             .filter(|raw| !raw.is_empty());
+        config.bff_internal_url = config.bff_internal_url.filter(|raw| !raw.is_empty());
         if let Some(raw) = &config.verify_default_redirect_uri {
             let url = url::Url::parse(raw).map_err(|error| {
                 anyhow::anyhow!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: {error}")
@@ -121,7 +131,16 @@ pub fn app(config: Config) -> Router {
         .route("/verify-email.html", get(verify_email_page))
         .nest_service("/static", files.clone())
         .fallback_service(files)
-        .with_state(config)
+        .with_state(AppState {
+            provider_names: Arc::new(ProviderNamesCache::new(&config)),
+            config,
+        })
+}
+
+#[derive(Clone)]
+struct AppState {
+    config: Config,
+    provider_names: Arc<ProviderNamesCache>,
 }
 
 /// Serves the compiled-in shell at `/` (and `/index.html`, for anyone linking
@@ -139,6 +158,15 @@ struct PageQuery {
     redirect_uri: Option<String>,
     error: Option<String>,
     email: Option<String>,
+    /// With `email`: whether the account can confirm the link with a
+    /// password. Absent counts as `true`.
+    has_password: Option<bool>,
+    /// With `email`: comma-separated keys of the providers already linked to
+    /// the account, any of which can confirm the link. Keys bff's
+    /// `/oidc/providers` doesn't list are dropped.
+    linked_providers: Option<String>,
+    /// With `email`: key of the provider whose sign-in is waiting to be linked.
+    provider: Option<String>,
     /// What bff bounced back with on the verification page: `invalid`, `sent`,
     /// `cooling_down`, `code_used_up`, `locked`, `locked_until_reset` or
     /// `session_expired`.
@@ -162,23 +190,145 @@ fn page_query(query: Result<Query<PageQuery>, QueryRejection>) -> PageQuery {
 }
 
 async fn login_page(
-    State(config): State<Config>,
+    State(AppState {
+        config,
+        provider_names,
+    }): State<AppState>,
     OriginalUri(uri): OriginalUri,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("login.html", &config, uri.path(), &page_query(query))
+    let query = page_query(query);
+    // Only the confirm-link view (`email` set) names providers.
+    let provider_names = match query.email {
+        Some(_) => provider_names.get().await,
+        None => ProviderNames::Unavailable,
+    };
+    render_page("login.html", &config, uri.path(), &query, &provider_names)
+}
+
+/// Display names by provider key, from bff's `/oidc/providers`.
+#[derive(Clone)]
+enum ProviderNames {
+    Fetched(HashMap<String, String>),
+    /// The lookup failed: keys are shown as themselves, limited to
+    /// `[A-Za-z0-9_-]` since they become a bff path segment.
+    Unavailable,
+}
+
+impl ProviderNames {
+    fn get(&self, key: &str) -> Option<String> {
+        match self {
+            ProviderNames::Fetched(names) => names.get(key).cloned(),
+            ProviderNames::Unavailable => {
+                let plain = !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                plain.then(|| key.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProvidersResponse {
+    providers: Vec<ProviderEntry>,
+}
+
+#[derive(Deserialize)]
+struct ProviderEntry {
+    key: String,
+    display_name: String,
+}
+
+/// bff's provider list, fetched on first use and kept for `FETCHED_TTL`
+/// (it only changes when backend restarts), or `FAILED_TTL` after a failed
+/// lookup -- so rendering the page, which anyone can do, doesn't turn into a
+/// bff and backend round trip each time.
+struct ProviderNamesCache {
+    client: reqwest::Client,
+    url: String,
+    /// Held across the fetch, so concurrent renders share one request.
+    cached: tokio::sync::Mutex<Option<(Instant, ProviderNames)>>,
+}
+
+const FETCHED_TTL: Duration = Duration::from_secs(300);
+const FAILED_TTL: Duration = Duration::from_secs(30);
+
+impl ProviderNamesCache {
+    fn new(config: &Config) -> Self {
+        let bff = config.bff_internal_url.as_ref().unwrap_or(&config.bff_url);
+        Self {
+            client: reqwest::Client::new(),
+            url: format!("{bff}/oidc/providers"),
+            cached: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn get(&self) -> ProviderNames {
+        let mut cached = self.cached.lock().await;
+        if let Some((expires_at, names)) = cached.as_ref()
+            && Instant::now() < *expires_at
+        {
+            return names.clone();
+        }
+        let names = self.fetch().await;
+        let ttl = match names {
+            ProviderNames::Fetched(_) => FETCHED_TTL,
+            ProviderNames::Unavailable => FAILED_TTL,
+        };
+        *cached = Some((Instant::now() + ttl, names.clone()));
+        names
+    }
+
+    async fn fetch(&self) -> ProviderNames {
+        let response = async {
+            self.client
+                .get(&self.url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ProvidersResponse>()
+                .await
+        }
+        .await;
+        match response {
+            Ok(response) => ProviderNames::Fetched(
+                response
+                    .providers
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.display_name))
+                    .collect(),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    error = %common::error::cause_chain(&error.without_url()),
+                    url = %self.url,
+                    "could not fetch oidc provider names from bff, showing keys"
+                );
+                ProviderNames::Unavailable
+            }
+        }
+    }
 }
 
 async fn register_page(
-    State(config): State<Config>,
+    State(AppState { config, .. }): State<AppState>,
     OriginalUri(uri): OriginalUri,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    render_page("register.html", &config, uri.path(), &page_query(query))
+    render_page(
+        "register.html",
+        &config,
+        uri.path(),
+        &page_query(query),
+        &ProviderNames::Unavailable,
+    )
 }
 
 async fn verify_email_page(
-    State(config): State<Config>,
+    State(AppState { config, .. }): State<AppState>,
     OriginalUri(uri): OriginalUri,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
@@ -186,7 +336,13 @@ async fn verify_email_page(
     if query.redirect_uri.is_none() {
         query.redirect_uri = config.verify_default_redirect_uri.clone();
     }
-    render_page("verify-email.html", &config, uri.path(), &query)
+    render_page(
+        "verify-email.html",
+        &config,
+        uri.path(),
+        &query,
+        &ProviderNames::Unavailable,
+    )
 }
 
 /// Waits shorter than this are spelled out in seconds, and the page counts
@@ -213,6 +369,7 @@ fn render_page(
     config: &Config,
     path: &str,
     query: &PageQuery,
+    provider_names: &ProviderNames,
 ) -> Result<Html<String>, StatusCode> {
     let origin = &config.own_origin;
     let redirect_uri = query
@@ -230,6 +387,26 @@ fn render_page(
     ctx.insert("own_url", &own_url);
     ctx.insert("error", &query.error);
     ctx.insert("email", &query.email);
+    ctx.insert("has_password", &query.has_password.unwrap_or(true));
+    // Names come from bff, never from the URL, so a crafted link can't put its own text on the page.
+    let display_name = |key: &str| provider_names.get(key);
+    let linked_providers: Vec<LinkedProvider> = query
+        .linked_providers
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|key| {
+            Some(LinkedProvider {
+                key,
+                name: display_name(key)?,
+            })
+        })
+        .collect();
+    ctx.insert("linked_providers", &linked_providers);
+    ctx.insert(
+        "provider",
+        &query.provider.as_deref().and_then(display_name),
+    );
     ctx.insert("status", &query.status);
     ctx.insert("retry_after", &query.retry_after.map(human_duration));
     ctx.insert(
@@ -261,6 +438,12 @@ const URLENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHAN
     .remove(b'.')
     .remove(b'~');
 
+#[derive(Serialize)]
+struct LinkedProvider<'a> {
+    key: &'a str,
+    name: String,
+}
+
 fn urlencode_filter(value: String, _kwargs: tera::Kwargs, _state: &tera::State) -> String {
     percent_encoding::utf8_percent_encode(&value, URLENCODE_SET).collect()
 }
@@ -280,6 +463,21 @@ mod tests {
             assert_eq!(config.port, 8081);
             assert_eq!(config.bff_url, "http://localhost:8080");
             assert_eq!(config.verify_default_redirect_uri, None);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_internal_bff_url_is_read_from_its_env_var() {
+        Jail::expect_with(|jail| {
+            assert_eq!(Config::load().unwrap().bff_internal_url, None);
+            jail.set_env("WA_BFF_INTERNAL_URL", "http://bff.internal:8080");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.bff_internal_url.as_deref(),
+                Some("http://bff.internal:8080")
+            );
             Ok(())
         });
     }

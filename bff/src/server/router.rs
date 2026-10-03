@@ -4,6 +4,7 @@ use crate::server::api::{
     login::start_login,
     oidc::oidc_callback,
     oidc::oidc_confirm_link,
+    oidc::oidc_providers,
     oidc::start_oidc_login,
     proxy::proxy_router,
     register::{start_register, start_register_doc},
@@ -45,6 +46,7 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
 
     let auth_routes = Router::new()
         .route("/login", post(start_login))
+        .route("/oidc/providers", get(oidc_providers))
         .route("/oidc/{provider}/login", get(start_oidc_login))
         .route("/oidc/{provider}/callback", get(oidc_callback))
         .route("/oidc/confirm-link", post(oidc_confirm_link))

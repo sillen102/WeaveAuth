@@ -209,8 +209,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   stripped) with `Cookie` dropped and `Authorization: Bearer <token>` set. `401` on
   missing/unknown session, `404` on no matching route.
 - `login/src/lib.rs` — thin `app(Config) -> Router`: one `/login` handler that
-  redirects into bff's `/login`, plus `ServeDir` over `login/static/`. No PKCE/reqwest
-  logic here — that all lives in `bff`.
+  redirects into bff's `/login`, plus `ServeDir` over `login/static/`. No PKCE logic
+  here — that all lives in `bff`. Its one outbound call is bff's `/oidc/providers`, for
+  the provider names on the link-confirm view.
 - `login/src/main.rs` — axum + tower-http `ServeDir` over `login/static/`. STATIC_DIR
   baked at compile time via `concat!(env!("CARGO_MANIFEST_DIR"), "/static")`; recompile
   needed only because the dir path is baked, not the HTML itself.

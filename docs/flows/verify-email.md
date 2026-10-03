@@ -13,7 +13,7 @@ Relevant code:
 - `backend/src/server/api/login.rs` -- hands out the `verification_session`
 - `backend/src/server/api/register.rs` -- sends the first email after `create_user`
 - `backend/src/storage/` -- `VerificationSessionStorage` and `EmailVerificationCodeStorage`
-  (traits) with their in-memory implementations, `UserStorage::mark_email_verified_by_code`,
+  (traits) with their in-memory implementations, `UserStorage::mark_email_verified`,
   the OIDC link guard
 - `bff/src/server/verification.rs` -- the verification cookie and the redirect to the page
 - `bff/src/server/api/verify_email.rs` -- `POST /verify-email` and `/verify-email/resend`
@@ -86,7 +86,7 @@ own origin; backend's allowlist must include whichever applies.
   forms. For `locked` it offers a "Sign in" link (a lock outlasts the verification session); for
   `locked_until_reset` signing in can't help, so it only says to reset the password (see Known
   gaps).
-- A right code marks the email verified (`email_verified_by_code`), **deletes the verification
+- A right code marks the email verified, **deletes the verification
   session** and returns the `login_session` the login withheld. If the account is *already*
   verified, the code isn't checked and **no login session is given**: the session is deleted and
   the request is `401`, so a session from before an account changed hands (see the password
@@ -197,12 +197,10 @@ place that enforces it.
 
 ## Interaction with OIDC linking
 
-Entering the code sets `email_verified_by_code`. `resolve_oidc_login` still asks such an account
-for its password before linking a Google (etc.) identity, exactly as for an unverified one: the
-code proves mailbox access to whoever chose the password, not that a provider vouches for the
-address, and without this an attacker who pre-registered a victim's address could ride the
-victim's own verification into a shared account. Confirming the password in
-`/oauth/oidc/confirm-link` clears the flag.
+Verification doesn't change OIDC linking: `resolve_oidc_login` asks every existing account to
+confirm a new identity, verified or not (see [oidc.md](oidc.md)). The code proves mailbox access
+to whoever chose the password, so without that an attacker who pre-registered a victim's address
+could ride the victim's own verification into a shared account.
 
 ## Known gaps
 

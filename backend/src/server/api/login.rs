@@ -240,6 +240,7 @@ mod tests {
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
+            oidc_display_names: Arc::new(Default::default()),
             oidc_profile_apis: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),
@@ -279,7 +280,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state.users.mark_email_verified_by_code(user.id).await,
+            state.users.mark_email_verified(user.id).await,
             crate::storage::MarkVerifiedOutcome::Ok
         );
     }

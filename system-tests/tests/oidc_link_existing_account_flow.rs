@@ -1,11 +1,10 @@
-//! An OIDC login for an email that already belongs to an existing but
-//! unverified password account can't be trusted to just authenticate as
-//! that account (see `OidcLinkOutcome::RequiresPasswordConfirmation` in
-//! `backend/src/storage/in_memory.rs`) -- the account owner has to prove
-//! they hold the password first, via bff's `/oidc/confirm-link`. This test
-//! drives that whole hand-off across real `backend`+`bff` servers plus the
-//! fake IdP: register a password account, attempt an OIDC login against the
-//! same email, then confirm the link with the account's password.
+//! An OIDC login for an email that already belongs to an account the identity
+//! isn't linked to can't just authenticate as that account (see
+//! `OidcLinkOutcome::RequiresLinkConfirmation` in `backend/src/storage/mod.rs`)
+//! -- the account owner has to confirm the link first, with the account's
+//! password (bff's `/oidc/confirm-link`) or a sign-in through a provider
+//! already linked to it. These tests drive both hand-offs across real
+//! `backend`+`bff` servers plus fake IdPs.
 
 use weaveauth_system_tests::support;
 
@@ -21,19 +20,29 @@ const EMAIL: &str = "bob@example.com";
 const PASSWORD: &str = "bobs-strong-password";
 
 fn backend_config(issuer: String, oidc_callback_url: String) -> weaveauth::config::Config {
-    let mut providers = std::collections::HashMap::new();
-    providers.insert(
-        "google".to_string(),
-        weaveauth::config::OidcProviderConfig {
-            client_id: fake_idp::CLIENT_ID.to_string(),
-            client_secret: fake_idp::CLIENT_SECRET.to_string().into(),
-            issuer,
-            redirect_uri: oidc_callback_url,
-            extra_claims: Default::default(),
-            scopes: vec!["email".to_string(), "profile".to_string()],
-            profile_apis: Vec::new(),
-        },
-    );
+    backend_config_for(vec![("google", issuer, oidc_callback_url)])
+}
+
+/// One `(provider, issuer, callback_url)` per configured provider.
+fn backend_config_for(providers: Vec<(&str, String, String)>) -> weaveauth::config::Config {
+    let providers = providers
+        .into_iter()
+        .map(|(name, issuer, redirect_uri)| {
+            (
+                name.to_string(),
+                weaveauth::config::OidcProviderConfig {
+                    client_id: fake_idp::CLIENT_ID.to_string(),
+                    client_secret: fake_idp::CLIENT_SECRET.to_string().into(),
+                    issuer,
+                    redirect_uri,
+                    display_name: None,
+                    extra_claims: Default::default(),
+                    scopes: vec!["email".to_string(), "profile".to_string()],
+                    profile_apis: Vec::new(),
+                },
+            )
+        })
+        .collect();
     weaveauth::config::Config {
         oidc_providers: providers,
         ..support::config::backend_config(vec![FINAL_REDIRECT.to_string()])
@@ -103,8 +112,11 @@ async fn oidc_login_into_unverified_account_requires_password_then_links() -> an
     let target = redirect_target(&oidc_resp);
     assert_eq!(
         target,
-        format!("{NEXT}?email={}", urlencoding(EMAIL)),
-        "expected the password-confirmation hand-off"
+        format!(
+            "{NEXT}?email={}&provider=google&has_password=true",
+            urlencoding(EMAIL)
+        ),
+        "expected the link-confirmation hand-off"
     );
 
     // The pending-link cookie is scoped to `/oidc` (see `FLOW_COOKIE_PATH` in
@@ -225,6 +237,81 @@ async fn confirm_link_with_the_wrong_password_does_not_authenticate() -> anyhow:
     assert!(
         !cookies.contains("wa_session="),
         "wrong password must not authenticate"
+    );
+
+    Ok(())
+}
+
+/// An account created through Google has no password: a LinkedIn sign-in for
+/// the same email is confirmed by signing in with Google, after which LinkedIn
+/// alone gets into the account.
+#[tokio::test]
+async fn a_new_provider_is_linked_by_signing_in_with_one_already_linked() -> anyhow::Result<()> {
+    let google = fake_idp::start(EMAIL, true).await?;
+    let linkedin = fake_idp::start(EMAIL, true).await?;
+
+    let (bff_addr, bff_listener) = servers::reserve_port().await?;
+    let bff_url = format!("http://{bff_addr}");
+    let (backend_url, _backend_handle) = servers::spawn_backend(&backend_config_for(vec![
+        (
+            "google",
+            google.issuer.clone(),
+            format!("{bff_url}/oidc/google/callback"),
+        ),
+        (
+            "linkedin",
+            linkedin.issuer.clone(),
+            format!("{bff_url}/oidc/linkedin/callback"),
+        ),
+    ]))
+    .await?;
+    let _bff_handle =
+        servers::spawn_bff_on(bff_listener, bff_config(backend_url, bff_url.clone()))?;
+
+    let login_url = |provider: &str| {
+        format!(
+            "{bff_url}/oidc/{provider}/login?redirect_uri={}&next={}",
+            urlencoding(FINAL_REDIRECT),
+            urlencoding(NEXT),
+        )
+    };
+    let fresh_client = || {
+        reqwest::Client::builder()
+            .cookie_provider(Arc::new(reqwest::cookie::Jar::default()))
+            .redirect(stop_at_real_hosts())
+            .build()
+    };
+
+    let first = fresh_client()?.get(login_url("google")).send().await?;
+    assert_eq!(
+        redirect_target(&first),
+        FINAL_REDIRECT,
+        "setup: Google creates the account"
+    );
+
+    let client = fresh_client()?;
+    let linkedin_resp = client.get(login_url("linkedin")).send().await?;
+    assert_eq!(
+        redirect_target(&linkedin_resp),
+        format!(
+            "{NEXT}?email={}&provider=linkedin&has_password=false&linked_providers=google",
+            urlencoding(EMAIL)
+        ),
+        "LinkedIn must not get in before the link is confirmed"
+    );
+
+    // What the login page's "Continue with Google" link adds.
+    let confirm_resp = client
+        .get(format!("{}&confirm_link=true", login_url("google")))
+        .send()
+        .await?;
+    assert_eq!(redirect_target(&confirm_resp), FINAL_REDIRECT);
+
+    let linked = fresh_client()?.get(login_url("linkedin")).send().await?;
+    assert_eq!(
+        redirect_target(&linked),
+        FINAL_REDIRECT,
+        "LinkedIn is linked now"
     );
 
     Ok(())

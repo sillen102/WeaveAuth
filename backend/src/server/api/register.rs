@@ -208,11 +208,8 @@ mod service {
                 id: user_id,
                 email: email.clone(),
                 password: Some(PasswordHash::Argon2(password_hash.into())),
-                // Set by entering the emailed code (then also
-                // `email_verified_by_code`) or by an OIDC provider confirming
-                // the address.
+                // Set by entering the emailed code or by linking an OIDC identity.
                 email_verified: false,
-                email_verified_by_code: false,
                 created_at: now,
                 updated_at: now,
             })
@@ -496,6 +493,7 @@ mod tests {
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
+            oidc_display_names: Arc::new(Default::default()),
             oidc_profile_apis: Arc::new(Default::default()),
             oidc_state: crate::storage::in_memory::InMemoryOidcStateStorage::new(300),
             pending_oidc_links: crate::storage::in_memory::InMemoryPendingOidcLinkStorage::new(300),

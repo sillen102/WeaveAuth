@@ -460,7 +460,7 @@ mod service {
             }
             CheckCodeOutcome::LockedUntilReset => return Ok(ConfirmOutcome::LockedUntilReset),
         }
-        match state.users.mark_email_verified_by_code(user.id).await {
+        match state.users.mark_email_verified(user.id).await {
             MarkVerifiedOutcome::Ok => {}
             MarkVerifiedOutcome::UserNotFound => return Err(ConfirmServiceError::InvalidSession),
         }
@@ -1082,7 +1082,6 @@ mod tests {
 
         let user = state.users.get_user_by_id(user_id).await.unwrap();
         assert!(user.email_verified);
-        assert!(user.email_verified_by_code);
         // The login session is the real thing: it redeems for this user, once.
         let mut sessions = state.login_sessions.clone();
         let EmailVerificationConfirmResponse::Verified { login_session } = response.1.0 else {

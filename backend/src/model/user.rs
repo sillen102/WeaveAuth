@@ -41,11 +41,6 @@ pub(crate) struct User {
     /// the user entered the verification email's code; `false` for a plain
     /// password registration until then.
     pub email_verified: bool,
-    /// `email_verified` was set by redeeming an emailed code, which proves
-    /// mailbox access to whoever chose the password, not that an OIDC provider
-    /// vouches for the address. Such an account is never auto-linked to an
-    /// OIDC login (see `UserStorage::resolve_oidc_login`).
-    pub email_verified_by_code: bool,
     #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -59,7 +54,6 @@ impl User {
             email: String::new(),
             password: None,
             email_verified: false,
-            email_verified_by_code: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

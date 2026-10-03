@@ -12,7 +12,7 @@
     <h1>Create an account</h1>
     <p>Enter your email and choose a password to get started.</p>
     {% if error == "consent_required" %}
-    <p class="error">This app needs a permission you didn't grant. Please try Sign in with Google again and allow all of the requested permissions.</p>
+    <p class="error">This app needs a permission you didn't grant. Please sign in again and allow all of the requested permissions.</p>
     {% elif error %}
     <p class="error">That email is already taken.</p>
     {% else %}

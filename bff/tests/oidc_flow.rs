@@ -64,6 +64,12 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
             ),
         )
         .route(
+            "/oauth/oidc/providers",
+            get(|| async {
+                Json(serde_json::json!({"providers": [{"key": "google", "display_name": "Google"}]}))
+            }),
+        )
+        .route(
             "/oauth/oidc/callback",
             get(
                 |axum::extract::Query(q): axum::extract::Query<
@@ -78,10 +84,21 @@ async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
                         )),
                         (Some("declined-code"), Some("declined-state")) => Err(StatusCode::FORBIDDEN),
                         (Some("unverified-code"), Some("unverified-state")) => Ok(Json(serde_json::json!({
-                            "status": "password_confirmation_required",
+                            "status": "link_confirmation_required",
                             "pending_link_token": "stub-pending-link-token",
                             "email": "squatter@example.com",
+                            "has_password": true,
+                            "linked_providers": ["google", "linkedin"],
                         }))),
+                        (Some("link-code"), Some("link-state")) => {
+                            if q.get("pending_link_token").map(String::as_str)
+                                == Some("stub-pending-link-token")
+                            {
+                                Ok(Json(serde_json::json!({"status": "authenticated", "login_session": "stub-session"})))
+                            } else {
+                                Err(StatusCode::CONFLICT)
+                            }
+                        }
                         _ => Err(StatusCode::BAD_REQUEST),
                     }
                 },
@@ -458,7 +475,10 @@ async fn oidc_callback_bounces_to_login_with_pending_link_details_when_confirmat
         .get("location")
         .and_then(|v| v.to_str().ok())
         .context("missing location header")?;
-    assert_eq!(loc, "http://login.test/?email=squatter%40example.com");
+    assert_eq!(
+        loc,
+        "http://login.test/?email=squatter%40example.com&provider=google&has_password=true&linked_providers=google%2Clinkedin"
+    );
 
     let cookies = set_cookie_values(&resp);
     assert!(
@@ -632,5 +652,178 @@ async fn malformed_query_input_is_rejected_as_json() -> anyhow::Result<()> {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)?;
     assert_eq!(body["reason"], "InvalidRequest");
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_callback_forwards_the_pending_link_token_and_clears_it_on_success()
+-> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=link-code&state=link-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=link-state; wa_oidc_pending_link_token=stub-pending-link-token",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://admin.test/"));
+    let cookies = set_cookie_values(&resp);
+    assert!(cookies.iter().any(|c| c.starts_with("wa_session=")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_callback_bounces_with_link_failed_when_the_sign_in_does_not_confirm_the_link()
+-> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=link-code&state=link-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=link-state; wa_oidc_pending_link_token=some-other-token",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").and_then(|v| v.to_str().ok());
+    assert_eq!(loc, Some("http://login.test/?error=link_failed"));
+    let cookies = set_cookie_values(&resp);
+    assert!(!cookies.iter().any(|c| c.starts_with("wa_session=")));
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0"))
+    );
+    Ok(())
+}
+
+async fn start_login_set_cookies(query: &str) -> anyhow::Result<Vec<String>> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(test_config(backend)).unwrap();
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get(format!(
+                "/oidc/google/login?redirect_uri=http%3A%2F%2Fadmin.test%2F&next=http%3A%2F%2Flogin.test%2F{query}"
+            ))
+            .header("cookie", "wa_oidc_pending_link_token=stub-pending-link-token")
+            .body(Body::empty())?,
+        ))
+        .await?;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    Ok(set_cookie_values(&resp))
+}
+
+#[tokio::test]
+async fn a_plain_oidc_login_drops_a_leftover_pending_link() -> anyhow::Result<()> {
+    let cookies = start_login_set_cookies("").await?;
+
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=") && c.contains("Max-Age=0")),
+        "got {cookies:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_oidc_login_meant_to_confirm_a_link_keeps_the_pending_link() -> anyhow::Result<()> {
+    let cookies = start_login_set_cookies("&confirm_link=true").await?;
+
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=")),
+        "got {cookies:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn over_https_the_pending_link_cookie_is_host_prefixed_so_a_sibling_subdomain_cannot_plant_it()
+-> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let app = app(Config {
+        bff_url: "https://bff.test".into(),
+        ..test_config(backend)
+    })
+    .unwrap();
+
+    let resp = app
+        .oneshot(with_test_peer(
+            Request::get("/oidc/google/callback?code=unverified-code&state=unverified-state")
+                .header(
+                    "cookie",
+                    "wa_oidc_redirect_uri=http://admin.test/; wa_oidc_next=http://login.test/; wa_oidc_state=unverified-state",
+                )
+                .body(Body::empty())?,
+        ))
+        .await?;
+
+    let cookies = set_cookie_values(&resp);
+    assert!(
+        cookies.iter().any(|c| {
+            c.starts_with("__Host-wa_oidc_pending_link_token=stub-pending-link-token")
+                && c.contains("Path=/;")
+                && c.contains("Secure")
+        }),
+        "got {cookies:?}"
+    );
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("wa_oidc_pending_link_token=")),
+        "got {cookies:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn providers_relays_backends_list() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+
+    let resp = app(test_config(backend))?
+        .oneshot(with_test_peer(
+            Request::get("/oidc/providers").body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await?)?;
+    assert_eq!(
+        body,
+        serde_json::json!({"providers": [{"key": "google", "display_name": "Google"}]})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn providers_is_a_bad_gateway_when_backend_is_unreachable() -> anyhow::Result<()> {
+    let resp = app(test_config("http://127.0.0.1:9".to_string()))?
+        .oneshot(with_test_peer(
+            Request::get("/oidc/providers").body(Body::empty())?,
+        ))
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     Ok(())
 }

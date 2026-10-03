@@ -307,6 +307,10 @@ pub struct OidcProviderConfig {
     /// not backend's own address. bff forwards the provider's callback
     /// request to backend's matching route server-to-server.
     pub redirect_uri: String,
+    /// How login pages name this provider ("Continue with LinkedIn"); served
+    /// at `/oauth/oidc/providers`. Unset: the key with its first letter capitalized.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Extra profile fields to take from this provider's id_token, as
     /// `field name -> id_token claim name` (e.g. `last_name: family_name`).
     /// Claim names differ per provider, so nothing is forwarded by default.
@@ -348,6 +352,20 @@ pub struct ProfileApiConfig {
     /// out, and a pointer that finds nothing leaves just that field out.
     #[serde(default)]
     pub required: bool,
+}
+
+impl OidcProviderConfig {
+    /// `display_name`, or `key` (this provider's name under `oidc_providers`)
+    /// with its first letter capitalized.
+    pub fn display_name_for(&self, key: &str) -> String {
+        self.display_name.clone().unwrap_or_else(|| {
+            let mut chars = key.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        })
+    }
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -560,6 +578,28 @@ mod tests {
     use super::*;
     use figment::Jail;
     use secrecy::ExposeSecret;
+
+    fn provider(display_name: Option<&str>) -> OidcProviderConfig {
+        OidcProviderConfig {
+            client_id: String::new(),
+            client_secret: SecretString::from(String::new()),
+            issuer: String::new(),
+            redirect_uri: String::new(),
+            display_name: display_name.map(str::to_string),
+            extra_claims: HashMap::new(),
+            scopes: Vec::new(),
+            profile_apis: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_provider_without_a_display_name_is_shown_by_its_capitalized_key() {
+        assert_eq!(provider(None).display_name_for("google"), "Google");
+        assert_eq!(
+            provider(Some("LinkedIn")).display_name_for("linkedin"),
+            "LinkedIn"
+        );
+    }
 
     // A file that exists but can't be read is a deployment mistake, and
     // running on defaults instead would quietly drop every setting in it. A
