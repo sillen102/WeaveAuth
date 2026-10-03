@@ -10,6 +10,7 @@ mod controller {
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
@@ -92,12 +93,11 @@ mod controller {
         op.tag("Auth")
             .id("register")
             .summary("Register a new user")
-            .description(
-                "Creates a user with a password hashed via Argon2; 400 if the email is not a \
-                 valid address, 409 if it's already taken. Any fields beyond email/password are \
-                 forwarded to the deployer's configured extra-data handler -- 400 if none is \
-                 configured, 502 if the handler rejects the registration.",
-            )
+            .description(indoc! {"
+                Creates a user with a password hashed via Argon2; 400 if the email is not a
+                valid address, 409 if it's already taken. Any fields beyond email/password are
+                forwarded to the deployer's configured extra-data handler -- 400 if none is
+                configured, 502 if the handler rejects the registration."})
     }
 
     pub(crate) async fn register(
@@ -490,6 +490,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),

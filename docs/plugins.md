@@ -62,11 +62,11 @@ release. A plugin only has to handle the hooks it's wired into; return
   `google.protobuf.Struct`, so values can nest (e.g.
   `{"roles": {"admin": ["user-1", "user-2"]}}`), not just flat strings.
 - **Return any other status, or a claim name that collides with a reserved
-  one** (`sub`, `email`, `email_verified`, `iat`, `exp`) **to fail the
-  request.** No token is issued; the request gets `502`. This is
-  fail-closed by design: a token must not be minted without the claims it
-  was configured to carry, and a plugin can't spoof identity claims by
-  returning a reserved name.
+  one** (`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `email`,
+  `email_verified`) **to fail the request.** No token is issued; the
+  request gets `502`. This is fail-closed by design: a token must not be
+  minted without the claims it was configured to carry, and a plugin can't
+  spoof identity or registered claims by returning a reserved name.
 - An unset `data` field in the response is treated as no extra claims, not an
   error.
 

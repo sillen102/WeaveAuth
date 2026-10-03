@@ -10,6 +10,7 @@ mod controller {
     use common::extract::ApiForm;
     use common::model::token::GrantType;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
@@ -105,10 +106,9 @@ mod controller {
         op.tag("Auth")
             .id("token")
             .summary("Exchange an authorization code for tokens")
-            .description(
-                "Verifies code_verifier against the code_challenge stored at /oauth/authorize, \
-                 and that redirect_uri matches the one the code was issued for",
-            )
+            .description(indoc! {"
+                Verifies code_verifier against the code_challenge stored at /oauth/authorize,
+                and that redirect_uri matches the one the code was issued for."})
     }
 
     pub(crate) async fn issue_token(
@@ -179,12 +179,26 @@ mod service {
     /// (`super::login_claims`) that returns one of these would let a
     /// downstream plugin/webhook spoof identity claims, so a collision fails
     /// the token request instead of silently overwriting one.
-    const RESERVED_CLAIM_NAMES: &[&str] = &["sub", "email", "email_verified", "iat", "exp"];
+    /// `aud`/`nbf`/`jti` are never set here but still reserved: verifiers give
+    /// registered claims meaning, and an injected `aud` could get a token
+    /// accepted by a resource server it wasn't meant for.
+    const RESERVED_CLAIM_NAMES: &[&str] = &[
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "nbf",
+        "iat",
+        "jti",
+        "email",
+        "email_verified",
+    ];
 
     /// Access token claims (RFC 7519), plus whatever the configured
     /// login-claims handler (see `super::login_claims`) added.
     #[derive(Serialize)]
     struct Claims {
+        iss: String,
         sub: Uuid,
         /// The user's email at the time this token was issued -- callers that
         /// only see the token (not a fresh `/oauth/token` response) can still
@@ -305,6 +319,7 @@ mod service {
         let expires_at = issued_at + Duration::seconds(state.access_token_ttl_secs);
         let refresh_expires_at = issued_at + Duration::seconds(state.refresh_token_ttl_secs);
         let claims = Claims {
+            iss: state.issuer.to_string(),
             sub: user_id,
             email: user.email,
             email_verified: user.email_verified,
@@ -639,6 +654,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
@@ -1031,7 +1047,38 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::HashSet<_>>(),
-            std::collections::HashSet::from(["sub", "email", "email_verified", "iat", "exp"])
+            std::collections::HashSet::from([
+                "iss",
+                "sub",
+                "email",
+                "email_verified",
+                "iat",
+                "exp"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn access_token_is_issued_by_the_configured_issuer() {
+        let (mut state, user_id) = state_with_user().await;
+        state.issuer = "https://auth.internal".into();
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for("correct-verifier"),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                user_id,
+            )
+            .await;
+        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+
+        let Json(body) = issue_token(State(state), ApiForm(req)).await.unwrap();
+
+        assert_eq!(
+            decode_claims(&body.access_token)["iss"],
+            "https://auth.internal"
         );
     }
 
@@ -1064,27 +1111,43 @@ mod tests {
     // silently letting the downstream value win or lose the merge.
     #[tokio::test]
     async fn a_reserved_claim_name_from_the_handler_fails_the_token_request() {
-        let (mut state, user_id) = state_with_user().await;
-        let claims = serde_json::Map::from_iter([(
-            "sub".to_string(),
-            serde_json::json!("attacker-controlled"),
-        )]);
-        state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
-        state
-            .pkce
-            .save_code_challenge(
-                "code1".to_string(),
-                challenge_for("correct-verifier"),
-                CodeChallengeMethod::S256,
-                "http://redirect.test".to_string(),
-                user_id,
-            )
-            .await;
-        let req = code_req("code1", "correct-verifier", "http://redirect.test");
+        for name in [
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "nbf",
+            "iat",
+            "jti",
+            "email",
+            "email_verified",
+        ] {
+            let (mut state, user_id) = state_with_user().await;
+            let claims = serde_json::Map::from_iter([(
+                name.to_string(),
+                serde_json::json!("attacker-controlled"),
+            )]);
+            state.login_claims_handler = Some(Arc::new(FixedClaimsHandler(claims)));
+            state
+                .pkce
+                .save_code_challenge(
+                    "code1".to_string(),
+                    challenge_for("correct-verifier"),
+                    CodeChallengeMethod::S256,
+                    "http://redirect.test".to_string(),
+                    user_id,
+                )
+                .await;
+            let req = code_req("code1", "correct-verifier", "http://redirect.test");
 
-        let result = issue_token(State(state), ApiForm(req)).await;
+            let result = issue_token(State(state), ApiForm(req)).await;
 
-        assert_eq!(result.err(), Some(TokenError::ReservedClaimOverridden));
+            assert_eq!(
+                result.err(),
+                Some(TokenError::ReservedClaimOverridden),
+                "{name}"
+            );
+        }
     }
 
     // "Every token mint" (the locked design decision): a refresh grant must

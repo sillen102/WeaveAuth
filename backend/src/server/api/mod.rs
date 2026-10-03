@@ -4,6 +4,7 @@ pub(crate) mod health;
 pub(crate) mod jwks;
 pub(crate) mod login;
 pub(crate) mod oidc;
+pub(crate) mod openid_configuration;
 pub(crate) mod password_reset;
 pub(crate) mod register;
 pub(crate) mod token;

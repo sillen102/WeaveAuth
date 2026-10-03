@@ -17,6 +17,7 @@ mod controller {
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -135,35 +136,32 @@ mod controller {
         op.tag("Auth")
             .id("request_email_verification")
             .summary("Send a new verification code")
-            .description(
-                "Authenticated with the `verification_session` `/oauth/login` returned (401 \
-                 otherwise). Returns 202 and sends a fresh 9-digit code to the account's \
-                 address, delivered asynchronously through the configured email handler \
-                 (`status: \"sent\"`, with `expires_in_secs`). Also 202 when nothing was \
-                 sent, with `retry_after_secs` saying how long until a new code can be \
-                 requested: `status: \"cooling_down\"` when a code was sent within the resend \
-                 cooldown, `status: \"locked\"` when the account is locked after wrong \
-                 guesses; `status: \"locked_until_reset\"` (no `retry_after_secs`) after \
-                 five lockouts, until the password is reset. 401 as well for an already \
-                 verified account, 503 when no email handler is configured.",
-            )
+            .description(indoc! {r#"
+                Authenticated with the `verification_session` `/oauth/login` returned (401
+                otherwise). Returns 202 and sends a fresh 9-digit code to the account's address,
+                delivered asynchronously through the configured email handler (`status: "sent"`,
+                with `expires_in_secs`). Also 202 when nothing was sent, with `retry_after_secs`
+                saying how long until a new code can be requested: `status: "cooling_down"` when
+                a code was sent within the resend cooldown, `status: "locked"` when the account
+                is locked after wrong guesses; `status: "locked_until_reset"` (no
+                `retry_after_secs`) after five lockouts, until the password is reset. 401 as
+                well for an already verified account, 503 when no email handler is configured."#})
     }
 
     pub(crate) fn confirm_email_verification_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("confirm_email_verification")
             .summary("Verify an email address with the emailed code")
-            .description(
-                "Authenticated with the `verification_session` `/oauth/login` returned (401 \
-                 otherwise). When `code` matches, marks the email verified, ends the \
-                 verification session and returns the `login_session` the login withheld \
-                 (`status: \"verified\"`). 400 if the code is wrong or expired, or with reason \
-                 `CodeUsedUp` if too many wrong attempts used it up (a new one is needed); the \
-                 verification session stays usable. 423 with `status: \"locked\"` and \
-                 `retry_after_secs` while the account is locked out after too many wrong \
-                 guesses, or `status: \"locked_until_reset\"` after five lockouts, until the \
-                 password is reset: even the right code is refused.",
-            )
+            .description(indoc! {r#"
+                Authenticated with the `verification_session` `/oauth/login` returned (401
+                otherwise). When `code` matches, marks the email verified, ends the verification
+                session and returns the `login_session` the login withheld (`status:
+                "verified"`). 400 if the code is wrong or expired, or with reason `CodeUsedUp`
+                if too many wrong attempts used it up (a new one is needed); the verification
+                session stays usable. 423 with `status: "locked"` and `retry_after_secs` while
+                the account is locked out after too many wrong guesses, or `status:
+                "locked_until_reset"` after five lockouts, until the password is reset: even the
+                right code is refused."#})
     }
 
     pub(crate) async fn request_email_verification(

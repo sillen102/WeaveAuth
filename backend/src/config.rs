@@ -22,10 +22,17 @@ pub struct Config {
     /// How often a new JWT signing key replaces the active one. The
     /// replaced key stays published at `/.well-known/jwks.json` for
     /// [`jwt_key_grace_secs()`] after that, and the next key is published
-    /// [`JWT_KEY_ROTATION_MARGIN_SECS`] before it starts signing. The grace
-    /// plus that margin must fit inside this interval, so at most two keys
+    /// [`JWT_KEY_PUBLISH_AHEAD_SECS`] before it starts signing. The grace
+    /// plus that lead must fit inside this interval, so at most two keys
     /// are published at once.
     pub jwt_key_rotation_interval_secs: i64,
+    /// The `iss` claim on access tokens, and the base URL verifiers fetch
+    /// `/.well-known/openid-configuration` from, so it must be backend's
+    /// address as they reach it. Validated at load (http(s), no user info,
+    /// path, query or fragment) and stored normalized: scheme and host
+    /// lowercased, default port and trailing `/` dropped. That normalized
+    /// form is what `iss` carries.
+    pub issuer: String,
     /// How long a state entry for an in-flight `/oauth/oidc/login`
     /// redirect stays valid while the user is off at the provider's consent
     /// screen.
@@ -382,6 +389,7 @@ impl Default for Config {
             access_token_ttl_secs: 900,
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".to_string(),
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
             password_reset_token_ttl_secs: 1_800,
@@ -401,21 +409,23 @@ impl Default for Config {
     }
 }
 
-/// Margin around signing key changes, serving two purposes. A new key is
-/// published this long before it signs anything, so a consumer that caches
-/// the JWKS for less than this has it by then. A replaced key is kept this
-/// long past the last access token it signed, to cover verifiers' `exp`
-/// leeway (jsonwebtoken defaults to 60s) and clock skew.
-pub const JWT_KEY_ROTATION_MARGIN_SECS: i64 = 3_600;
+/// How long a new signing key is published before it signs anything, so a
+/// verifier that caches the JWKS for less than this, without re-fetching on
+/// an unknown `kid`, has it by then.
+pub const JWT_KEY_PUBLISH_AHEAD_SECS: i64 = 86_400;
+
+/// How long a replaced key is kept past the last access token it signed, to
+/// cover verifiers' `exp` leeway (jsonwebtoken defaults to 60s) and clock skew.
+pub const JWT_KEY_GRACE_MARGIN_SECS: i64 = 3_600;
 
 /// Largest accepted TTL or rotation interval (10 years): keeps the time
 /// arithmetic on these far from overflow.
 const MAX_SECS: i64 = 315_360_000;
 
 /// How long a replaced signing key stays published: the longest-lived access
-/// token it can have signed, plus [`JWT_KEY_ROTATION_MARGIN_SECS`].
+/// token it can have signed, plus [`JWT_KEY_GRACE_MARGIN_SECS`].
 pub fn jwt_key_grace_secs(access_token_ttl_secs: i64) -> i64 {
-    access_token_ttl_secs.saturating_add(JWT_KEY_ROTATION_MARGIN_SECS)
+    access_token_ttl_secs.saturating_add(JWT_KEY_GRACE_MARGIN_SECS)
 }
 
 impl Config {
@@ -518,15 +528,33 @@ impl Config {
         }
         // The replaced key must be pruned before the next one is staged, so at most two are published.
         if jwt_key_grace_secs(config.access_token_ttl_secs)
-            .saturating_add(JWT_KEY_ROTATION_MARGIN_SECS)
+            .saturating_add(JWT_KEY_PUBLISH_AHEAD_SECS)
             > config.jwt_key_rotation_interval_secs
         {
             anyhow::bail!(
-                "WA_ACCESS_TOKEN_TTL_SECS ({}) plus twice the {JWT_KEY_ROTATION_MARGIN_SECS}s key rotation margin must not exceed WA_JWT_KEY_ROTATION_INTERVAL_SECS ({})",
+                "WA_ACCESS_TOKEN_TTL_SECS ({}) plus {}s (key grace margin and publish-ahead) must not exceed WA_JWT_KEY_ROTATION_INTERVAL_SECS ({})",
                 config.access_token_ttl_secs,
+                JWT_KEY_GRACE_MARGIN_SECS + JWT_KEY_PUBLISH_AHEAD_SECS,
                 config.jwt_key_rotation_interval_secs
             );
         }
+
+        // The value isn't echoed in these errors: it may carry credentials.
+        let issuer = url::Url::parse(&config.issuer)
+            .map_err(|e| anyhow::anyhow!("invalid WA_ISSUER: {e}"))?;
+        if !matches!(issuer.scheme(), "http" | "https")
+            || !issuer.username().is_empty()
+            || issuer.password().is_some()
+            // Backend serves discovery and the endpoints it lists at its own root.
+            || issuer.path() != "/"
+            || issuer.query().is_some()
+            || issuer.fragment().is_some()
+        {
+            anyhow::bail!(
+                "WA_ISSUER must be an http(s) URL without user info, path, query or fragment"
+            );
+        }
+        config.issuer = issuer.origin().ascii_serialization();
 
         Ok(config)
     }
@@ -681,13 +709,13 @@ mod tests {
     }
 
     #[test]
-    fn access_ttl_plus_twice_the_margin_longer_than_rotation_interval_is_rejected() {
+    fn access_ttl_plus_grace_margin_and_publish_ahead_longer_than_rotation_interval_is_rejected() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1001");
             jail.set_env(
                 "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
-                (1000 + 2 * JWT_KEY_ROTATION_MARGIN_SECS).to_string(),
+                (1000 + JWT_KEY_GRACE_MARGIN_SECS + JWT_KEY_PUBLISH_AHEAD_SECS).to_string(),
             );
 
             let error = Config::load().unwrap_err().to_string();
@@ -697,13 +725,13 @@ mod tests {
     }
 
     #[test]
-    fn access_ttl_plus_twice_the_margin_equal_to_rotation_interval_is_accepted() {
+    fn access_ttl_plus_grace_margin_and_publish_ahead_equal_to_rotation_interval_is_accepted() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
             jail.set_env("WA_ACCESS_TOKEN_TTL_SECS", "1000");
             jail.set_env(
                 "WA_JWT_KEY_ROTATION_INTERVAL_SECS",
-                (1000 + 2 * JWT_KEY_ROTATION_MARGIN_SECS).to_string(),
+                (1000 + JWT_KEY_GRACE_MARGIN_SECS + JWT_KEY_PUBLISH_AHEAD_SECS).to_string(),
             );
 
             Config::load().unwrap();
@@ -715,12 +743,74 @@ mod tests {
     fn refresh_ttl_may_outlast_the_rotation_interval() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
-            jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "86400");
+            jail.set_env("WA_JWT_KEY_ROTATION_INTERVAL_SECS", "172800");
             jail.set_env("WA_REFRESH_TOKEN_TTL_SECS", "864000");
 
             Config::load().unwrap();
             Ok(())
         });
+    }
+
+    #[test]
+    fn issuer_is_set_from_env_without_its_trailing_slash() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_ISSUER", "https://auth.internal:1983/");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.issuer, "https://auth.internal:1983");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn issuer_is_stored_in_its_normalized_form() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_ISSUER", "HTTP:Auth.Internal");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.issuer, "http://auth.internal");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn issuer_drops_the_default_port_but_keeps_any_other() {
+        for (issuer, stored) in [
+            ("https://auth.internal:443", "https://auth.internal"),
+            ("https://auth.internal:8443", "https://auth.internal:8443"),
+        ] {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                jail.set_env("WA_ISSUER", issuer);
+
+                assert_eq!(Config::load().unwrap().issuer, stored);
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_or_non_http_issuer_is_rejected() {
+        for issuer in [
+            "not a url",
+            "ftp://auth.internal",
+            "https://auth.internal?x=1",
+            "https://auth.internal#x",
+            "https://auth.internal/auth",
+            "https://user@auth.internal",
+            "https://:secret@auth.internal",
+        ] {
+            Jail::expect_with(|jail| {
+                jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                jail.set_env("WA_ISSUER", issuer);
+
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains("WA_ISSUER"), "{issuer}: {error}");
+                Ok(())
+            });
+        }
     }
 
     #[test]

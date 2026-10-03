@@ -20,6 +20,7 @@ fn test_config() -> Config {
         access_token_ttl_secs: 900,
         refresh_token_ttl_secs: 2_592_000,
         jwt_key_rotation_interval_secs: 2_592_000,
+        issuer: "http://localhost:1983".into(),
         oidc_state_ttl_secs: 300,
         pending_oidc_link_ttl_secs: 600,
         password_reset_token_ttl_secs: 1_800,
@@ -367,4 +368,35 @@ async fn openapi_generation_reports_no_errors() {
     aide::generate::on_error(|err| panic!("openapi generation error: {err}"));
 
     let _app = app(&test_config()).await.expect("test app builds");
+}
+
+#[tokio::test]
+async fn discovery_document_is_served_and_its_jwks_uri_resolves() {
+    let app = app(&test_config()).await.unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["issuer"], "http://localhost:1983");
+    let jwks_path = body["jwks_uri"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://localhost:1983")
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .oneshot(Request::get(jwks_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!body_json(resp).await["keys"].as_array().unwrap().is_empty());
 }
