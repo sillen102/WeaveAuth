@@ -8,6 +8,7 @@ mod controller {
     use axum::response::Redirect;
     use common::extract::ApiQuery;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
@@ -56,10 +57,9 @@ mod controller {
         op.tag("Auth")
             .id("authorize")
             .summary("Issue an authorization code")
-            .description(
-                "Requires a login_session from /oauth/login proving the user is authenticated, \
-                 then binds a single-use auth_code to the given PKCE code_challenge",
-            )
+            .description(indoc! {"
+                Requires a login_session from /oauth/login proving the user is authenticated,
+                then binds a single-use auth_code to the given PKCE code_challenge."})
     }
 
     pub(crate) async fn authorize(
@@ -178,6 +178,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),

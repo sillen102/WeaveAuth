@@ -1,5 +1,5 @@
 use crate::config::{
-    Config, EmailHandlerConfig, ExtraDataHandlerConfig, JWT_KEY_ROTATION_MARGIN_SECS,
+    Config, EmailHandlerConfig, ExtraDataHandlerConfig, JWT_KEY_PUBLISH_AHEAD_SECS,
     LoginClaimsHandlerConfig, OidcProviderConfig, ProfileApiConfig, jwt_key_grace_secs,
 };
 use crate::oidc::{self, OidcClient};
@@ -39,6 +39,7 @@ pub(crate) struct AppState {
     pub(crate) refresh_tokens: InMemoryRefreshTokenStorage,
     pub(crate) refresh_token_ttl_secs: i64,
     pub(crate) jwt_key_rotation_interval_secs: i64,
+    pub(crate) issuer: Arc<str>,
     pub(crate) oidc_providers: Arc<HashMap<String, OidcClient>>,
     /// Per provider: `field name -> id_token claim name` (see `OidcProviderConfig::extra_claims`).
     pub(crate) oidc_extra_claims: Arc<HashMap<String, HashMap<String, String>>>,
@@ -75,12 +76,12 @@ impl AppState {
 
     /// Keeps the signing key rotating, one step per call as each falls due.
     ///
-    /// Stage: `JWT_KEY_ROTATION_MARGIN_SECS` before the active key is
+    /// Stage: [`JWT_KEY_PUBLISH_AHEAD_SECS`] before the active key is
     /// `jwt_key_rotation_interval_secs` old, the next key is published
     /// without signing.
     ///
     /// Promote: once the active key is that old and the staged key has been
-    /// published for the margin, the staged key takes over.
+    /// published for that long, the staged key takes over.
     ///
     /// Prune: a replaced key stays published for [`jwt_key_grace_secs`]
     /// after that, by which time every access token it signed has expired.
@@ -91,13 +92,13 @@ impl AppState {
                 chrono::Duration::seconds(jwt_key_grace_secs(self.access_token_ttl_secs)),
             )
             .await;
-        let margin = chrono::Duration::seconds(JWT_KEY_ROTATION_MARGIN_SECS);
+        let ahead = chrono::Duration::seconds(JWT_KEY_PUBLISH_AHEAD_SECS);
         let interval = chrono::Duration::seconds(self.jwt_key_rotation_interval_secs);
         let active_for = now - self.jwt_keys.active_since().await;
 
         let staged_at = match self.jwt_keys.next_since().await {
             Some(at) => at,
-            None if active_for >= interval - margin => {
+            None if active_for >= interval - ahead => {
                 if let Err(error) = self.jwt_keys.stage_next(now).await {
                     tracing::error!(%error, "staging the next JWT signing key failed; retrying on the next sweep");
                     return;
@@ -107,7 +108,7 @@ impl AppState {
             None => return,
         };
         if active_for >= interval
-            && now - staged_at >= margin
+            && now - staged_at >= ahead
             && let Err(error) = self.jwt_keys.promote_next(now).await
         {
             tracing::error!(%error, "JWT signing key rotation failed; keeping the current key");
@@ -185,6 +186,7 @@ impl AppState {
             refresh_tokens: InMemoryRefreshTokenStorage::new(config.refresh_token_ttl_secs),
             refresh_token_ttl_secs: config.refresh_token_ttl_secs,
             jwt_key_rotation_interval_secs: config.jwt_key_rotation_interval_secs,
+            issuer: config.issuer.as_str().into(),
             oidc_providers: Arc::new(oidc_providers),
             oidc_profile_apis: Arc::new(
                 config
@@ -452,12 +454,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_key_is_staged_one_rotation_margin_before_the_interval_without_signing() {
+    async fn next_key_is_staged_one_publish_ahead_before_the_interval_without_signing() {
         let state = AppState::for_test().await;
         let kid = state.jwt_keys.active_key().await.kid.clone();
         let since = state.jwt_keys.active_since().await;
         let stage_at =
-            since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_ROTATION_MARGIN_SECS);
+            since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_PUBLISH_AHEAD_SECS);
 
         state.rotate_keys_if_due(stage_at - secs(1)).await;
         assert_eq!(published(&state).await, 1);
@@ -479,7 +481,7 @@ mod tests {
         let since = state.jwt_keys.active_since().await;
         state
             .rotate_keys_if_due(
-                since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_ROTATION_MARGIN_SECS),
+                since + secs(state.jwt_key_rotation_interval_secs - JWT_KEY_PUBLISH_AHEAD_SECS),
             )
             .await;
         let staged_kid = state.jwt_keys.jwk_set().await["keys"][1]["kid"]
@@ -502,7 +504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_staged_late_is_published_for_the_full_margin_before_it_signs() {
+    async fn a_key_staged_late_is_published_for_the_full_publish_ahead_before_it_signs() {
         let state = AppState::for_test().await;
         let kid = state.jwt_keys.active_key().await.kid.clone();
         let late =
@@ -513,12 +515,12 @@ mod tests {
         assert_eq!(state.jwt_keys.active_key().await.kid, kid);
 
         state
-            .rotate_keys_if_due(late + secs(JWT_KEY_ROTATION_MARGIN_SECS - 1))
+            .rotate_keys_if_due(late + secs(JWT_KEY_PUBLISH_AHEAD_SECS - 1))
             .await;
         assert_eq!(state.jwt_keys.active_key().await.kid, kid);
 
         state
-            .rotate_keys_if_due(late + secs(JWT_KEY_ROTATION_MARGIN_SECS))
+            .rotate_keys_if_due(late + secs(JWT_KEY_PUBLISH_AHEAD_SECS))
             .await;
         assert_ne!(state.jwt_keys.active_key().await.kid, kid);
     }

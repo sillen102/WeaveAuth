@@ -87,8 +87,9 @@ never the browser directly.
 - `grant_type=authorization_code`: redeems `auth_code` (single-use), checks
   `redirect_uri` matches what the code was issued for, checks `code_verifier` hashes
   to the stored `code_challenge`.
-- Mints an access token (RS256 JWT; claims `sub`, `email`, `email_verified`, `iat`,
-  `exp`) and a fresh opaque refresh token in a new `family_id`.
+- Mints an access token (RS256 JWT; claims `iss` (`WA_ISSUER`), `sub`, `email`,
+  `email_verified`, `iat`, `exp`) and a fresh opaque refresh token in a new
+  `family_id`.
 - `grant_type=refresh_token`: redeems and rotates a refresh token; replaying an
   already-rotated token revokes the whole family.
 

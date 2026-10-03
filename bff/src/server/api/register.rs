@@ -8,6 +8,7 @@ mod controller {
     use axum::response::{IntoResponse, Response};
     use common::extract::ApiForm;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use std::collections::HashMap;
@@ -75,11 +76,10 @@ mod controller {
         op.tag("Auth")
             .id("register")
             .summary("Register a new user and log them in")
-            .description(
-                "Forwards to backend's /register, then auto-logs the new user in. Any fields \
-                 beyond email/password/redirect_uri/next are forwarded to backend as-is, which \
-                 in turn forwards them to its own configured extra-data handler.",
-            )
+            .description(indoc! {"
+                Forwards to backend's /register, then auto-logs the new user in. Any fields
+                beyond email/password/redirect_uri/next are forwarded to backend as-is, which in
+                turn forwards them to its own configured extra-data handler."})
     }
 
     /// Forwards registration to backend's `/register`, then -- since the

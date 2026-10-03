@@ -6,13 +6,14 @@ mod controller {
     use axum::Json;
     use axum::extract::State;
     use axum::http::{HeaderValue, header};
+    use indoc::indoc;
     use serde_json::Value;
 
     use crate::server::AppState;
 
     use super::service;
 
-    /// Below `JWT_KEY_ROTATION_MARGIN_SECS`, with headroom for the delay
+    /// Well below `JWT_KEY_PUBLISH_AHEAD_SECS`, with headroom for the delay
     /// before a sweep tick stages the next key.
     const JWKS_CACHE_CONTROL: HeaderValue = HeaderValue::from_static("public, max-age=1800");
 
@@ -20,14 +21,13 @@ mod controller {
         op.tag("Auth")
             .id("jwks")
             .summary("JSON Web Key Set")
-            .description(
-                "Public keys used to verify access token signatures (RFC 7517). \
-A new key is published ahead of signing with it (except right after a backend \
-restart, when a fresh key signs at once and tokens signed before it no longer \
-verify), and a replaced key stays published \
-until its tokens have expired. Cache for at most the `max-age` sent, and \
-re-fetch when a token has an unknown `kid`, at most once per minute.",
-            )
+            .description(indoc! {"
+                Public keys used to verify access token signatures (RFC 7517). A new key is
+                published ahead of signing with it (except right after a backend restart, when a
+                fresh key signs at once and tokens signed before it no longer verify), and a
+                replaced key stays published until its tokens have expired. Cache for at most
+                the `max-age` sent, and re-fetch when a token has an unknown `kid`, at most once
+                per minute."})
     }
 
     pub(crate) async fn jwks(
@@ -56,7 +56,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::header::CACHE_CONTROL;
 
-    use crate::config::JWT_KEY_ROTATION_MARGIN_SECS;
+    use crate::config::JWT_KEY_PUBLISH_AHEAD_SECS;
     use crate::server::AppState;
 
     #[tokio::test]
@@ -72,6 +72,6 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(0 < max_age && max_age < JWT_KEY_ROTATION_MARGIN_SECS);
+        assert!(0 < max_age && max_age < JWT_KEY_PUBLISH_AHEAD_SECS);
     }
 }

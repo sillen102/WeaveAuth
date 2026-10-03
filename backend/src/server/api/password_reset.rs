@@ -9,6 +9,7 @@ mod controller {
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::Deserialize;
     use thiserror::Error;
@@ -62,23 +63,21 @@ mod controller {
         op.tag("Auth")
             .id("request_password_reset")
             .summary("Request a password reset")
-            .description(
-                "Always returns 202, whether or not `email` matches an account, so the \
-                 response can't be used to enumerate registered addresses. The issued token \
-                 is never included in the response or logged; delivering it to the account \
-                 owner is out of scope for this endpoint.",
-            )
+            .description(indoc! {"
+                Always returns 202, whether or not `email` matches an account, so the response
+                can't be used to enumerate registered addresses. The issued token is never
+                included in the response or logged; delivering it to the account owner is out of
+                scope for this endpoint."})
     }
 
     pub(crate) fn confirm_password_reset_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("confirm_password_reset")
             .summary("Redeem a password reset token")
-            .description(
-                "Sets a new password on the account `token` was issued for, and revokes every \
-                 outstanding refresh token and login session for that account; 400 if the \
-                 token is unknown, expired, or already used.",
-            )
+            .description(indoc! {"
+                Sets a new password on the account `token` was issued for, and revokes every
+                outstanding refresh token and login session for that account; 400 if the token
+                is unknown, expired, or already used."})
     }
 
     pub(crate) async fn request_password_reset(
@@ -252,6 +251,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),

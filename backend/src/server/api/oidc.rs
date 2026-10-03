@@ -15,6 +15,7 @@ mod controller {
     use axum::response::Redirect;
     use common::extract::{ApiJson, ApiQuery};
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -170,51 +171,46 @@ mod controller {
         op.tag("Auth")
             .id("oidc_providers")
             .summary("List the configured OIDC providers")
-            .description(
-                "Each configured provider's key and the name a login page should show for it \
-                 (`display_name`, default the key capitalized). bff serves this as its own \
-                 /oidc/providers.",
-            )
+            .description(indoc! {"
+                Each configured provider's key and the name a login page should show for it
+                (`display_name`, default the key capitalized). bff serves this as its own
+                /oidc/providers."})
     }
 
     pub(crate) fn oidc_login_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("oidc_login")
             .summary("Start a third-party OIDC login")
-            .description(
-                "Not meant to be called by the browser directly -- bff proxies this \
-                 server-to-server and relays the redirect. `provider` (query param) is one of the keys \
-                 configured under `oidc_providers`, e.g. \"google\".",
-            )
+            .description(indoc! {r#"
+                Not meant to be called by the browser directly -- bff proxies this
+                server-to-server and relays the redirect. `provider` (query param) is one of the
+                keys configured under `oidc_providers`, e.g. "google"."#})
     }
 
     pub(crate) fn oidc_callback_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("oidc_callback")
             .summary("Complete a third-party OIDC login")
-            .description(
-                "Not meant to be called by the provider directly -- backend isn't \
-                 internet-exposed, so bff receives the provider's redirect at its own public \
-                 URL and forwards provider+code+state (all query params) here \
-                 server-to-server. Returns either an Authenticated login_session (same shape as \
-                 a successful /oauth/login), or a \
-                 LinkConfirmationRequired response if this email matches an existing account \
-                 this identity isn't linked to yet. The link is confirmed either with the \
-                 account's password (/oauth/oidc/confirm-link) or by calling this again for a \
-                 sign-in through one of the account's linked providers, passing \
-                 pending_link_token (409 if that sign-in isn't linked to the account).",
-            )
+            .description(indoc! {"
+                Not meant to be called by the provider directly -- backend isn't
+                internet-exposed, so bff receives the provider's redirect at its own public URL
+                and forwards provider+code+state (all query params) here server-to-server.
+                Returns either an Authenticated login_session (same shape as a successful
+                /oauth/login), or a LinkConfirmationRequired response if this email matches an
+                existing account this identity isn't linked to yet. The link is confirmed either
+                with the account's password (/oauth/oidc/confirm-link) or by calling this again
+                for a sign-in through one of the account's linked providers, passing
+                pending_link_token (409 if that sign-in isn't linked to the account)."})
     }
 
     pub(crate) fn oidc_confirm_link_doc(op: TransformOperation) -> TransformOperation {
         op.tag("Auth")
             .id("oidc_confirm_link")
             .summary("Link an OIDC identity into an existing account with its password")
-            .description(
-                "Call after /oauth/oidc/callback returns \
-                 LinkConfirmationRequired, supplying that account's password. On success, \
-                 the identity is linked and the account is marked email_verified.",
-            )
+            .description(indoc! {"
+                Call after /oauth/oidc/callback returns LinkConfirmationRequired, supplying that
+                account's password. On success, the identity is linked and the account is marked
+                email_verified."})
     }
 
     pub(crate) async fn oidc_providers(
@@ -815,6 +811,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: Arc::new(HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),

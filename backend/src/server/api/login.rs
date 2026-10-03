@@ -8,6 +8,7 @@ mod controller {
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use common_macros::ErrorResponses;
+    use indoc::indoc;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -73,18 +74,17 @@ mod controller {
         op.tag("Auth")
             .id("login")
             .summary("Authenticate a user")
-            .description(
-                "Checks email/password against stored users and, on success, returns a \
-                 short-lived login_session token that /oauth/authorize requires before it will \
-                 issue a code -- this is what makes authentication happen before authorization \
-                 regardless of what order a caller invokes the two endpoints in. An account whose \
-                 email isn't verified also gets a verification_session (good only for \
-                 /oauth/email-verification/*); when the deployment requires verified emails \
-                 that is all it gets, and the verification email is sent. The body is one of \
-                 {login_session}, {login_session, verification_session, \
-                 verification_session_ttl_secs} or {verification_session, \
-                 verification_session_ttl_secs}.",
-            )
+            .description(indoc! {"
+                Checks email/password against stored users and, on success, returns a
+                short-lived login_session token that /oauth/authorize requires before it will
+                issue a code -- this is what makes authentication happen before authorization
+                regardless of what order a caller invokes the two endpoints in. An account whose
+                email isn't verified also gets a verification_session (good only for
+                /oauth/email-verification/*); when the deployment requires verified emails that
+                is all it gets, and the verification email is sent. The body is one of
+                {login_session}, {login_session, verification_session,
+                verification_session_ttl_secs} or {verification_session,
+                verification_session_ttl_secs}."})
     }
 
     pub(crate) async fn login(
@@ -237,6 +237,7 @@ mod tests {
             refresh_tokens: crate::storage::in_memory::InMemoryRefreshTokenStorage::new(2_592_000),
             refresh_token_ttl_secs: 2_592_000,
             jwt_key_rotation_interval_secs: 2_592_000,
+            issuer: "http://localhost:1983".into(),
             oidc_providers: std::sync::Arc::new(std::collections::HashMap::new()),
             oidc_extra_claims: Arc::new(Default::default()),
             oidc_scopes: Arc::new(Default::default()),
