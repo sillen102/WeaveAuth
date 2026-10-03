@@ -1033,7 +1033,7 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "client-id".to_string(),
                 client_secret: secrecy::SecretString::from("client-secret".to_string()),
-                redirect_uri: "http://localhost/callback".to_string(),
+                redirect_uri: Some("http://localhost/callback".to_string()),
                 display_name: None,
                 extra_claims: HashMap::new(),
                 scopes: vec!["email".to_string()],
@@ -1041,7 +1041,7 @@ mod tests {
             },
         );
         let http_client = openidconnect::reqwest::Client::new();
-        let providers = crate::oidc::build_providers(&configs, &http_client)
+        let providers = crate::oidc::build_providers(&configs, "http://bff.test", &http_client)
             .await
             .expect("discovery succeeds");
 

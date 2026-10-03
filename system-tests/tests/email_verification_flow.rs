@@ -9,7 +9,7 @@ use weaveauth_system_tests::support;
 use std::collections::HashMap;
 
 use support::config::FINAL_REDIRECT;
-use support::plugin::{current_id, env, register};
+use support::plugin::{env, plugin_settings, register};
 use support::servers::spawn_backend;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,7 +22,7 @@ const LOGIN_URL: &str = "http://login.test";
 fn backend_config(handler: weaveauth::config::EmailHandlerConfig) -> weaveauth::config::Config {
     weaveauth::config::Config {
         email_handler: Some(handler),
-        login_public_url: Some(LOGIN_URL.to_string()),
+        login_public_url: LOGIN_URL.to_string(),
         require_verified_email: true,
         ..support::config::backend_config(vec![FINAL_REDIRECT.to_string()])
     }
@@ -119,15 +119,13 @@ async fn assert_full_flow(backend_url: &str, delivered_code: impl AsyncFnOnce() 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plugin_receives_the_code_and_entering_it_unlocks_login() {
     let out = std::env::temp_dir().join(format!("wa-email-{}", uuid::Uuid::new_v4()));
-    let config = backend_config(weaveauth::config::EmailHandlerConfig::Plugin {
-        command: PLUGIN.to_string(),
-        args: vec![],
-        env: env(&[("EMAIL_OUT", out.to_str().expect("utf-8 path"))]),
-        timeout_secs: 10,
-        startup_timeout_secs: 10,
-        uid: current_id("-u"),
-        gid: current_id("-g"),
-    });
+    let config = backend_config(weaveauth::config::EmailHandlerConfig::Plugin(
+        plugin_settings(
+            PLUGIN,
+            env(&[("EMAIL_OUT", out.to_str().expect("utf-8 path"))]),
+            10,
+        ),
+    ));
     let (backend_url, _handle) = spawn_backend(&config).await.expect("backend starts");
 
     assert_full_flow(&backend_url, async || {
@@ -153,10 +151,12 @@ async fn a_webhook_receives_the_code_and_entering_it_unlocks_login() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&hook)
         .await;
-    let config = backend_config(weaveauth::config::EmailHandlerConfig::Webhook {
-        url: format!("{}/hook", hook.uri()),
-        timeout_secs: 5,
-    });
+    let config = backend_config(weaveauth::config::EmailHandlerConfig::Webhook(
+        weaveauth::config::WebhookConfig {
+            url: format!("{}/hook", hook.uri()),
+            timeout_secs: 5,
+        },
+    ));
     let (backend_url, _handle) = spawn_backend(&config).await.expect("backend starts");
 
     assert_full_flow(&backend_url, async || {
@@ -190,10 +190,12 @@ async fn a_failing_handler_does_not_fail_registration_and_resend_respects_the_co
         .respond_with(ResponseTemplate::new(500))
         .mount(&hook)
         .await;
-    let config = backend_config(weaveauth::config::EmailHandlerConfig::Webhook {
-        url: format!("{}/hook", hook.uri()),
-        timeout_secs: 5,
-    });
+    let config = backend_config(weaveauth::config::EmailHandlerConfig::Webhook(
+        weaveauth::config::WebhookConfig {
+            url: format!("{}/hook", hook.uri()),
+            timeout_secs: 5,
+        },
+    ));
     let (backend_url, _handle) = spawn_backend(&config).await.expect("backend starts");
 
     assert_eq!(

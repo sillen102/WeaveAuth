@@ -43,7 +43,7 @@ exist. What comes back then depends on the account:
 
 The `verification_session` is a random 32-byte token held by backend's
 `VerificationSessionStorage`, bound to one user and valid for
-`email_verification_session_ttl_secs` (default 1800); the response also carries that lifetime
+30 minutes (1800s, fixed); the response also carries that lifetime
 (`verification_session_ttl_secs`) so bff's cookie lives exactly as long. It is **not consumed** by
 use, so a wrong code leaves it usable. It is only accepted by `/oauth/email-verification/*`.
 A **password reset revokes every verification session of the account** and clears its code
@@ -97,7 +97,7 @@ own origin; backend's allowlist must include whichever applies.
 
 **5. Resend (`POST /verify-email/resend`, bff).** Form `{next}`, same cookie and checks ->
 backend's `POST /oauth/email-verification/request`, which sends only when the account is
-unverified, outside the cooldown (`email_verification_resend_cooldown_secs`, default 60) and not
+unverified, outside the cooldown (60s, fixed) and not
 locked out, and says which happened:
 - sent: `202 {status: "sent", expires_in_secs}` -> bff bounces to
   `next?status=sent&expires_in=<secs>` and the page says how long the code is valid;
@@ -174,8 +174,8 @@ verification is required and the account has no live code) and by the resend end
 
 - No `email_handler` configured: nothing happens and no code is issued.
 - A code is issued for the user: 9 random digits, stored only as a sha256 over the user id and
-  the code, valid for `email_verification_code_ttl_secs` (default 900). A new code replaces the
-  old one. A second code is **not** issued within `email_verification_resend_cooldown_secs` of the
+  the code, valid for 15 minutes (900s, fixed). A new code replaces the
+  old one. A second code is **not** issued within 60 seconds of the
   last one, so resend can't flood an inbox or keep replacing the code the user is typing.
 - The handler gets `{user_id, email, code, verify_page_url, expires_at}` (`expires_at` is RFC
   3339, UTC) and runs in a **background task**, so neither registration, login nor the resend

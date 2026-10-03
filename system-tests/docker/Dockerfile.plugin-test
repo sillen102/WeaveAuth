@@ -28,3 +28,5 @@ FROM ${BASE_IMAGE}
 COPY --from=probe-builder /app/target/release/probe-plugin /usr/local/bin/probe-plugin
 COPY --from=probe-builder /out /etc/weaveauth
 ENV WA_CONFIG_FILE=/etc/weaveauth/config.yaml
+# All three services run here; login reads no config file, so the profile is an env var.
+ENV WA_PROFILE=dev

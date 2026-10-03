@@ -148,9 +148,7 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   `.cargo/mutants.toml` by default, not a workspace-root `mutants.toml`.
 - A surviving mutant that only changes whether a log line fires (not any return value,
   stored state, or response) is treated as accepted noise, not chased with log-capture
-  test infrastructure — e.g. `Config::load`'s `>` vs `>=` at the bcrypt cost clamp
-  boundary is a no-op either way (the clamped and unclamped value are identical at the
-  boundary); `upgrade_bcrypt_to_argon2`'s `!=`/`==` on the `set_password` outcome only
+  test infrastructure — e.g. `upgrade_bcrypt_to_argon2`'s `!=`/`==` on the `set_password` outcome only
   gates a `tracing::warn!`. Record the reasoning in the commit body when leaving one
   unaddressed.
 - When a run does happen for security-relevant behavior, record the surviving-then-fixed
@@ -242,9 +240,24 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 
 - `backend` and `bff` load an optional YAML overlay (`WA_CONFIG_FILE`, default bare
   `config.yaml` relative to cwd — see the cwd gotcha above) before env vars; env vars
-  still win when set. New scalar config → add a field to `Config` + the crate's
-  `FileConfig` + a row in `README.md`. Structured config with no sane env shape (bff's
-  `routes`) is YAML-only.
+  still win when set. All three services load through `common::config`: defaults, then
+  YAML (backend and bff only; login reads env vars alone), then only the env vars listed
+  in the crate's `ENV`/`ENV_LISTS` table (so an unlisted `WA_*` var is never read). A
+  YAML key can set any `Config` field; an env var exists only when someone needs it per
+  deployment.
+- A setting that can be derived from another is derived in `Config::load` when the
+  deployer didn't set it (`user.contains("key")`), not given its own required input:
+  allowlist/trusted origins from `WA_LOGIN_PUBLIC_URL`, backend's `issuer` from
+  `WA_PORT` (dev only; prod requires `WA_BACKEND_URL`), OIDC `redirect_uri` from
+  `WA_BFF_URL`, and the `WA_PROFILE` (`dev`/`prod`) defaults. `prod` (the default, in
+  all three services) refuses to start unless the browser-facing URLs are https
+  (`require_https_in_prod`; `WA_LOGIN_PUBLIC_URL` must be a bare origin) and backend's
+  own URL is set; test and dev configs set `profile: dev` (`WA_PROFILE=dev` where login
+  runs too, since it reads no YAML). Every service trims a trailing `/` off
+  `WA_LOGIN_PUBLIC_URL` before deriving from it. Lifetimes nobody tunes per deployment
+  go in backend's `Tuning` (code-only) or a constant, not in YAML/env. New scalar config
+  → a field on `Config` + a row in the crate's `ENV` table (if it needs an env var) + a
+  row in `README.md`.
 - Custom environment variables are prefixed with `WA_`.
 - Root `Cargo.toml`'s `[workspace.dependencies]` declares bare version numbers only, no
   features (e.g. `axum = "0.8"`, not `axum = { version = "0.8" }`). Each member crate

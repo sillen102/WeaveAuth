@@ -13,9 +13,8 @@ fn docs_config() -> Config {
         routes: vec![],
         trusted_origins: vec![],
         rate_limit_max_attempts: 1000,
-        rate_limit_window_secs: 60,
-        expiry_sweep_interval_secs: 60,
         docs_enabled: true,
+        login_public_url: "http://login.test".into(),
     }
 }
 

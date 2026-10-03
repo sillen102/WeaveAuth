@@ -52,8 +52,7 @@ Relevant code:
   - `Argon2` -- parsed as a PHC string, verified against the shared `ARGON2` instance.
   - `Bcrypt` -- only ever exists on an account imported from a legacy store; this app
     never writes one. Its own cost factor is checked against `max_bcrypt_cost`
-    (`WA_MAX_BCRYPT_COST`, default 12, clamped to bcrypt's own maximum cost of 31 if
-    configured higher) before verifying -- an inflated cost claimed by an imported
+    (bcrypt's default cost (12), fixed in code) before verifying -- an inflated cost claimed by an imported
     hash could otherwise tie up a blocking-pool thread for a long time. Verification
     time still isn't covered by the dummy-hash timing guard (the dummy is argon2), so
     a bcrypt account's login timing still depends on its own cost; the cap bounds how
@@ -70,7 +69,7 @@ Relevant code:
   sent). This happens only after the password verified, so a wrong password still gets `401`
   and the response can't be used to probe which addresses are registered.
 - On success, `login_sessions.create_session(user.id)` mints a single-use
-  `login_session` token (`login_session_ttl_secs`, default 60s) and returns it.
+  `login_session` token (fixed at 60s) and returns it.
 
 **3. `GET /oauth/authorize`** (backend: `authorize`) -- called by `complete_login`,
 never the browser directly.
@@ -87,7 +86,7 @@ never the browser directly.
 - `grant_type=authorization_code`: redeems `auth_code` (single-use), checks
   `redirect_uri` matches what the code was issued for, checks `code_verifier` hashes
   to the stored `code_challenge`.
-- Mints an access token (RS256 JWT; claims `iss` (`WA_ISSUER`), `sub`, `email`,
+- Mints an access token (RS256 JWT; claims `iss` (`WA_BACKEND_URL`), `sub`, `email`,
   `email_verified`, `iat`, `exp`) and a fresh opaque refresh token in a new
   `family_id`.
 - `grant_type=refresh_token`: redeems and rotates a refresh token; replaying an

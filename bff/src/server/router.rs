@@ -31,8 +31,9 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
     // shared by every proxied route -- so a flood against one side can't burn
     // the other's budget. /health is exempt (cheap liveness check, commonly
     // polled by infra that shouldn't get caught in either bucket).
-    let per_second =
-        (state.config.rate_limit_window_secs / state.config.rate_limit_max_attempts as u64).max(1);
+    let per_second = (crate::config::RATE_LIMIT_WINDOW_SECS
+        / state.config.rate_limit_max_attempts as u64)
+        .max(1);
     let build_governor = || {
         let config = GovernorConfigBuilder::default()
             .burst_size(state.config.rate_limit_max_attempts.max(1))

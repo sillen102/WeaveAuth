@@ -15,6 +15,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod config;
 pub mod docs;
 pub mod error;
 pub mod extract;

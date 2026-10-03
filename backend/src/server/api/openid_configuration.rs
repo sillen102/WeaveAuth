@@ -17,7 +17,7 @@ mod controller {
             .summary("OpenID Provider metadata")
             .description(indoc! {"
                 OpenID Connect Discovery-style metadata for verifiers that configure themselves
-                from the issuer URL (`WA_ISSUER`): `jwks_uri` points at
+                from the issuer URL (`WA_BACKEND_URL`): `jwks_uri` points at
                 `/.well-known/jwks.json`, and `issuer` matches access tokens' `iss` claim. Not a
                 compliant OpenID Provider document: `authorization_endpoint` is left out because
                 /oauth/authorize is not a standard authorize endpoint (it needs a login_session

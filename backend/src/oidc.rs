@@ -23,6 +23,7 @@ pub(crate) type OidcClient = CoreClient<
 /// tweaks its endpoint paths.
 pub(crate) async fn build_providers(
     configs: &HashMap<String, OidcProviderConfig>,
+    bff_url: &str,
     http_client: &openidconnect::reqwest::Client,
 ) -> anyhow::Result<HashMap<String, OidcClient>> {
     let mut providers = HashMap::with_capacity(configs.len());
@@ -44,7 +45,7 @@ pub(crate) async fn build_providers(
         ))
         .set_auth_uri(metadata.authorization_endpoint().clone())
         .set_token_uri(token_endpoint)
-        .set_redirect_uri(RedirectUrl::new(config.redirect_uri.clone())?);
+        .set_redirect_uri(RedirectUrl::new(config.redirect_uri_for(name, bff_url))?);
 
         providers.insert(name.clone(), client);
     }
@@ -93,7 +94,7 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "client-id".to_string(),
                 client_secret: SecretString::from("client-secret".to_string()),
-                redirect_uri: "http://localhost/callback".to_string(),
+                redirect_uri: Some("http://localhost/callback".to_string()),
                 display_name: None,
                 extra_claims: HashMap::new(),
                 scopes: vec!["email".to_string()],
@@ -102,7 +103,7 @@ mod tests {
         );
 
         let http_client = openidconnect::reqwest::Client::new();
-        let providers = build_providers(&configs, &http_client)
+        let providers = build_providers(&configs, "http://bff.test", &http_client)
             .await
             .expect("discovery succeeds");
 

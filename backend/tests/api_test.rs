@@ -1,7 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use std::collections::HashMap;
 use tower::ServiceExt;
 use weaveauth::config::Config;
 use weaveauth::server::app;
@@ -13,29 +12,8 @@ use weaveauth::server::app;
 
 fn test_config() -> Config {
     Config {
-        port: 1983,
         redirect_uri_allowlist: vec!["http://bff.test/callback".to_string()],
-        pkce_code_ttl_secs: 300,
-        login_session_ttl_secs: 60,
-        access_token_ttl_secs: 900,
-        refresh_token_ttl_secs: 2_592_000,
-        jwt_key_rotation_interval_secs: 2_592_000,
-        issuer: "http://localhost:1983".into(),
-        oidc_state_ttl_secs: 300,
-        pending_oidc_link_ttl_secs: 600,
-        password_reset_token_ttl_secs: 1_800,
-        email_verification_code_ttl_secs: 900,
-        email_verification_resend_cooldown_secs: 60,
-        email_verification_session_ttl_secs: 1_800,
-        expiry_sweep_interval_secs: 60,
-        oidc_providers: HashMap::new(),
-        max_bcrypt_cost: 12,
-        extra_data_handler: None,
-        login_claims_handler: None,
-        setuid_helper: None,
-        email_handler: None,
-        login_public_url: None,
-        require_verified_email: false,
+        ..Config::default()
     }
 }
 
@@ -186,7 +164,7 @@ async fn password_reset_confirm_rejects_an_unknown_token_over_http() {
 #[tokio::test]
 async fn token_exchange_rejects_expired_code() {
     let mut config = test_config();
-    config.pkce_code_ttl_secs = -1; // already "expired" the instant it's issued
+    config.tuning.pkce_code_ttl_secs = -1; // already "expired" the instant it's issued
     let app = app(&config).await.expect("test app builds");
     let verifier = "correct-verifier";
     let challenge = challenge_for(verifier);

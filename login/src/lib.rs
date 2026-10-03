@@ -21,8 +21,7 @@ use axum::extract::{OriginalUri, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use figment::Figment;
-use figment::providers::{Env, Serialized};
+use common::config::PublicUrl;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -72,31 +71,41 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    /// Loads config from `WA_LOGIN_PORT` / `WA_BFF_URL` / `WA_LOGIN_PUBLIC_URL` /
-    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` env vars, falling back to defaults for
-    /// anything unset (an empty `WA_VERIFY_DEFAULT_REDIRECT_URI` counts as
-    /// unset). A value that is set but invalid is an error: silently using the
-    /// defaults would point the login page at localhost.
-    pub fn load() -> anyhow::Result<Self> {
-        let defaults = Config::default();
+const ENV: common::config::EnvTable = &[
+    ("WA_PROFILE", "profile"),
+    ("WA_BFF_URL", "bff_url"),
+    ("WA_LOGIN_PUBLIC_URL", "own_origin"),
+    (
+        "WA_VERIFY_DEFAULT_REDIRECT_URI",
+        "verify_default_redirect_uri",
+    ),
+    ("WA_BFF_INTERNAL_URL", "bff_internal_url"),
+];
 
-        let mut config: Config = Figment::from(Serialized::defaults(defaults))
-            // `WA_LOGIN_PORT` doesn't map 1:1 to its field name, so it's
-            // applied by hand below instead.
-            .merge(
-                Env::raw()
-                    .map(|k| match k.as_str() {
-                        "WA_BFF_URL" => "bff_url".into(),
-                        "WA_LOGIN_PUBLIC_URL" => "own_origin".into(),
-                        "WA_VERIFY_DEFAULT_REDIRECT_URI" => "verify_default_redirect_uri".into(),
-                        "WA_BFF_INTERNAL_URL" => "bff_internal_url".into(),
-                        _ => "_ignored".into(),
-                    })
-                    .ignore(&["_ignored"]),
-            )
-            .extract()
+impl Config {
+    /// Loads config from the env vars in [`ENV`] plus `WA_LOGIN_PORT`, falling
+    /// back to defaults for anything unset (an empty
+    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` or `WA_BFF_INTERNAL_URL` counts as
+    /// unset). A value that is set but invalid is an error: silently using the
+    /// defaults would point the login page at localhost. Under the prod
+    /// profile (`WA_PROFILE`, the default) `WA_BFF_URL` and
+    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` must be https and `WA_LOGIN_PUBLIC_URL`
+    /// an https origin. `own_origin` is stored without a trailing `/`.
+    pub fn load() -> anyhow::Result<Self> {
+        // `WA_LOGIN_PORT` is applied by hand below, so its error names the variable.
+        let user = common::config::user_settings(false, ENV, &[])?;
+        let mut config: Config = common::config::extract(Config::default(), &user)
             .map_err(|error| anyhow::anyhow!("invalid login configuration: {error}"))?;
+        let profile = common::config::profile(&user)?;
+        common::config::require_https_in_prod(
+            profile,
+            &[
+                ("WA_BFF_URL", &config.bff_url, PublicUrl::Base),
+                ("WA_LOGIN_PUBLIC_URL", &config.own_origin, PublicUrl::Origin),
+            ],
+        )?;
+        // Every URL derived from it appends a path.
+        config.own_origin = config.own_origin.trim_end_matches('/').to_string();
 
         if let Ok(raw) = env::var("WA_LOGIN_PORT") {
             config.port = raw
@@ -115,6 +124,10 @@ impl Config {
             if !matches!(url.scheme(), "http" | "https") {
                 anyhow::bail!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: not an http(s) URL");
             }
+            common::config::require_https_in_prod(
+                profile,
+                &[("WA_VERIFY_DEFAULT_REDIRECT_URI", raw, PublicUrl::Base)],
+            )?;
         }
 
         Ok(config)
@@ -458,7 +471,8 @@ mod tests {
 
     #[test]
     fn defaults_when_no_env_set() {
-        Jail::expect_with(|_jail| {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             let config = Config::load().unwrap();
             assert_eq!(config.port, 8081);
             assert_eq!(config.bff_url, "http://localhost:8080");
@@ -470,6 +484,7 @@ mod tests {
     #[test]
     fn the_internal_bff_url_is_read_from_its_env_var() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             assert_eq!(Config::load().unwrap().bff_internal_url, None);
             jail.set_env("WA_BFF_INTERNAL_URL", "http://bff.internal:8080");
 
@@ -485,6 +500,7 @@ mod tests {
     #[test]
     fn env_vars_override_defaults() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PORT", "9999");
             jail.set_env("WA_BFF_URL", "http://bff.env.test");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
@@ -508,6 +524,7 @@ mod tests {
     #[test]
     fn an_empty_verify_default_redirect_uri_counts_as_unset() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "");
 
             let config = Config::load().unwrap();
@@ -519,6 +536,7 @@ mod tests {
     #[test]
     fn an_unparseable_verify_default_redirect_uri_is_an_error() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "/downstream");
 
             let error = Config::load()
@@ -535,6 +553,7 @@ mod tests {
     fn a_verify_default_redirect_uri_must_be_http_or_https() {
         for value in ["javascript:alert(1)", "mailto:a@example.com"] {
             Jail::expect_with(|jail| {
+                jail.set_env("WA_PROFILE", "dev");
                 jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", value);
 
                 let error = Config::load().expect_err("only web URLs can be redirected to");
@@ -550,6 +569,7 @@ mod tests {
     #[test]
     fn invalid_port_is_an_error() {
         Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
             jail.set_env("WA_LOGIN_PORT", "not-a-port");
 
             let error =
@@ -558,6 +578,65 @@ mod tests {
                 error.to_string().contains("WA_LOGIN_PORT"),
                 "unhelpful error: {error}"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_login_public_url_is_dropped() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test/");
+
+            assert_eq!(Config::load().unwrap().own_origin, "https://login.env.test");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_refuses_to_start_on_localhost_defaults() {
+        for (bff_url, login_url, missing) in [
+            (None, Some("https://login.test"), "WA_BFF_URL"),
+            (Some("https://bff.test"), None, "WA_LOGIN_PUBLIC_URL"),
+        ] {
+            Jail::expect_with(|jail| {
+                if let Some(url) = bff_url {
+                    jail.set_env("WA_BFF_URL", url);
+                }
+                if let Some(url) = login_url {
+                    jail.set_env("WA_LOGIN_PUBLIC_URL", url);
+                }
+
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains(missing), "{error}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn prod_refuses_an_http_verify_default_redirect_uri() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "http://app.test/home");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_VERIFY_DEFAULT_REDIRECT_URI"), "{error}");
+
+            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "https://app.test/home");
+            Config::load().unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_starts_once_its_public_urls_are_set() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+
+            Config::load().unwrap();
             Ok(())
         });
     }

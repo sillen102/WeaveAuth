@@ -1,10 +1,11 @@
+profile: dev
 redirect_uri_allowlist:
   - http://localhost:8080/downstream
-pkce_code_ttl_secs: 300
 # Third-party OIDC login, e.g. Google. Client registered at
 # https://console.cloud.google.com/apis/credentials. redirect_uri must be
-# bff's public URL (backend itself isn't internet-exposed) -- add it to the
-# client's "Authorized redirect URIs".
+# bff's public URL (backend itself isn't internet-exposed) -- the default,
+# {WA_BFF_URL}/oidc/google/callback, is what to add to the client's
+# "Authorized redirect URIs".
 #
 # client_id/client_secret below are placeholders -- real values go in a local
 # .env (see .env.example), which overrides these via WA_OIDC_GOOGLE_CLIENT_ID
@@ -18,7 +19,6 @@ oidc_providers:
     client_id: set-in-.env
     client_secret: set-in-.env
     issuer: https://accounts.google.com
-    redirect_uri: http://localhost:8080/oidc/google/callback
     # What the consent screen asks for besides `openid`. contacts.readonly is for the
     # phone number: Google only returns it from the user's own contact card, and the
     # scope reads ALL of their contacts.
@@ -46,7 +46,6 @@ login_claims_handler:
   kind: webhook
   url: http://localhost:10001/hooks/login-claims
 # Verification email, sent to Mailpit (testing/mailpit/docker-compose.yml; inbox at http://localhost:7025).
-login_public_url: http://localhost:8081
 # Login withholds the session from an unverified account until it enters the emailed code.
 require_verified_email: true
 email_handler:

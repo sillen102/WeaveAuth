@@ -40,7 +40,7 @@ pub async fn app_start(config: Config) -> anyhow::Result<()> {
     tracing::info!("listening on {addr}");
 
     let state = AppState::new(config)?;
-    let sweep_interval = Duration::from_secs(state.config.expiry_sweep_interval_secs);
+    let sweep_interval = Duration::from_secs(common::config::EXPIRY_SWEEP_INTERVAL_SECS);
     spawn_expiry_sweep(state.clone(), sweep_interval);
 
     // with_connect_info: the rate limiter keys on the real client IP
