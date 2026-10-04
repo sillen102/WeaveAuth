@@ -1,5 +1,5 @@
 profile: dev
-# login/mise.toml's `dev` task points WA_EMAIL_LINK_DEFAULT_REDIRECT_URI here.
+# login/mise.toml's `dev` task points WA_DEFAULT_REDIRECT_URI here.
 redirect_uri_allowlist:
   - http://localhost:8080/downstream
 # Third-party OIDC login, e.g. Google. Client registered at

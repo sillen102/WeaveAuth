@@ -9,6 +9,7 @@ fn test_config() -> Config {
         port: 8081,
         bff_url: "http://bff.test".into(),
         own_origin: "http://login.test".into(),
+        default_redirect_uri: None,
         email_link_default_redirect_uri: None,
         bff_internal_url: None,
     }
@@ -690,6 +691,71 @@ async fn the_email_link_default_redirect_uri_does_not_apply_to_other_pages() {
 
     let body = get_body(config, "/login.html").await;
     assert!(body.contains("name=\"redirect_uri\" value=\"http://login.test/\""));
+}
+
+/// What the page posts as `redirect_uri` (`forgot-password.html` has no such
+/// field, so there it is the login link it ends on).
+fn carries_redirect_uri(path: &str, body: &str, uri: &str) -> bool {
+    if path.starts_with("/forgot-password.html") {
+        let encoded: String = url::form_urlencoded::byte_serialize(uri.as_bytes()).collect();
+        body.contains(&format!("login.html?redirect_uri={encoded}"))
+    } else {
+        body.contains(&format!("name=\"redirect_uri\" value=\"{uri}\""))
+    }
+}
+
+#[tokio::test]
+async fn the_default_redirect_uri_applies_to_every_page() {
+    let config = Config {
+        default_redirect_uri: Some("http://app.test/home".into()),
+        ..test_config()
+    };
+
+    for path in [
+        "/login.html",
+        "/register.html",
+        "/verify-email.html",
+        "/forgot-password.html?status=invalid_token",
+        "/login.html?status=password_reset",
+    ] {
+        let body = get_body(config.clone(), path).await;
+        assert!(
+            carries_redirect_uri(path, &body, "http://app.test/home"),
+            "{path}: {body}"
+        );
+    }
+
+    // An explicit redirect_uri still wins.
+    let body = get_body(
+        config,
+        "/login.html?redirect_uri=http%3A%2F%2Fadmin.test%2F",
+    )
+    .await;
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://admin.test/\""));
+}
+
+#[tokio::test]
+async fn the_email_link_default_redirect_uri_wins_over_the_default_on_email_link_pages() {
+    let config = Config {
+        default_redirect_uri: Some("http://app.test/home".into()),
+        email_link_default_redirect_uri: Some("http://app.test/verified".into()),
+        ..test_config()
+    };
+
+    for path in [
+        "/verify-email.html",
+        "/forgot-password.html?status=invalid_token",
+        "/login.html?status=password_reset",
+    ] {
+        let body = get_body(config.clone(), path).await;
+        assert!(
+            carries_redirect_uri(path, &body, "http://app.test/verified"),
+            "{path}: {body}"
+        );
+    }
+
+    let body = get_body(config, "/login.html").await;
+    assert!(body.contains("name=\"redirect_uri\" value=\"http://app.test/home\""));
 }
 
 #[tokio::test]

@@ -115,8 +115,9 @@ and never in the app.
 
 **3. The page.** `verify-email.html` has one field, the code (no password: the cookie already
 proves who is signing in), and a "send a new code" button. It carries `redirect_uri` along. Opened
-without one (the link in the email), it uses login's `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, else login's
-own origin; backend's allowlist must include whichever applies.
+without one (the link in the email), it uses login's `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, else
+`WA_DEFAULT_REDIRECT_URI`, else login's own origin; backend's allowlist must include whichever
+applies.
 
 **4. Entering the code (`POST /verify-email`, bff).** Form `{code, redirect_uri, next}`.
 

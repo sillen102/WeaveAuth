@@ -135,7 +135,7 @@ redirect goes to a fixed page on `login_public_url`; nothing from the request
 picks the destination. Neither the reset link nor these redirects carry a
 `redirect_uri`, so the login page reached with `status=password_reset` and
 `forgot-password.html` use `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, like the
-verification page, else login's own origin.
+verification page, else `WA_DEFAULT_REDIRECT_URI`, else login's own origin.
 
 **5. Backend redeems the token.** `POST /oauth/password-reset/confirm`:
 
