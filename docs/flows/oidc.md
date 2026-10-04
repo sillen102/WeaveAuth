@@ -9,6 +9,56 @@ Relevant code:
 - `bff/src/server/api/oidc.rs` -- browser-facing endpoints, cookie handling
 - `backend/src/server/api/oidc.rs` -- provider exchange, PKCE, user resolution
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant F as bff
+    participant B as backend
+    participant P as Provider
+    participant H as Extra-data handler
+
+    U->>F: GET /oidc/{provider}/login?redirect_uri=...&next=...
+    F->>B: GET /oauth/oidc/login?provider=...
+    Note over B: save state -> {provider, pkce_verifier, nonce}
+    B-->>F: 303 provider authorize URL
+    F-->>U: 303 provider + wa_oidc_redirect_uri, wa_oidc_next, wa_oidc_state
+    U->>P: consent
+    P-->>U: 303 /oidc/{provider}/callback?code=...&state=...
+    U->>F: GET /oidc/{provider}/callback (flow cookies)
+    Note over F: state must equal wa_oidc_state cookie
+    F->>B: GET /oauth/oidc/callback?provider&code&state[&pending_link_token]
+    Note over B: take_state (single-use)
+    B->>P: code exchange (PKCE), verify id_token
+    opt new user with extra_claims and/or profile_apis
+        B->>P: profile APIs with the access token (profile_apis only)
+        B->>H: {user_id, email, fields}
+    end
+    alt Authenticated
+        B-->>F: {login_session}
+        Note over F,B: complete_login, as in login
+        F-->>U: 303 redirect_uri + wa_session, flow cookies cleared
+    else LinkConfirmationRequired
+        B-->>F: {pending_link_token, email, has_password, linked_providers}
+        F-->>U: 303 next?email&provider&has_password[&linked_providers] + pending-link cookie
+        alt confirm with the account's password
+            U->>F: POST /oidc/confirm-link {password, redirect_uri, next} + pending-link cookie
+            Note over F: no pending-link cookie: 303 next?error=link_failed<br/>without calling backend
+            F->>B: POST /oauth/oidc/confirm-link {pending_link_token, password}
+            alt password right
+                B-->>F: {login_session}
+                Note over F,B: complete_login
+                F-->>U: 303 redirect_uri + wa_session
+            else wrong password or dead token
+                B-->>F: 401 / 400 (any other status: 502)
+                F-->>U: 303 next?error=link_failed
+            end
+        else confirm through an already-linked provider
+            Note over U,B: restart at step 1 with confirm_link=true,<br/>the callback forwards pending_link_token and backend<br/>links only if this sign-in belongs to the same account,<br/>otherwise 409 -> 303 next?error=link_failed
+        end
+    end
+```
+
 ## Steps
 
 **1. `GET /oidc/{provider}/login`** (bff: `start_oidc_login`)

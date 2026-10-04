@@ -15,6 +15,53 @@ Pages live in `login`, the browser-facing routes in `bff`, and the work in
 - `backend/src/email.rs` -- delivery, shared with [verify email](verify-email.md)
 - `backend/src/storage/in_memory.rs` -- `InMemoryPasswordResetTokenStorage`
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant L as login
+    participant F as bff
+    participant B as backend
+    participant M as Mail handler
+
+    U->>L: GET forgot-password.html
+    U->>F: POST /password-reset/request {email}
+    F->>B: POST /oauth/password-reset/request
+    alt backend answers 2xx
+        B-->>F: 202 (always)
+        F-->>U: 303 forgot-password.html?status=sent
+        opt account exists, handler set, not cooling down
+            B--)M: mail to stored address:<br/>reset-password.html#token=...
+        end
+    else backend unreachable or non-2xx
+        F-->>U: 502
+    end
+
+    U->>L: GET reset-password.html
+    Note over U: token stays in the #fragment, never sent.<br/>JS moves it to form + sessionStorage, strips fragment
+    U->>F: POST /password-reset/confirm {token, new_password}
+    alt token not 1-128 base64url characters
+        F-->>U: 303 forgot-password.html?status=invalid_token (backend not called)
+    else well-formed token
+        F->>B: POST /oauth/password-reset/confirm
+        Note over B: policy check, take token, Argon2,<br/>set_password (version++), mark verified, clean up
+        alt 200 {user_id}
+            B-->>F: 200 {user_id}
+            Note over F: drop every bff session of user_id
+            F-->>U: 303 login.html?status=password_reset
+        else 400 WeakPassword
+            B-->>F: 400
+            F-->>U: 303 reset-password.html?status=weak_password
+        else other 400
+            B-->>F: 400
+            F-->>U: 303 forgot-password.html?status=invalid_token
+        else anything else
+            B-->>F: other status or unreachable
+            F-->>U: 502
+        end
+    end
+```
+
 ## Steps
 
 **1. Ask for a link.** `forgot-password.html` (linked from the login form, from
@@ -23,8 +70,8 @@ page once the account is locked until a reset) posts `email` to bff's
 `POST /password-reset/request`. bff checks the `Origin`, forwards
 `{"email"}` to backend and always answers with a 303 to
 `forgot-password.html?status=sent` ("if an account uses that address, a link is
-on its way"). It answers 502 only if backend is unreachable, which says nothing
-about any account.
+on its way"). It answers 502 only if backend is unreachable or errors, which says
+nothing about any account.
 
 **2. Backend issues and mails the token.** `POST /oauth/password-reset/request`
 always answers **202**. It looks the address up with `normalize_email`, then
@@ -110,22 +157,73 @@ verification page, else login's own origin.
 
 ## Every earlier credential dies
 
+### Why revoking isn't enough
+
+"Revoke all of the user's sessions and tokens" only deletes what exists at that
+instant. Anything still being issued slips through:
+
+1. An attacker who knows the old password starts a login. Backend reads the user
+   and starts the slow Argon2 check against the old hash.
+2. The owner's reset completes: new password, everything revoked.
+3. The attacker's check finishes ("password correct") and backend creates a
+   login session, *after* the revocation. The attacker is in.
+
+A refresh-token rotation or an authorization code in flight has the same race.
+So revocation (step 5, item 6) is only clean-up; the guarantee is the
+credential version.
+
+### Credential versions
+
+Every `User` has a `credential_version`. `set_password` bumps it under the same
+lock that writes the hash, so no reader ever sees the new hash with the old
+version or the other way round:
+
+```rust
+user.password = Some(password_hash);
+user.credential_version += 1;
+```
+
 Login sessions, authorization codes, refresh tokens and verification sessions
-each carry a `CredentialStamp`: the user id plus the `credential_version` the
-user had when the password (or provider sign-in) behind it was checked. Every
-place that redeems one first calls `current_user`, which refuses the stamp once
+each carry a `CredentialStamp { user_id, version }`, taken from the same user
+snapshot whose password (or provider sign-in) was checked:
+
+```rust
+let login_session = state.login_sessions.create_session(user.stamp()).await;
+```
+
+Every place that redeems one goes through one gate, which refuses the stamp once
 the version has moved on:
+
+```rust
+pub(crate) async fn current_user(users: &impl UserStorage, stamp: CredentialStamp) -> Option<User> {
+    users
+        .get_user_by_id(stamp.user_id)
+        .await
+        .filter(|user| user.credential_version == stamp.version)
+}
+```
 
 - `/oauth/authorize` refuses a login session (`InvalidLoginSession`),
 - `/oauth/token` refuses a code (`InvalidCode`) or refresh token (`InvalidRefreshToken`),
 - the email-verification endpoints refuse a verification session (`InvalidSession`).
 
-The stamp comes from the same snapshot of the user whose password was checked,
-so timing doesn't matter. A login that checked the old password while the reset
-ran, or a refresh rotation in flight, issues a credential with the old version,
-and that credential is refused the first time it's used. A rotated refresh token
-keeps its predecessor's stamp, so a token family started before the reset can't
-renew itself into a valid one.
+For example, the refresh grant:
+
+```rust
+RefreshTokenOutcome::Valid { stamp, family_id } => {
+    let user = current_user(&state.users, stamp)
+        .await
+        .ok_or(TokenServiceError::InvalidRefreshToken)?;
+    issue_tokens(state, user, family_id).await
+}
+```
+
+Back to the race: the attacker's late session carries the old version, so
+`/oauth/authorize` refuses it the first time it's used. Timing no longer
+matters. A rotated refresh token keeps its predecessor's stamp, so a token family
+started before the reset can't refresh itself into a valid one.
+
+### Writes guarded by the version
 
 Two writes that come out of an old proof are refused the same way:
 
@@ -136,12 +234,38 @@ Two writes that come out of an old proof are refused the same way:
   password check writes only while the version still matches. A link outlives
   any session, so one approved by the old password must not land afterwards.
 
+### Access tokens
+
 Access tokens never reach the browser: bff holds them, keyed by the session
 cookie. On a done reset bff drops every one of the user's sessions
 (`SessionStorage::revoke_all_for_user`), so the access tokens it held stop being
 used at once, on every device. This relies on resets coming in through bff, which
 holds because backend is never public. A trusted internal service that calls
 backend's confirm itself has to do the same with the returned `user_id`.
+
+## Attacks and defences
+
+| Attack | Defence |
+|--------|---------|
+| Account enumeration | `/request` always answers 202 and bff always lands on the same "if an account exists" page; the mail goes out in the background. Not timing-proof (step 2). |
+| Mail sent to an attacker's address (`email: [victim, attacker]`, look-alike addresses) | The mail goes to the stored address of the matched account, never the typed one; a JSON array is rejected. |
+| Host-header injection into the link | The link is built from configured `login_public_url`, never from request headers. |
+| Token leaking via logs, proxies, `Referer`, history | Token only in the URL fragment, removed from the address bar; page is `no-store`; no redirect, response or log line carries it. |
+| Mail scanners following the link | Opening the page has no side effect; only the form POST spends the token. |
+| Brute-forcing or dumping tokens | 256-bit CSPRNG token; stored only as `sha256(token)`. |
+| Two confirms racing with one token | `take_reset_token` removes the entry atomically. |
+| Email bombing | Silent 60s per-user cooldown plus bff's per-IP rate limit. Backend refuses to start with a cooldown <= 0, since it also caps the live tokens per user. |
+| Re-requesting to kill the owner's link | Earlier links stay valid; redeeming any one spends them all. |
+| A weak password spending the token | The password policy runs before the token is taken. |
+| Empty or huge password via the API | `validate_new_password`: >= 8 characters, <= 1024 bytes (bounds Argon2 work). |
+| Login, code exchange or refresh racing the reset | Credential stamps: anything issued under the old `credential_version` is refused on first use (see above). |
+| bcrypt upgrade or OIDC link writing back after the reset | Both write only while the version still matches. |
+| Squatter keeping access | Version bump plus clean-up ends their sessions, codes, refresh tokens and verification state; the password is overwritten and the email marked verified. |
+| Access tokens outliving the reset | bff drops every session of the user, on every device. |
+| CSRF on the forms | `Origin` check on both bff POSTs; a confirm never signs anyone in. |
+| Open redirect | bff redirects only to fixed pages on `login_public_url`. |
+| Header injection via the token | bff accepts only 1-128 base64url characters and refuses anything else without calling backend. |
+| Log spam by unauthenticated callers | "No email handler" is warned once at startup; the per-request line is `debug`. |
 
 ## Token summary
 
