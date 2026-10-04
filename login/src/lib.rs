@@ -49,11 +49,15 @@ pub struct Config {
     pub port: u16,
     pub bff_url: String,
     pub own_origin: String,
-    /// Where the user goes after the pages reached from an email link, when
-    /// they come without a `redirect_uri`: the verification page once the code
-    /// is right, the login page after a password reset, and the
+    /// Where the user goes after any login page opened without a
+    /// `redirect_uri`. Must be on backend's redirect allowlist. Unset: login's
+    /// own origin.
+    pub default_redirect_uri: Option<String>,
+    /// Like `default_redirect_uri`, for the pages reached from an email link
+    /// (they never carry a `redirect_uri`): the verification page once the
+    /// code is right, the login page after a password reset, and the
     /// forgot-password page (bff's dead-link redirect carries none either).
-    /// Must be on backend's redirect allowlist. Unset: login's own origin.
+    /// Must be on backend's redirect allowlist. Unset: `default_redirect_uri`.
     pub email_link_default_redirect_uri: Option<String>,
     /// Where login itself reaches bff (for `/oidc/providers`), when
     /// `bff_url` -- the browser-facing address -- doesn't resolve from
@@ -67,6 +71,7 @@ impl Default for Config {
             port: 8081,
             bff_url: "http://localhost:8080".to_string(),
             own_origin: "http://localhost:8081".to_string(),
+            default_redirect_uri: None,
             email_link_default_redirect_uri: None,
             bff_internal_url: None,
         }
@@ -77,6 +82,7 @@ const ENV: common::config::EnvTable = &[
     ("WA_PROFILE", "profile"),
     ("WA_BFF_URL", "bff_url"),
     ("WA_LOGIN_PUBLIC_URL", "own_origin"),
+    ("WA_DEFAULT_REDIRECT_URI", "default_redirect_uri"),
     (
         "WA_EMAIL_LINK_DEFAULT_REDIRECT_URI",
         "email_link_default_redirect_uri",
@@ -86,13 +92,14 @@ const ENV: common::config::EnvTable = &[
 
 impl Config {
     /// Loads config from the env vars in [`ENV`] plus `WA_LOGIN_PORT`, falling
-    /// back to defaults for anything unset (an empty
+    /// back to defaults for anything unset (an empty `WA_DEFAULT_REDIRECT_URI`,
     /// `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` or `WA_BFF_INTERNAL_URL` counts as
     /// unset). A value that is set but invalid is an error: silently using the
     /// defaults would point the login page at localhost. Under the prod
-    /// profile (`WA_PROFILE`, the default) `WA_BFF_URL` and
-    /// `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` must be https and `WA_LOGIN_PUBLIC_URL`
-    /// an https origin. `own_origin` is stored without a trailing `/`.
+    /// profile (`WA_PROFILE`, the default) `WA_BFF_URL`,
+    /// `WA_DEFAULT_REDIRECT_URI` and `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` must
+    /// be https and `WA_LOGIN_PUBLIC_URL` an https origin. `own_origin` is
+    /// stored without a trailing `/`.
     pub fn load() -> anyhow::Result<Self> {
         // `WA_LOGIN_PORT` is applied by hand below, so its error names the variable.
         let user = common::config::user_settings(false, ENV, &[])?;
@@ -115,23 +122,23 @@ impl Config {
                 .map_err(|error| anyhow::anyhow!("invalid WA_LOGIN_PORT {raw:?}: {error}"))?;
         }
 
-        config.email_link_default_redirect_uri = config
-            .email_link_default_redirect_uri
-            .filter(|raw| !raw.is_empty());
         config.bff_internal_url = config.bff_internal_url.filter(|raw| !raw.is_empty());
-        if let Some(raw) = &config.email_link_default_redirect_uri {
-            let url = url::Url::parse(raw).map_err(|error| {
-                anyhow::anyhow!("invalid WA_EMAIL_LINK_DEFAULT_REDIRECT_URI {raw:?}: {error}")
-            })?;
-            if !matches!(url.scheme(), "http" | "https") {
-                anyhow::bail!(
-                    "invalid WA_EMAIL_LINK_DEFAULT_REDIRECT_URI {raw:?}: not an http(s) URL"
-                );
+        for (var, value) in [
+            ("WA_DEFAULT_REDIRECT_URI", &mut config.default_redirect_uri),
+            (
+                "WA_EMAIL_LINK_DEFAULT_REDIRECT_URI",
+                &mut config.email_link_default_redirect_uri,
+            ),
+        ] {
+            *value = value.take().filter(|raw| !raw.is_empty());
+            if let Some(raw) = value {
+                let url = url::Url::parse(raw)
+                    .map_err(|error| anyhow::anyhow!("invalid {var} {raw:?}: {error}"))?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    anyhow::bail!("invalid {var} {raw:?}: not an http(s) URL");
+                }
+                common::config::require_https_in_prod(profile, &[(var, raw, PublicUrl::Base)])?;
             }
-            common::config::require_https_in_prod(
-                profile,
-                &[("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", raw, PublicUrl::Base)],
-            )?;
         }
 
         Ok(config)
@@ -430,9 +437,10 @@ fn human_duration(secs: u64) -> String {
 
 /// Renders one of the deployer-replaceable page templates, computing the
 /// same values their inline scripts used to compute client-side:
-/// `redirect_uri` (falling back to this service's own origin), and
-/// `own_url`/`next` (this page's own URL with that `redirect_uri` echoed
-/// back, so a form failure or an OIDC round-trip can bounce back here).
+/// `redirect_uri` (falling back to `default_redirect_uri`, then this service's
+/// own origin), and `own_url`/`next` (this page's own URL with that
+/// `redirect_uri` echoed back, so a form failure or an OIDC round-trip can
+/// bounce back here).
 fn render_page(
     template: &str,
     config: &Config,
@@ -444,6 +452,7 @@ fn render_page(
     let redirect_uri = query
         .redirect_uri
         .clone()
+        .or_else(|| config.default_redirect_uri.clone())
         .unwrap_or_else(|| format!("{origin}/"));
     let own_url = format!(
         "{origin}{path}?redirect_uri={}",
@@ -573,6 +582,35 @@ mod tests {
             assert_eq!(config.port, 9999);
             assert_eq!(config.bff_url, "http://bff.env.test");
             assert_eq!(config.own_origin, "https://login.env.test");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_default_redirect_uri_is_read_validated_and_empty_counts_as_unset() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_DEFAULT_REDIRECT_URI", "http://app.test/home");
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.default_redirect_uri.as_deref(),
+                Some("http://app.test/home")
+            );
+            assert_eq!(config.email_link_default_redirect_uri, None);
+
+            jail.set_env("WA_DEFAULT_REDIRECT_URI", "");
+            assert_eq!(Config::load().unwrap().default_redirect_uri, None);
+
+            jail.set_env("WA_DEFAULT_REDIRECT_URI", "/downstream");
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_DEFAULT_REDIRECT_URI"), "{error}");
+
+            jail.set_env("WA_PROFILE", "prod");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            jail.set_env("WA_DEFAULT_REDIRECT_URI", "http://app.test/home");
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_DEFAULT_REDIRECT_URI"), "{error}");
             Ok(())
         });
     }
