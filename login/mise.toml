@@ -1,7 +1,9 @@
 [tasks.dev]
 description = "Run development in dev mode"
-# Only on this task: login reads no config.yaml, and the tests expect the prod default.
-env = { WA_PROFILE = "dev" }
+# Only on this task: login reads no config.yaml, and the tests expect WA_PROFILE's prod default.
+# Email links (verification, password reset) carry no redirect_uri; land them on the
+# local downstream, the one entry in backend/config.yaml's redirect_uri_allowlist.
+env = { WA_PROFILE = "dev", WA_EMAIL_LINK_DEFAULT_REDIRECT_URI = "http://localhost:8080/downstream" }
 run = "cargo run"
 
 [tasks.build]

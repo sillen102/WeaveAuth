@@ -35,6 +35,12 @@
       <input type="hidden" name="next" value="{{ own_url }}">
       <button class="btn" type="submit">Confirm and link account</button>
     </form>
+    <p class="secondary">
+      Don't know this password? It may have been set by someone else.
+      <a id="forgot-password-link" href="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-get="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-target="#page" hx-select="#page-content" hx-push-url="true">Forgot password?</a>
+    </p>
     {% endif %}
     {% if has_password and linked_providers %}<div class="divider"><span>or</span></div>{% endif %}
     {% for linked in linked_providers %}
@@ -47,6 +53,10 @@
   <main class="card">
     <h1>WeaveAuth</h1>
     <p>Sign in with your account to continue.</p>
+    {% if status == "password_reset" %}
+    <p id="login-password-reset">Your password was changed. Sign in with the new one.</p>
+    <script>try { sessionStorage.removeItem("wa_reset_token"); } catch (e) {}</script>
+    {% endif %}
     {% if error == "consent_required" %}
     <p class="error">This app needs a permission you didn't grant. Please sign in again and allow all of the requested permissions.</p>
     {% elif error == "link_failed" %}
@@ -69,6 +79,11 @@
       <input type="hidden" name="next" value="{{ own_url }}">
       <button class="btn" type="submit">Sign in</button>
     </form>
+    <p class="secondary">
+      <a id="forgot-password-link" href="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-get="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-target="#page" hx-select="#page-content" hx-push-url="true">Forgot password?</a>
+    </p>
     <div class="divider"><span>or</span></div>
     <a id="google-login-link" class="btn btn-google"
        href="{{ bff_url | safe }}/oidc/google/login?redirect_uri={{ redirect_uri | urlencode | safe }}&next={{ own_url | urlencode | safe }}">

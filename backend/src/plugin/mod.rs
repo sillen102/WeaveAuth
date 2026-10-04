@@ -5,8 +5,9 @@
 //! and the connection the two talk over. The contract itself lives in
 //! `plugin-sdk/proto`, so a new flow is a new `hook` value on its one
 //! generic rpc rather than a new runtime. Registration
-//! (`crate::server::api::register`) and login claims
-//! (`crate::server::api::token`) are its callers.
+//! (`crate::server::api::register`), login claims
+//! (`crate::server::api::token`) and email delivery (`crate::email`) are its
+//! callers.
 //!
 //! A plugin is a native binary, so it keeps its own async runtime and its
 //! own long-lived resources: a `deadpool`/`sqlx` connection pool, an AMQP

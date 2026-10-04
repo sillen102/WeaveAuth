@@ -150,10 +150,10 @@ mod service {
     use thiserror::Error;
     use uuid::Uuid;
 
+    use crate::model::user::User;
     use crate::server::AppState;
-    use crate::storage::{
-        JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage, UserStorage,
-    };
+    use crate::server::api::current_user;
+    use crate::storage::{JwkStorage, PkceStorage, RefreshTokenOutcome, RefreshTokenStorage};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum TokenServiceError {
@@ -241,7 +241,7 @@ mod service {
             redirect_uri,
         } = grant.ok_or(TokenServiceError::MissingParameters)?;
 
-        let (challenge, _method, issued_redirect_uri, user_id) = state
+        let (challenge, _method, issued_redirect_uri, stamp) = state
             .pkce
             .take_code_challenge(&code)
             .await
@@ -259,7 +259,10 @@ mod service {
             return Err(TokenServiceError::InvalidCodeVerifier);
         }
 
-        issue_tokens(state, user_id, Uuid::new_v4()).await
+        let user = current_user(&state.users, stamp)
+            .await
+            .ok_or(TokenServiceError::InvalidCode)?;
+        issue_tokens(state, user, Uuid::new_v4()).await
     }
 
     pub(crate) async fn issue_token_for_refresh_token(
@@ -273,8 +276,11 @@ mod service {
             .take_refresh_token(&refresh_token)
             .await
         {
-            RefreshTokenOutcome::Valid { user_id, family_id } => {
-                issue_tokens(state, user_id, family_id).await
+            RefreshTokenOutcome::Valid { stamp, family_id } => {
+                let user = current_user(&state.users, stamp)
+                    .await
+                    .ok_or(TokenServiceError::InvalidRefreshToken)?;
+                issue_tokens(state, user, family_id).await
             }
             // Already-used token: the storage layer has revoked the
             // whole family as a side effect. Wrong/unknown token: same
@@ -291,12 +297,11 @@ mod service {
     /// call can redeem it.
     async fn issue_tokens(
         state: &mut AppState,
-        user_id: Uuid,
+        user: User,
         family_id: Uuid,
     ) -> Result<TokenResponse, TokenServiceError> {
-        let user = state.users.get_user_by_id(user_id).await.ok_or_else(|| {
-            TokenServiceError::UnexpectedError(format!("user {user_id} not found"))
-        })?;
+        let user_id = user.id;
+        let stamp = user.stamp();
 
         let extra = match &state.login_claims_handler {
             Some(handler) => {
@@ -342,7 +347,7 @@ mod service {
         let refresh_token = URL_SAFE_NO_PAD.encode(token_bytes);
         state
             .refresh_tokens
-            .save_refresh_token(refresh_token.clone(), user_id, family_id)
+            .save_refresh_token(refresh_token.clone(), stamp, family_id)
             .await;
 
         Ok(TokenResponse {
@@ -598,10 +603,10 @@ mod tests {
 
     use super::login_claims::{LoginClaimsError, LoginClaimsHandler};
     use crate::model::pkce::CodeChallengeMethod;
-    use crate::model::user::User;
+    use crate::model::user::{CredentialStamp, User};
     use crate::server::AppState;
     use crate::storage::in_memory::InMemoryPkceStorage;
-    use crate::storage::{PkceStorage, UserStorage};
+    use crate::storage::{PkceStorage, RefreshTokenStorage, UserStorage};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sha2::{Digest, Sha256};
@@ -662,10 +667,12 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         }
     }
 
@@ -718,7 +725,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", verifier, "http://redirect.test");
@@ -739,7 +746,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", verifier, "http://redirect.test");
@@ -769,7 +776,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                CredentialStamp::initial(uuid::Uuid::new_v4()),
             )
             .await;
         let req = code_req("code1", verifier, "http://other.test");
@@ -789,7 +796,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                uuid::Uuid::new_v4(),
+                CredentialStamp::initial(uuid::Uuid::new_v4()),
             )
             .await;
         let req = code_req("code1", "wrong-verifier", "http://redirect.test");
@@ -810,7 +817,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let first_req = code_req("code1", verifier, "http://redirect.test");
@@ -850,7 +857,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let before = chrono::Utc::now();
@@ -910,7 +917,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let Json(first) = issue_token(
@@ -939,6 +946,80 @@ mod tests {
         assert_eq!(result.err(), Some(TokenError::InvalidRefreshToken));
     }
 
+    async fn change_password(state: &mut AppState, user_id: Uuid) {
+        let outcome = state
+            .users
+            .set_password(
+                user_id,
+                crate::model::user::PasswordHash::Argon2("new-hash".into()),
+            )
+            .await;
+        assert_eq!(outcome, crate::storage::SetPasswordOutcome::Ok);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_code_issued_before_a_password_change() {
+        let (mut state, user_id) = state_with_user().await;
+        let verifier = "correct-verifier";
+        state
+            .pkce
+            .save_code_challenge(
+                "code1".to_string(),
+                challenge_for(verifier),
+                CodeChallengeMethod::S256,
+                "http://redirect.test".to_string(),
+                CredentialStamp::initial(user_id),
+            )
+            .await;
+        change_password(&mut state, user_id).await;
+
+        let result = issue_token(
+            State(state),
+            ApiForm(code_req("code1", verifier, "http://redirect.test")),
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(TokenError::InvalidCode));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_refresh_token_issued_before_a_password_change() {
+        let (mut state, user_id) = state_with_user().await;
+        state
+            .refresh_tokens
+            .save_refresh_token(
+                "refresh1".to_string(),
+                CredentialStamp::initial(user_id),
+                Uuid::new_v4(),
+            )
+            .await;
+        change_password(&mut state, user_id).await;
+
+        let result = issue_token(State(state), ApiForm(refresh_req("refresh1"))).await;
+
+        assert_eq!(result.err(), Some(TokenError::InvalidRefreshToken));
+    }
+
+    #[tokio::test]
+    async fn a_rotated_refresh_token_keeps_working_while_the_password_is_unchanged() {
+        let (mut state, user_id) = state_with_user().await;
+        state
+            .refresh_tokens
+            .save_refresh_token(
+                "refresh1".to_string(),
+                CredentialStamp::initial(user_id),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        let Json(first) = issue_token(State(state.clone()), ApiForm(refresh_req("refresh1")))
+            .await
+            .unwrap();
+        let second = issue_token(State(state), ApiForm(refresh_req(&first.refresh_token))).await;
+
+        assert!(second.is_ok());
+    }
+
     #[tokio::test]
     async fn reusing_a_rotated_refresh_token_revokes_the_whole_family() {
         let (mut state, user_id) = state_with_user().await;
@@ -950,7 +1031,7 @@ mod tests {
                 challenge_for(verifier),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let Json(first) = issue_token(
@@ -1005,7 +1086,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
@@ -1028,7 +1109,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
@@ -1065,7 +1146,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
@@ -1092,7 +1173,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let req = code_req("code1", "correct-verifier", "http://redirect.test");
@@ -1131,7 +1212,7 @@ mod tests {
                     challenge_for("correct-verifier"),
                     CodeChallengeMethod::S256,
                     "http://redirect.test".to_string(),
-                    user_id,
+                    CredentialStamp::initial(user_id),
                 )
                 .await;
             let req = code_req("code1", "correct-verifier", "http://redirect.test");
@@ -1162,7 +1243,7 @@ mod tests {
                 challenge_for("correct-verifier"),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             )
             .await;
         let Json(first) = issue_token(

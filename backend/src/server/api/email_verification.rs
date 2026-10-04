@@ -2,11 +2,6 @@ pub(crate) use controller::confirm_email_verification;
 pub(crate) use controller::confirm_email_verification_doc;
 pub(crate) use controller::request_email_verification;
 pub(crate) use controller::request_email_verification_doc;
-#[cfg(test)]
-pub(crate) use delivery::{EmailDeliveryError, VerificationEmail};
-pub(crate) use delivery::{
-    EmailVerificationHandler, PluginHandler, SmtpHandler, TEMPLATES_GLOB, WebhookHandler,
-};
 pub(crate) use service::{EmailVerification, send_verification_email};
 
 mod controller {
@@ -213,8 +208,6 @@ mod controller {
 }
 
 mod service {
-    use std::sync::Arc;
-
     use chrono::Utc;
     use thiserror::Error;
     use tokio::task::JoinHandle;
@@ -222,6 +215,7 @@ mod service {
 
     use crate::model::user::User;
     use crate::server::AppState;
+    use crate::server::api::current_user;
     use crate::storage::in_memory::{
         InMemoryEmailVerificationCodeStorage, InMemoryVerificationSessionStorage,
     };
@@ -230,7 +224,7 @@ mod service {
         MarkVerifiedOutcome, UserStorage, VerificationSessionStorage,
     };
 
-    use super::delivery::{EmailVerificationHandler, VerificationEmail};
+    use crate::email::{EmailKind, OutboundEmail};
 
     #[derive(Debug, Error, Eq, PartialEq)]
     #[error("invalid or expired verification session")]
@@ -293,11 +287,6 @@ mod service {
         /// What `/oauth/login` hands an unverified account; see
         /// `VerificationSessionStorage`.
         pub(crate) sessions: InMemoryVerificationSessionStorage,
-        /// `None`: no email is sent.
-        pub(crate) handler: Option<Arc<dyn EmailVerificationHandler>>,
-        /// Login's public origin, without a trailing `/` (see `Config::load`);
-        /// the email points at its `/verify-email.html`.
-        pub(crate) login_public_url: String,
         pub(crate) code_ttl_secs: i64,
         /// Withhold the `login_session` from an unverified account.
         pub(crate) required: bool,
@@ -309,8 +298,6 @@ mod service {
             Self {
                 codes: InMemoryEmailVerificationCodeStorage::new(60, 0),
                 sessions: InMemoryVerificationSessionStorage::new(60),
-                handler: None,
-                login_public_url: String::new(),
                 code_ttl_secs: 60,
                 required: false,
             }
@@ -330,12 +317,8 @@ mod service {
         user_id: Uuid,
         email: &str,
     ) -> Result<JoinHandle<()>, NotSent> {
-        let handler = state
-            .email_verification
-            .handler
-            .clone()
-            .ok_or(NotSent::Disabled)?;
-        let login_url = state.email_verification.login_public_url.as_str();
+        let handler = state.email_handler.clone().ok_or(NotSent::Disabled)?;
+        let login_url = state.login_public_url.as_str();
 
         let code = match state.email_verification.codes.issue_code(user_id).await {
             IssueCodeOutcome::Issued(code) => code,
@@ -360,13 +343,15 @@ mod service {
                 return Err(NotSent::Locked { retry_after_secs });
             }
         };
-        let mail = VerificationEmail {
+        let mail = OutboundEmail {
             user_id,
             email: email.to_string(),
-            code,
-            verify_page_url: format!("{login_url}/verify-email.html"),
             expires_at: Utc::now()
                 + chrono::Duration::seconds(state.email_verification.code_ttl_secs),
+            kind: EmailKind::EmailVerification {
+                code,
+                verify_page_url: format!("{login_url}/verify-email.html"),
+            },
         };
         Ok(tokio::spawn(async move {
             if let Err(error) = handler.send(&mail).await {
@@ -376,15 +361,13 @@ mod service {
     }
 
     async fn session_user(state: &AppState, token: &str) -> Result<User, InvalidSession> {
-        let user_id = state
+        let stamp = state
             .email_verification
             .sessions
             .get_session(token)
             .await
             .ok_or(InvalidSession)?;
-        state
-            .users
-            .get_user_by_id(user_id)
+        current_user(&state.users, stamp)
             .await
             .ok_or(InvalidSession)
     }
@@ -467,253 +450,8 @@ mod service {
             .delete_session(verification_session)
             .await;
         Ok(ConfirmOutcome::Verified {
-            login_session: state.login_sessions.create_session(user.id).await,
+            login_session: state.login_sessions.create_session(user.stamp()).await,
         })
-    }
-}
-
-/// How a verification email leaves WeaveAuth: over SMTP with templates, to a
-/// webhook, or to a plugin process. An error is returned to the caller
-/// (`service::send_verification_email`), which logs it.
-mod delivery {
-    use std::time::Duration;
-
-    use chrono::{DateTime, Utc};
-    use lettre::message::{Mailbox, MultiPart};
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-    use secrecy::{ExposeSecret, SecretString};
-    use serde::Serialize;
-    use tera::{Context, Tera};
-    use uuid::Uuid;
-    use weaveauth_plugin_sdk::PluginRequest;
-
-    use crate::config::SmtpTls;
-    use crate::plugin::{self, PluginProcess};
-
-    /// This hook's name on the generic plugin contract (`PluginRequest::hook`).
-    const HOOK: &str = "email_verification";
-
-    /// Deployer-replaceable email templates: `verify-email.subject.txt`,
-    /// `verify-email.txt` and `verify-email.html`. Shared with the login pages
-    /// under the repo's top-level `templates/`.
-    pub(crate) const TEMPLATES_GLOB: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../templates/emails/*");
-
-    const REQUIRED_TEMPLATES: [&str; 3] = [
-        "verify-email.subject.txt",
-        "verify-email.txt",
-        "verify-email.html",
-    ];
-
-    #[derive(Debug, thiserror::Error, Eq, PartialEq)]
-    #[error("{0}")]
-    pub(crate) struct EmailDeliveryError(pub(crate) String);
-
-    /// What the handler is given, and the webhook's JSON body. Owned, because
-    /// the send runs in a background task.
-    #[derive(Serialize)]
-    pub(crate) struct VerificationEmail {
-        pub(crate) user_id: Uuid,
-        pub(crate) email: String,
-        /// The 9-digit code the user types in.
-        pub(crate) code: String,
-        /// Login's page where the code is entered.
-        pub(crate) verify_page_url: String,
-        /// When the code stops working (RFC 3339 in the webhook payload).
-        pub(crate) expires_at: DateTime<Utc>,
-    }
-
-    #[async_trait::async_trait]
-    pub(crate) trait EmailVerificationHandler: Send + Sync {
-        async fn send(&self, mail: &VerificationEmail) -> Result<(), EmailDeliveryError>;
-    }
-
-    pub(crate) struct PluginHandler {
-        plugin: PluginProcess,
-    }
-
-    impl PluginHandler {
-        pub(crate) fn new(plugin: PluginProcess) -> Self {
-            Self { plugin }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EmailVerificationHandler for PluginHandler {
-        async fn send(&self, mail: &VerificationEmail) -> Result<(), EmailDeliveryError> {
-            let data = serde_json::json!({
-                "code": mail.code,
-                "verify_page_url": mail.verify_page_url,
-                "expires_at": mail.expires_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            });
-            let serde_json::Value::Object(data) = data else {
-                return Err(EmailDeliveryError("payload is not an object".to_string()));
-            };
-            let request = PluginRequest {
-                hook: HOOK.to_string(),
-                user_id: mail.user_id.to_string(),
-                email: mail.email.clone(),
-                data: Some(plugin::json_to_struct(data)),
-            };
-
-            self.plugin
-                .invoke(request)
-                .await
-                .map(|_| ())
-                .map_err(|status| {
-                    EmailDeliveryError(format!(
-                        "plugin rejected the verification email: {:?}: {}",
-                        status.code(),
-                        status.message()
-                    ))
-                })
-        }
-    }
-
-    pub(crate) struct WebhookHandler {
-        client: reqwest::Client,
-        url: String,
-    }
-
-    impl WebhookHandler {
-        pub(crate) fn new(url: String, timeout: Duration) -> anyhow::Result<Self> {
-            crate::config::require_https_or_loopback("email webhook url", &url)?;
-
-            // No redirects: server-to-server call to a deployer-configured
-            // target, same reasoning as `extra_data::WebhookHandler`.
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(timeout)
-                .build()?;
-            Ok(Self { client, url })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EmailVerificationHandler for WebhookHandler {
-        async fn send(&self, mail: &VerificationEmail) -> Result<(), EmailDeliveryError> {
-            let response = self
-                .client
-                .post(&self.url)
-                .json(mail)
-                .send()
-                .await
-                .map_err(|error| {
-                    EmailDeliveryError(format!(
-                        "email webhook request failed: {}",
-                        common::error::cause_chain(&error.without_url())
-                    ))
-                })?;
-
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(EmailDeliveryError(format!(
-                    "email webhook returned {}",
-                    response.status()
-                )))
-            }
-        }
-    }
-
-    pub(crate) struct SmtpHandler {
-        transport: AsyncSmtpTransport<Tokio1Executor>,
-        from: Mailbox,
-        templates: Tera,
-    }
-
-    impl SmtpHandler {
-        /// Loads the templates matching `templates_glob` and fails if one of
-        /// the required ones is missing, so a bad override stops the boot
-        /// instead of failing every registration. Also refuses SMTP without
-        /// TLS to a non-loopback host.
-        #[allow(clippy::too_many_arguments)]
-        pub(crate) fn new(
-            host: &str,
-            port: u16,
-            tls: SmtpTls,
-            credentials: Option<(String, SecretString)>,
-            from: &str,
-            timeout: Duration,
-            templates_glob: &str,
-        ) -> anyhow::Result<Self> {
-            crate::config::require_tls_or_loopback(host, tls)?;
-            let builder = match tls {
-                SmtpTls::Starttls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?,
-                SmtpTls::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(host)?,
-                SmtpTls::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host),
-            };
-            let mut builder = builder.port(port).timeout(Some(timeout));
-            if let Some((username, password)) = credentials {
-                builder = builder
-                    .credentials(Credentials::new(username, password.expose_secret().into()));
-            }
-
-            let mut templates = Tera::new();
-            templates
-                .load_from_glob(templates_glob)
-                .map_err(|error| anyhow::anyhow!("could not load email templates: {error}"))?;
-            for name in REQUIRED_TEMPLATES {
-                if !templates.get_template_names().any(|n| n == name) {
-                    anyhow::bail!("email template {name:?} not found in {templates_glob:?}");
-                }
-            }
-
-            Ok(Self {
-                transport: builder.build(),
-                from: from
-                    .parse()
-                    .map_err(|error| anyhow::anyhow!("invalid email from address: {error}"))?,
-                templates,
-            })
-        }
-
-        fn render(&self, template: &str, ctx: &Context) -> Result<String, EmailDeliveryError> {
-            self.templates.render(template, ctx).map_err(|error| {
-                EmailDeliveryError(format!("could not render {template}: {error}"))
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EmailVerificationHandler for SmtpHandler {
-        async fn send(&self, mail: &VerificationEmail) -> Result<(), EmailDeliveryError> {
-            let mut ctx = Context::new();
-            ctx.insert("email", &mail.email);
-            ctx.insert("code", &mail.code);
-            ctx.insert("verify_page_url", &mail.verify_page_url);
-            ctx.insert(
-                "expires_at",
-                &mail.expires_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-            );
-
-            let subject = self.render("verify-email.subject.txt", &ctx)?;
-            let text = self.render("verify-email.txt", &ctx)?;
-            let html = self.render("verify-email.html", &ctx)?;
-
-            let to: Mailbox = mail
-                .email
-                .parse()
-                .map_err(|error| EmailDeliveryError(format!("invalid recipient: {error}")))?;
-            let message = Message::builder()
-                .from(self.from.clone())
-                .to(to)
-                .subject(subject.trim())
-                .multipart(MultiPart::alternative_plain_html(text, html))
-                .map_err(|error| EmailDeliveryError(format!("could not build message: {error}")))?;
-
-            self.transport
-                .send(message)
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    EmailDeliveryError(format!(
-                        "smtp send failed: {}",
-                        common::error::cause_chain(&error)
-                    ))
-                })
-        }
     }
 }
 
@@ -721,7 +459,7 @@ mod delivery {
 /// the endpoints that send (register, login, resend).
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::*;
+    use crate::email::{EmailDeliveryError, EmailHandler, EmailKind, OutboundEmail};
     use crate::server::AppState;
     use crate::storage::in_memory::wrong_code;
     use crate::storage::{EmailVerificationCodeStorage, IssueCodeOutcome};
@@ -734,9 +472,8 @@ pub(crate) mod test_support {
     #[derive(Debug)]
     pub(crate) struct Sent {
         pub(crate) email: String,
-        pub(crate) code: String,
-        pub(crate) verify_page_url: String,
         pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
+        pub(crate) kind: EmailKind,
     }
 
     /// Reports every send on a channel; fails each one when told to.
@@ -746,13 +483,12 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
-    impl EmailVerificationHandler for Recorder {
-        async fn send(&self, mail: &VerificationEmail) -> Result<(), EmailDeliveryError> {
+    impl EmailHandler for Recorder {
+        async fn send(&self, mail: &OutboundEmail) -> Result<(), EmailDeliveryError> {
             let _ = self.tx.send(Sent {
                 email: mail.email.clone(),
-                code: mail.code.clone(),
-                verify_page_url: mail.verify_page_url.clone(),
                 expires_at: mail.expires_at,
+                kind: mail.kind.clone(),
             });
             if self.fail {
                 Err(EmailDeliveryError("boom".to_string()))
@@ -769,8 +505,8 @@ pub(crate) mod test_support {
         fail: bool,
     ) -> mpsc::UnboundedReceiver<Sent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        state.email_verification.handler = Some(Arc::new(Recorder { tx, fail }));
-        state.email_verification.login_public_url = "https://login.test".to_string();
+        state.email_handler = Some(Arc::new(Recorder { tx, fail }));
+        state.login_public_url = "https://login.test".to_string();
         state.email_verification.codes =
             crate::storage::in_memory::InMemoryEmailVerificationCodeStorage::new(900, 0);
         state.email_verification.code_ttl_secs = 900;
@@ -830,7 +566,7 @@ mod tests {
         Sent, assert_nothing_sent, code_for, install_recorder, lock_out, next_sent,
     };
     use super::*;
-    use crate::model::user::User;
+    use crate::model::user::{CredentialStamp, User};
     use crate::server::AppState;
     use crate::storage::in_memory::wrong_code;
     use crate::storage::{
@@ -867,7 +603,7 @@ mod tests {
         state
             .email_verification
             .sessions
-            .create_session(user_id)
+            .create_session(CredentialStamp::initial(user_id))
             .await
     }
 
@@ -897,9 +633,16 @@ mod tests {
 
         let sent = next_sent(&mut rx).await;
         assert_eq!(sent.email, "alice@example.com");
-        assert_eq!(sent.code.len(), 9);
-        assert!(sent.code.chars().all(|c| c.is_ascii_digit()));
-        assert_eq!(sent.verify_page_url, "https://login.test/verify-email.html");
+        let crate::email::EmailKind::EmailVerification {
+            code,
+            verify_page_url,
+        } = sent.kind
+        else {
+            unreachable!("not a verification email: {:?}", sent.kind);
+        };
+        assert_eq!(code.len(), 9);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(verify_page_url, "https://login.test/verify-email.html");
         let expires_in = sent.expires_at - chrono::Utc::now();
         assert!(
             (895..=900).contains(&expires_in.num_seconds()),
@@ -909,7 +652,7 @@ mod tests {
             state
                 .email_verification
                 .codes
-                .check_code(user_id, &sent.code)
+                .check_code(user_id, &code)
                 .await,
             CheckCodeOutcome::Verified
         );
@@ -919,14 +662,17 @@ mod tests {
     async fn send_does_not_wait_for_a_slow_handler() {
         struct Slow;
         #[async_trait::async_trait]
-        impl EmailVerificationHandler for Slow {
-            async fn send(&self, _: &VerificationEmail) -> Result<(), EmailDeliveryError> {
+        impl crate::email::EmailHandler for Slow {
+            async fn send(
+                &self,
+                _: &crate::email::OutboundEmail,
+            ) -> Result<(), crate::email::EmailDeliveryError> {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(())
             }
         }
         let (mut state, _rx) = state_with(false).await;
-        state.email_verification.handler = Some(Arc::new(Slow));
+        state.email_handler = Some(Arc::new(Slow));
 
         let handle = tokio::time::timeout(
             Duration::from_secs(5),
@@ -940,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn send_without_a_handler_issues_no_code() {
         let (mut state, _rx) = state_with(false).await;
-        state.email_verification.handler = None;
+        state.email_handler = None;
 
         let handle = send_verification_email(&mut state, Uuid::new_v4(), "alice@example.com").await;
 
@@ -1044,6 +790,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_refuses_a_session_issued_before_a_password_change() {
+        let (mut state, mut rx) = state_with(false).await;
+        let user_id = add_user(&mut state, "alice@example.com", false).await;
+        let session = session_for(&mut state, user_id).await;
+        let _ = state
+            .users
+            .set_password(
+                user_id,
+                crate::model::user::PasswordHash::Argon2("new-hash".into()),
+            )
+            .await;
+
+        let result = request_email_verification(State(state), ApiJson(request_req(&session))).await;
+
+        assert_eq!(
+            result.err(),
+            Some(EmailVerificationRequestError::InvalidSession)
+        );
+        assert_nothing_sent(&mut rx).await;
+    }
+
+    #[tokio::test]
     async fn request_refuses_an_already_verified_account_without_sending() {
         let (mut state, mut rx) = state_with(false).await;
         let user_id = add_user(&mut state, "alice@example.com", true).await;
@@ -1081,7 +849,10 @@ mod tests {
             unreachable!("verified");
         };
         assert_eq!(response.0, StatusCode::OK);
-        assert_eq!(sessions.take_session(&login_session).await, Some(user_id));
+        assert_eq!(
+            sessions.take_session(&login_session).await,
+            Some(CredentialStamp::initial(user_id))
+        );
         // The verification session is gone.
         assert_eq!(
             state
@@ -1123,7 +894,7 @@ mod tests {
                 .sessions
                 .get_session(&session)
                 .await,
-            Some(user_id)
+            Some(CredentialStamp::initial(user_id))
         );
     }
 
@@ -1294,7 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn request_without_an_email_handler_is_service_unavailable() {
         let (mut state, _rx) = state_with(false).await;
-        state.email_verification.handler = None;
+        state.email_handler = None;
         let user_id = add_user(&mut state, "alice@example.com", false).await;
         let session = session_for(&mut state, user_id).await;
 
@@ -1341,224 +1112,5 @@ mod tests {
 
         assert!(matches!(handle, Err(NotSent::Locked { .. })), "{handle:?}");
         assert_nothing_sent(&mut rx).await;
-    }
-}
-
-#[cfg(test)]
-mod delivery_tests {
-    use super::delivery::*;
-    use super::*;
-    use crate::config::SmtpTls;
-    use chrono::{DateTime, Utc};
-    use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpListener;
-    use uuid::Uuid;
-    use wiremock::matchers::{body_partial_json, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    fn mail() -> VerificationEmail {
-        VerificationEmail {
-            user_id: Uuid::nil(),
-            email: "alice@example.com".to_string(),
-            code: "042517".to_string(),
-            verify_page_url: "https://login.test/verify-email.html".to_string(),
-            expires_at: DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        }
-    }
-
-    #[tokio::test]
-    async fn webhook_posts_the_payload() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .and(body_partial_json(serde_json::json!({
-                "email": "alice@example.com",
-                "code": "042517",
-                "verify_page_url": "https://login.test/verify-email.html",
-                "expires_at": "2026-10-03T12:00:00Z",
-            })))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).unwrap();
-
-        assert_eq!(handler.send(&mail()).await, Ok(()));
-    }
-
-    #[tokio::test]
-    async fn webhook_fails_on_a_5xx() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let handler = WebhookHandler::new(format!("{}/hook", server.uri()), TIMEOUT).unwrap();
-
-        assert!(handler.send(&mail()).await.is_err());
-    }
-
-    #[test]
-    fn webhook_refuses_plain_http_to_a_non_local_host() {
-        assert!(WebhookHandler::new("http://hooks.example.com/x".to_string(), TIMEOUT).is_err());
-    }
-
-    /// Accepts one SMTP session and returns the DATA it received.
-    async fn fake_smtp() -> (u16, tokio::task::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut read = BufReader::new(read);
-            write.write_all(b"220 fake ESMTP\r\n").await.unwrap();
-            let mut data = String::new();
-            let mut in_data = false;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if read.read_line(&mut line).await.unwrap() == 0 {
-                    break;
-                }
-                if in_data {
-                    if line == ".\r\n" {
-                        in_data = false;
-                        write.write_all(b"250 queued\r\n").await.unwrap();
-                    } else {
-                        data.push_str(&line);
-                    }
-                    continue;
-                }
-                let upper = line.to_uppercase();
-                let reply: &[u8] = if upper.starts_with("EHLO") {
-                    b"250 fake\r\n"
-                } else if upper.starts_with("DATA") {
-                    in_data = true;
-                    b"354 go\r\n"
-                } else if upper.starts_with("QUIT") {
-                    write.write_all(b"221 bye\r\n").await.unwrap();
-                    break;
-                } else {
-                    b"250 ok\r\n"
-                };
-                write.write_all(reply).await.unwrap();
-            }
-            data
-        });
-        (port, task)
-    }
-
-    fn smtp(port: u16, glob: &str) -> anyhow::Result<SmtpHandler> {
-        SmtpHandler::new(
-            "127.0.0.1",
-            port,
-            SmtpTls::None,
-            None,
-            "WeaveAuth <no-reply@example.com>",
-            TIMEOUT,
-            glob,
-        )
-    }
-
-    #[tokio::test]
-    async fn smtp_sends_the_default_templates() {
-        let (port, session) = fake_smtp().await;
-        let handler = smtp(port, TEMPLATES_GLOB).unwrap();
-
-        handler.send(&mail()).await.unwrap();
-
-        let data = session.await.unwrap();
-        assert!(data.contains("Subject: Your verification code"), "{data}");
-        assert!(data.contains("To: alice@example.com"), "{data}");
-        assert!(data.contains("042517"), "{data}");
-        assert!(
-            data.contains("https://login.test/verify-email.html"),
-            "{data}"
-        );
-        // Quoted-printable wraps lines, so only the unbroken part is checked.
-        assert!(data.contains("2026-10-03 12:00 UTC"), "{data}");
-    }
-
-    fn override_dir(files: &[(&str, &str)]) -> String {
-        let dir = std::env::temp_dir().join(format!("wa-email-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, body) in files {
-            std::fs::write(dir.join(name), body).unwrap();
-        }
-        format!("{}/*", dir.display())
-    }
-
-    const ALL: [(&str, &str); 3] = [
-        ("verify-email.subject.txt", "Custom subject"),
-        ("verify-email.txt", "custom text {{ code }}"),
-        ("verify-email.html", "<p>custom html</p>"),
-    ];
-
-    #[tokio::test]
-    async fn smtp_uses_a_deployers_templates() {
-        let (port, session) = fake_smtp().await;
-        let handler = smtp(port, &override_dir(&ALL)).unwrap();
-
-        handler.send(&mail()).await.unwrap();
-
-        let data = session.await.unwrap();
-        assert!(data.contains("Subject: Custom subject"), "{data}");
-        assert!(data.contains("custom html"), "{data}");
-        assert!(!data.contains("Your verification code"), "{data}");
-    }
-
-    #[test]
-    fn smtp_refuses_a_template_dir_missing_a_required_template() {
-        let error = smtp(1, &override_dir(&ALL[..2])).err().expect("must fail");
-
-        assert!(error.to_string().contains("verify-email.html"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn smtp_reports_a_refused_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let handler = smtp(port, TEMPLATES_GLOB).unwrap();
-
-        let error = handler.send(&mail()).await.unwrap_err();
-
-        assert!(error.0.contains("smtp send failed"), "{error}");
-    }
-
-    #[test]
-    fn smtp_refuses_plaintext_to_a_remote_host() {
-        let result = SmtpHandler::new(
-            "smtp.example.com",
-            25,
-            SmtpTls::None,
-            None,
-            "no-reply@example.com",
-            TIMEOUT,
-            TEMPLATES_GLOB,
-        );
-
-        let error = result.err().expect("must fail");
-        assert!(error.to_string().contains("smtp.example.com"), "{error}");
-    }
-
-    #[test]
-    fn smtp_refuses_an_invalid_from_address() {
-        let result = SmtpHandler::new(
-            "127.0.0.1",
-            1,
-            SmtpTls::None,
-            None,
-            "not an address",
-            TIMEOUT,
-            TEMPLATES_GLOB,
-        );
-
-        assert!(result.is_err());
     }
 }

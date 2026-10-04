@@ -84,6 +84,19 @@ release. A plugin only has to handle the hooks it's wired into; return
 - The plugin's user defaults to `1003` (`wa-email`) and its environment comes
   from `WA_PLUGIN_EMAIL_ENV_<NAME>`.
 
+### `hook: "password_reset"`
+
+- Sent to the same email plugin when someone asks for a password reset for
+  an existing account (at most once a minute per account). `email` is the
+  account's own address; `data` carries `reset_url` (login's
+  `/reset-password.html` with the single-use token in its `#token=` fragment,
+  put it in the mail as is) and `expires_at` (RFC 3339, UTC). Background task,
+  as for `email_verification`.
+- **Return `OK` once the email is sent or queued.** Any other status is logged;
+  the user sees the same "check your inbox" page either way and can ask again.
+- `reset_url` takes over the account for whoever opens it: don't log it or
+  store it beyond sending.
+
 ## Running
 
 WeaveAuth spawns the plugin with one end of a connected unix socket as its

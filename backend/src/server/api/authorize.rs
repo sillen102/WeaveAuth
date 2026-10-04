@@ -87,6 +87,7 @@ mod service {
 
     use crate::model::pkce::CodeChallengeMethod;
     use crate::server::AppState;
+    use crate::server::api::current_user;
     use crate::storage::{LoginSessionStorage, PkceStorage};
 
     #[derive(Debug, Error, Eq, PartialEq)]
@@ -108,9 +109,12 @@ mod service {
         query_state: Option<String>,
         login_session: String,
     ) -> Result<String, AuthorizeServiceError> {
-        let user_id = state
+        let stamp = state
             .login_sessions
             .take_session(&login_session)
+            .await
+            .ok_or(AuthorizeServiceError::InvalidLoginSession)?;
+        current_user(&state.users, stamp)
             .await
             .ok_or(AuthorizeServiceError::InvalidLoginSession)?;
 
@@ -133,7 +137,7 @@ mod service {
                 code_challenge,
                 code_challenge_method,
                 redirect_uri.clone(),
-                user_id,
+                stamp,
             )
             .await;
 
@@ -155,8 +159,9 @@ mod tests {
 
     use super::controller::AuthorizeError::{InvalidLoginSession, InvalidRedirectUri};
     use crate::model::pkce::CodeChallengeMethod;
+    use crate::model::user::CredentialStamp;
     use crate::server::AppState;
-    use crate::storage::{LoginSessionStorage, PkceStorage};
+    use crate::storage::{LoginSessionStorage, PkceStorage, UserStorage};
 
     async fn state_with_allowlist(allowlist: &[&str]) -> (AppState, String) {
         let (state, login_session, _user_id) = state_with_allowlist_and_user(allowlist).await;
@@ -165,11 +170,16 @@ mod tests {
 
     async fn state_with_allowlist_and_user(allowlist: &[&str]) -> (AppState, String, uuid::Uuid) {
         let mut login_sessions = crate::storage::in_memory::InMemoryLoginSessionStorage::new(60);
-        let user_id = uuid::Uuid::new_v4();
-        let login_session = login_sessions.create_session(user_id).await;
+        let mut users = crate::storage::in_memory::InMemoryUserStorage::new();
+        let user = crate::model::user::User::default();
+        let user_id = user.id;
+        let _ = users.create_user(user).await;
+        let login_session = login_sessions
+            .create_session(CredentialStamp::initial(user_id))
+            .await;
         let state = AppState {
             pkce: crate::storage::in_memory::InMemoryPkceStorage::new(300),
-            users: crate::storage::in_memory::InMemoryUserStorage::new(),
+            users,
             login_sessions,
             redirect_uri_allowlist: Arc::new(allowlist.iter().map(|s| s.to_string()).collect()),
             jwt_keys: crate::storage::in_memory::InMemoryJwkStorage::new()
@@ -190,10 +200,12 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         };
         (state, login_session, user_id)
     }
@@ -317,6 +329,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_login_session_issued_before_a_password_change() {
+        let (mut state, login_session, user_id) =
+            state_with_allowlist_and_user(&["http://redirect.test"]).await;
+        let _ = state
+            .users
+            .set_password(
+                user_id,
+                crate::model::user::PasswordHash::Argon2("new-hash".into()),
+            )
+            .await;
+        let req = AuthorizeRequest {
+            redirect_uri: "http://redirect.test".to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            state: None,
+            login_session,
+        };
+
+        let result = authorize(State(state), ApiQuery(req)).await;
+
+        assert_eq!(result.err(), Some(InvalidLoginSession));
+    }
+
+    #[tokio::test]
     async fn saves_code_challenge_bound_to_redirect_uri() {
         let (mut state, login_session, user_id) =
             state_with_allowlist_and_user(&["http://redirect.test"]).await;
@@ -341,7 +377,7 @@ mod tests {
                 "my_challenge".to_string(),
                 CodeChallengeMethod::S256,
                 "http://redirect.test".to_string(),
-                user_id,
+                CredentialStamp::initial(user_id),
             ))
         );
     }

@@ -2,9 +2,10 @@ use crate::config::{
     Config, EmailHandlerConfig, HandlerConfig, JWT_KEY_PUBLISH_AHEAD_SECS, OidcProviderConfig,
     PluginHook, PluginSettings, ProfileApiConfig, WebhookConfig, jwt_key_grace_secs,
 };
+use crate::email::EmailHandler;
 use crate::oidc::{self, OidcClient};
 use crate::plugin::{PluginConfig, PluginProcess, forwarded_env};
-use crate::server::api::email_verification::{self, EmailVerification, EmailVerificationHandler};
+use crate::server::api::email_verification::EmailVerification;
 use crate::server::api::register::{self, ExtraDataHandler};
 use crate::server::api::token::{self, LoginClaimsHandler};
 use crate::server::router::router;
@@ -52,6 +53,10 @@ pub(crate) struct AppState {
     pub(crate) max_bcrypt_cost: u32,
     pub(crate) extra_data_handler: Option<Arc<dyn ExtraDataHandler>>,
     pub(crate) login_claims_handler: Option<Arc<dyn LoginClaimsHandler>>,
+    /// Sends every email (verification codes, reset links). `None`: none is sent.
+    pub(crate) email_handler: Option<Arc<dyn EmailHandler>>,
+    /// Login's public origin, without a trailing `/` (see `Config::load`); emails link to its pages.
+    pub(crate) login_public_url: String,
     pub(crate) email_verification: EmailVerification,
 }
 
@@ -120,6 +125,12 @@ impl AppState {
     }
 
     pub(crate) async fn new(config: &Config) -> anyhow::Result<Self> {
+        // Earlier reset tokens stay valid, so the cooldown is the only bound on
+        // how many one user holds.
+        anyhow::ensure!(
+            config.tuning.password_reset_resend_cooldown_secs > 0,
+            "password_reset_resend_cooldown_secs must be positive"
+        );
         // Fail at boot rather than silently dropping the claims on every login.
         let maps_extra_claims = |p: &OidcProviderConfig| {
             !p.extra_claims.is_empty() || p.profile_apis.iter().any(|api| !api.claims.is_empty())
@@ -217,10 +228,13 @@ impl AppState {
             oidc_http_client,
             password_reset_tokens: InMemoryPasswordResetTokenStorage::new(
                 config.tuning.password_reset_token_ttl_secs,
+                config.tuning.password_reset_resend_cooldown_secs,
             ),
             max_bcrypt_cost: config.tuning.max_bcrypt_cost,
             extra_data_handler,
             login_claims_handler,
+            email_handler,
+            login_public_url: config.login_public_url.clone(),
             email_verification: EmailVerification {
                 codes: InMemoryEmailVerificationCodeStorage::new(
                     config.tuning.email_verification_code_ttl_secs,
@@ -229,8 +243,6 @@ impl AppState {
                 sessions: InMemoryVerificationSessionStorage::new(
                     config.tuning.email_verification_session_ttl_secs,
                 ),
-                handler: email_handler,
-                login_public_url: config.login_public_url.clone(),
                 code_ttl_secs: config.tuning.email_verification_code_ttl_secs,
                 required: config.require_verified_email,
             },
@@ -275,9 +287,14 @@ async fn build_login_claims_handler(
 async fn build_email_handler(
     config: Option<&EmailHandlerConfig>,
     setuid_helper: Option<&str>,
-) -> anyhow::Result<Option<Arc<dyn EmailVerificationHandler>>> {
-    let handler: Arc<dyn EmailVerificationHandler> = match config {
-        None => return Ok(None),
+) -> anyhow::Result<Option<Arc<dyn EmailHandler>>> {
+    let handler: Arc<dyn EmailHandler> = match config {
+        None => {
+            tracing::warn!(
+                "no email_handler configured: verification codes and password reset links are not sent"
+            );
+            return Ok(None);
+        }
         Some(EmailHandlerConfig::Smtp {
             host,
             port,
@@ -286,24 +303,21 @@ async fn build_email_handler(
             password,
             from,
             timeout_secs,
-        }) => Arc::new(email_verification::SmtpHandler::new(
+        }) => Arc::new(crate::email::SmtpHandler::new(
             host,
             *port,
             *tls,
             smtp_credentials(username, password)?,
             from,
             Duration::from_secs(*timeout_secs),
-            email_verification::TEMPLATES_GLOB,
+            crate::email::TEMPLATES_GLOB,
         )?),
-        Some(EmailHandlerConfig::Webhook(WebhookConfig { url, timeout_secs })) => {
-            Arc::new(email_verification::WebhookHandler::new(
-                url.clone(),
-                Duration::from_secs(*timeout_secs),
-            )?)
-        }
+        Some(EmailHandlerConfig::Webhook(WebhookConfig { url, timeout_secs })) => Arc::new(
+            crate::email::WebhookHandler::new(url.clone(), Duration::from_secs(*timeout_secs))?,
+        ),
         Some(EmailHandlerConfig::Plugin(settings)) => {
             let plugin = start_plugin(settings, PluginHook::Email, setuid_helper).await?;
-            Arc::new(email_verification::PluginHandler::new(plugin))
+            Arc::new(crate::email::PluginHandler::new(plugin))
         }
     };
     Ok(Some(handler))
@@ -519,6 +533,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_to_start_without_a_password_reset_cooldown() {
+        let mut config = Config::default();
+        config.tuning.password_reset_resend_cooldown_secs = 0;
+
+        let error = AppState::new(&config).await.err().expect("must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("password_reset_resend_cooldown_secs"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn starts_with_a_webhook_email_handler() {
         let config = Config {
             email_handler: Some(EmailHandlerConfig::Webhook(WebhookConfig {
@@ -530,7 +559,7 @@ mod tests {
 
         let state = AppState::new(&config).await.expect("startup succeeds");
 
-        assert!(state.email_verification.handler.is_some());
+        assert!(state.email_handler.is_some());
     }
 
     #[tokio::test]
@@ -550,7 +579,7 @@ mod tests {
 
         let state = AppState::new(&config).await.expect("startup succeeds");
 
-        assert!(state.email_verification.handler.is_some());
+        assert!(state.email_handler.is_some());
     }
 
     #[tokio::test]

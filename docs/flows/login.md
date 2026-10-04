@@ -59,26 +59,32 @@ Relevant code:
     bad that leak can get without closing it.
 - A successful bcrypt verification calls `upgrade_bcrypt_to_argon2`, which re-hashes
   the password with `crypto::hash_password` and overwrites the stored hash via
-  `set_password`, inline, in the same request. The same helper is called from
-  `/oauth/oidc/confirm-link` (oidc.rs) when that path verifies a legacy bcrypt hash, so
-  the upgrade behavior can't drift between the two call sites. A failure to upgrade
-  (hashing error, or `set_password` not finding the user) is logged (`tracing::warn!`)
-  but never fails the login -- the password was already confirmed correct.
+  `upgrade_password_hash`, inline, in the same request. The write only happens if the
+  account's `credential_version` still matches the one the password was checked against,
+  so a password reset landing during the re-hash isn't overwritten with the old
+  password. The same helper is called from `/oauth/oidc/confirm-link` (oidc.rs) when that
+  path verifies a legacy bcrypt hash, so the upgrade behavior can't drift between the two
+  call sites. A failure to upgrade (hashing error, or a reset in between) is logged
+  (`tracing::warn!`) but never fails the login -- the password was already confirmed
+  correct.
 - An account whose `email_verified` is `false` also gets a `verification_session`; with
   `require_verified_email` set that is *all* it gets (no `login_session`, and the code email is
   sent). This happens only after the password verified, so a wrong password still gets `401`
   and the response can't be used to probe which addresses are registered.
-- On success, `login_sessions.create_session(user.id)` mints a single-use
-  `login_session` token (fixed at 60s) and returns it.
+- On success, `login_sessions.create_session(user.stamp())` mints a single-use
+  `login_session` token (fixed at 60s) and returns it. The stamp records the account's
+  `credential_version` as of the password check, so a password reset since then makes
+  the session worthless ([password reset](password-reset.md#every-earlier-credential-dies)).
 
 **3. `GET /oauth/authorize`** (backend: `authorize`) -- called by `complete_login`,
 never the browser directly.
 
 - Redeems `login_session` (single-use, `take_session`) -> `401` if missing, unknown,
-  or already used.
+  already used, or issued before the account's latest password reset.
 - Checks `redirect_uri` against `redirect_uri_allowlist` -- exact string match.
 - Mints a single-use `auth_code` bound to the PKCE `code_challenge`,
-  `code_challenge_method`, `redirect_uri`, and `user_id`, and redirects to
+  `code_challenge_method`, `redirect_uri`, and the login session's
+  `CredentialStamp` (user id and credential version), and redirects to
   `redirect_uri?code=...`.
 
 **4. `POST /oauth/token`** (backend: `issue_token`) -- also called by `complete_login`.

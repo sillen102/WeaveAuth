@@ -165,14 +165,14 @@ mod service {
     ) -> Result<LoginOutcome, LoginServiceError> {
         let user = authenticate_password(state, email, password).await?;
         if user.email_verified {
-            let login_session = state.login_sessions.create_session(user.id).await;
+            let login_session = state.login_sessions.create_session(user.stamp()).await;
             return Ok(LoginOutcome::Verified { login_session });
         }
 
         let verification_session = state
             .email_verification
             .sessions
-            .create_session(user.id)
+            .create_session(user.stamp())
             .await;
         if state.email_verification.required {
             if !state.email_verification.codes.has_live_code(user.id).await {
@@ -182,7 +182,7 @@ mod service {
                 verification_session,
             });
         }
-        let login_session = state.login_sessions.create_session(user.id).await;
+        let login_session = state.login_sessions.create_session(user.stamp()).await;
         Ok(LoginOutcome::Unverified {
             login_session,
             verification_session,
@@ -249,10 +249,12 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         }
     }
 
@@ -341,7 +343,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.email_verification.sessions.get_session(&token).await,
-            Some(user.id)
+            Some(user.stamp())
         );
     }
 

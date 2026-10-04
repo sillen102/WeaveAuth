@@ -541,7 +541,7 @@ mod service {
             .await
         {
             OidcLinkOutcome::Resolved(user) => {
-                let login_session = state.login_sessions.create_session(user.id).await;
+                let login_session = state.login_sessions.create_session(user.stamp()).await;
                 OidcCallbackResponse::Authenticated { login_session }
             }
             OidcLinkOutcome::RequiresLinkConfirmation {
@@ -588,21 +588,26 @@ mod service {
                 pending_link.existing_user_id
             )));
         }
+        // The provider sign-in is the proof here, so the current stamp is
+        // taken as is; it only catches a reset racing this very request.
+        let no_account = || {
+            OidcServiceError::LinkConfirmationFailed(format!(
+                "account {} no longer exists or was reset just now",
+                pending_link.existing_user_id
+            ))
+        };
+        let stamp = state
+            .users
+            .get_user_by_id(pending_link.existing_user_id)
+            .await
+            .ok_or_else(no_account)?
+            .stamp();
         let user = state
             .users
-            .link_verified_oidc_identity(
-                pending_link.existing_user_id,
-                &pending_link.provider,
-                &pending_link.subject,
-            )
+            .link_verified_oidc_identity(stamp, &pending_link.provider, &pending_link.subject)
             .await
-            .ok_or_else(|| {
-                OidcServiceError::LinkConfirmationFailed(format!(
-                    "account {} no longer exists",
-                    pending_link.existing_user_id
-                ))
-            })?;
-        let login_session = state.login_sessions.create_session(user.id).await;
+            .ok_or_else(no_account)?;
+        let login_session = state.login_sessions.create_session(user.stamp()).await;
         Ok(OidcCallbackResponse::Authenticated { login_session })
     }
 
@@ -750,6 +755,7 @@ mod service {
             .get_user_by_id(pending_link.existing_user_id)
             .await
             .ok_or(ConfirmLinkServiceError::InvalidPendingLink)?;
+        let stamp = user.stamp();
         let hash = user
             .password
             .ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
@@ -768,19 +774,15 @@ mod service {
         }
 
         if is_legacy_bcrypt {
-            crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
+            crate::server::api::upgrade_bcrypt_to_argon2(&mut state.users, stamp, password).await;
         }
 
         let user = state
             .users
-            .link_verified_oidc_identity(
-                pending_link.existing_user_id,
-                &pending_link.provider,
-                &pending_link.subject,
-            )
+            .link_verified_oidc_identity(stamp, &pending_link.provider, &pending_link.subject)
             .await
             .ok_or(ConfirmLinkServiceError::PasswordConfirmationFailed)?;
-        let login_session = state.login_sessions.create_session(user.id).await;
+        let login_session = state.login_sessions.create_session(user.stamp()).await;
 
         Ok(login_session)
     }
@@ -795,7 +797,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::model::user::{PasswordHash, User};
+    use crate::model::user::{CredentialStamp, PasswordHash, User};
     use crate::server::AppState;
     use crate::storage::{OidcStateStorage, PendingOidcLinkStorage, UserStorage};
 
@@ -823,10 +825,12 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         }
     }
 
@@ -1774,7 +1778,11 @@ mod tests {
             state_with_pending_linkedin_link("alice@example.com").await;
         let _ = state
             .users
-            .link_verified_oidc_identity(user_id, "test-provider", "provider-subject")
+            .link_verified_oidc_identity(
+                CredentialStamp::initial(user_id),
+                "test-provider",
+                "provider-subject",
+            )
             .await;
 
         let result = callback_response(&state, "csrf-token", Some(&token)).await;
@@ -1830,7 +1838,11 @@ mod tests {
         let _ = state.users.create_user(bob).await;
         let _ = state
             .users
-            .link_verified_oidc_identity(bob_id, "test-provider", "provider-subject")
+            .link_verified_oidc_identity(
+                CredentialStamp::initial(bob_id),
+                "test-provider",
+                "provider-subject",
+            )
             .await;
 
         let result = callback_response(&state, "csrf-token", Some(&token)).await;
@@ -1858,7 +1870,7 @@ mod tests {
         let _ = state.users.create_user(user).await;
         let _ = state
             .users
-            .link_verified_oidc_identity(user_id, "linkedin", "li-sub")
+            .link_verified_oidc_identity(CredentialStamp::initial(user_id), "linkedin", "li-sub")
             .await;
 
         let result = callback_response(&state, "csrf-token", None).await;

@@ -38,6 +38,12 @@ mod controller {
         #[error("invalid email address")]
         #[error_response(StatusCode::BAD_REQUEST, details = "invalid email address")]
         InvalidEmail,
+        #[error("password does not meet the password policy")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "password must be at least 8 characters and at most 1024 bytes"
+        )]
+        WeakPassword,
         #[error("email already taken")]
         #[error_response(StatusCode::CONFLICT, details = "email already taken")]
         EmailTaken,
@@ -77,6 +83,7 @@ mod controller {
             }
             match err {
                 RegisterServiceError::InvalidEmail => RegisterError::InvalidEmail,
+                RegisterServiceError::WeakPassword(_) => RegisterError::WeakPassword,
                 RegisterServiceError::EmailTaken => RegisterError::EmailTaken,
                 RegisterServiceError::ExtraDataNotSupported => RegisterError::ExtraDataNotSupported,
                 RegisterServiceError::ExtraDataTooLarge => RegisterError::ExtraDataTooLarge,
@@ -95,7 +102,8 @@ mod controller {
             .summary("Register a new user")
             .description(indoc! {"
                 Creates a user with a password hashed via Argon2; 400 if the email is not a
-                valid address, 409 if it's already taken. Any fields beyond email/password are
+                valid address or the password is shorter than 8 characters or longer than 1024
+                bytes, 409 if it's already taken. Any fields beyond email/password are
                 forwarded to the deployer's configured extra-data handler -- 400 if none is
                 configured, 502 if the handler rejects the registration."})
     }
@@ -120,6 +128,7 @@ mod service {
 
     use crate::crypto;
     use crate::model::email::normalize_email;
+    use crate::model::password::{PasswordPolicyError, validate_new_password};
     use crate::model::user::{PasswordHash, User};
     use crate::server::AppState;
     use crate::server::api::email_verification::send_verification_email;
@@ -129,6 +138,8 @@ mod service {
     pub(crate) enum RegisterServiceError {
         #[error("invalid email address")]
         InvalidEmail,
+        #[error(transparent)]
+        WeakPassword(#[from] PasswordPolicyError),
         #[error("email already taken")]
         EmailTaken,
         #[error("extra registration fields are not supported by this deployment")]
@@ -166,6 +177,7 @@ mod service {
         if !EmailAddress::is_valid(&email) {
             return Err(RegisterServiceError::InvalidEmail);
         }
+        validate_new_password(&password)?;
 
         let password_hash = crypto::hash_password(password)
             .await
@@ -210,6 +222,7 @@ mod service {
                 password: Some(PasswordHash::Argon2(password_hash.into())),
                 // Set by entering the emailed code or by linking an OIDC identity.
                 email_verified: false,
+                credential_version: 0,
                 created_at: now,
                 updated_at: now,
             })
@@ -498,10 +511,12 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         }
     }
 
@@ -530,7 +545,7 @@ mod tests {
             .method("POST")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(Bytes::from(
-                r#"{"email":"alice@example.com","password":"hunter2","company":"Acme","plan":"pro"}"#,
+                r#"{"email":"alice@example.com","password":"hunter2-hunter2","company":"Acme","plan":"pro"}"#,
             )))
             .expect("valid request");
 
@@ -539,7 +554,7 @@ mod tests {
             .expect("json deserializes");
 
         assert_eq!(req.email, "alice@example.com");
-        assert_eq!(req.password, "hunter2");
+        assert_eq!(req.password, "hunter2-hunter2");
         assert_eq!(
             req.extra,
             HashMap::from([
@@ -559,7 +574,11 @@ mod tests {
     async fn registering_sends_a_verification_email_to_the_normalized_address() {
         let (state, mut rx) = state_with_recorder();
 
-        let result = register(State(state), ApiJson(req("Alice+x@Example.com", "hunter2"))).await;
+        let result = register(
+            State(state),
+            ApiJson(req("Alice+x@Example.com", "hunter2-hunter2")),
+        )
+        .await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
         assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
@@ -570,7 +589,11 @@ mod tests {
         let (mut state, mut rx) = state_with_recorder();
         state.email_verification.required = true;
 
-        let result = register(State(state), ApiJson(req("alice@example.com", "hunter2"))).await;
+        let result = register(
+            State(state),
+            ApiJson(req("alice@example.com", "hunter2-hunter2")),
+        )
+        .await;
 
         assert_eq!(result, Ok(StatusCode::CREATED));
         assert_eq!(next_sent(&mut rx).await.email, "alice@example.com");
@@ -580,7 +603,11 @@ mod tests {
     async fn a_rejected_registration_sends_no_verification_email() {
         let (state, mut rx) = state_with_recorder();
 
-        let result = register(State(state), ApiJson(req("not-an-email", "hunter2"))).await;
+        let result = register(
+            State(state),
+            ApiJson(req("not-an-email", "hunter2-hunter2")),
+        )
+        .await;
 
         assert_eq!(result.err(), Some(RegisterError::InvalidEmail));
         assert_nothing_sent(&mut rx).await;
@@ -592,7 +619,7 @@ mod tests {
 
         let result = register(
             State(state.clone()),
-            ApiJson(req("alice@example.com", "hunter2")),
+            ApiJson(req("alice@example.com", "hunter2-hunter2")),
         )
         .await;
 
@@ -603,15 +630,39 @@ mod tests {
     async fn rejects_an_invalid_email() {
         let state = state();
 
-        let result = register(State(state), ApiJson(req("not-an-email", "hunter2"))).await;
+        let result = register(
+            State(state),
+            ApiJson(req("not-an-email", "hunter2-hunter2")),
+        )
+        .await;
 
         assert_eq!(result, Err(RegisterError::InvalidEmail));
     }
 
     #[tokio::test]
+    async fn rejects_a_password_below_the_policy_minimum_and_creates_no_user() {
+        let state = state();
+
+        let result = register(
+            State(state.clone()),
+            ApiJson(req("alice@example.com", "1234567")),
+        )
+        .await;
+
+        assert_eq!(result, Err(RegisterError::WeakPassword));
+        assert!(
+            state
+                .users
+                .get_user_by_email("alice@example.com")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_a_taken_email() {
         let state = state();
-        let first = req("alice@example.com", "hunter2");
+        let first = req("alice@example.com", "hunter2-hunter2");
         let second = req("alice@example.com", "different-password");
 
         let first_result = register(State(state.clone()), ApiJson(first)).await;
@@ -624,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_extra_fields_when_no_handler_is_configured() {
         let state = state();
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
         let result = register(State(state), ApiJson(req)).await;
@@ -656,7 +707,7 @@ mod tests {
     async fn accepts_extra_fields_when_the_handler_succeeds() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
         let result = register(State(state), ApiJson(req)).await;
@@ -668,7 +719,7 @@ mod tests {
     async fn does_not_create_the_user_when_the_handler_fails() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: false }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
         let result = register(State(state.clone()), ApiJson(req)).await;
@@ -710,7 +761,7 @@ mod tests {
 
         let first = register(
             State(state.clone()),
-            ApiJson(req("alice@example.com", "hunter2")),
+            ApiJson(req("alice@example.com", "hunter2-hunter2")),
         )
         .await;
         assert_eq!(first, Ok(StatusCode::CREATED));
@@ -744,7 +795,7 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         state.extra_data_handler = Some(handler.clone());
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("company".to_string(), "Acme".to_string());
 
         let result = register(State(state.clone()), ApiJson(req)).await;
@@ -764,7 +815,7 @@ mod tests {
     async fn allows_exactly_the_max_number_of_extra_fields() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         for i in 0..50 {
             req.extra.insert(format!("field{i}"), "value".to_string());
         }
@@ -778,7 +829,7 @@ mod tests {
     async fn allows_extra_field_key_and_value_at_the_max_length() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("k".repeat(4096), "v".repeat(4096));
 
         let result = register(State(state), ApiJson(req)).await;
@@ -790,7 +841,7 @@ mod tests {
     async fn rejects_too_many_extra_fields() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         for i in 0..51 {
             req.extra.insert(format!("field{i}"), "value".to_string());
         }
@@ -804,7 +855,7 @@ mod tests {
     async fn rejects_an_oversized_extra_field_value() {
         let mut state = state();
         state.extra_data_handler = Some(Arc::new(StubHandler { succeed: true }));
-        let mut req = req("alice@example.com", "hunter2");
+        let mut req = req("alice@example.com", "hunter2-hunter2");
         req.extra.insert("company".to_string(), "x".repeat(4097));
 
         let result = register(State(state), ApiJson(req)).await;

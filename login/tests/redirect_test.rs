@@ -9,7 +9,7 @@ fn test_config() -> Config {
         port: 8081,
         bff_url: "http://bff.test".into(),
         own_origin: "http://login.test".into(),
-        verify_default_redirect_uri: None,
+        email_link_default_redirect_uri: None,
         bff_internal_url: None,
     }
 }
@@ -548,11 +548,17 @@ async fn verify_email_page_reports_each_outcome() {
         let body = body_string(resp).await;
         assert!(body.contains(marker), "{status}: {body}");
         assert_eq!(body.contains("id=\"verify-form\""), forms, "{status}");
-        // Signing in again can't lift a hard lock, so that page has no link.
+        // Signing in again can't lift a hard lock, so that page has no
+        // sign-in link; a password reset can, so it links there instead.
         assert_eq!(
             body.contains("id=\"login-link\""),
             !forms && status != "locked_until_reset",
             "{status}: a page without forms offers signing in again, except when locked for good"
+        );
+        assert_eq!(
+            body.contains("id=\"forgot-password-link\""),
+            status == "locked_until_reset",
+            "{status}"
         );
     }
 }
@@ -659,7 +665,7 @@ async fn get_body(config: Config, path: &str) -> String {
 #[tokio::test]
 async fn verify_email_page_defaults_redirect_uri_to_the_configured_one() {
     let config = Config {
-        verify_default_redirect_uri: Some("http://app.test/home".into()),
+        email_link_default_redirect_uri: Some("http://app.test/home".into()),
         ..test_config()
     };
 
@@ -676,12 +682,190 @@ async fn verify_email_page_defaults_redirect_uri_to_the_configured_one() {
 }
 
 #[tokio::test]
-async fn the_verify_default_redirect_uri_does_not_apply_to_other_pages() {
+async fn the_email_link_default_redirect_uri_does_not_apply_to_other_pages() {
     let config = Config {
-        verify_default_redirect_uri: Some("http://app.test/home".into()),
+        email_link_default_redirect_uri: Some("http://app.test/home".into()),
         ..test_config()
     };
 
     let body = get_body(config, "/login.html").await;
     assert!(body.contains("name=\"redirect_uri\" value=\"http://login.test/\""));
+}
+
+#[tokio::test]
+async fn forgot_password_page_posts_the_email_to_bff_and_reports_each_status() {
+    for (status, marker) in [
+        ("", "id=\"forgot-intro\""),
+        ("sent", "id=\"forgot-sent\""),
+        ("invalid_token", "id=\"forgot-invalid-token\""),
+    ] {
+        let body = get_body(
+            test_config(),
+            &format!("/forgot-password.html?status={status}"),
+        )
+        .await;
+
+        assert!(body.contains(marker), "{status}: {body}");
+        assert!(
+            body.contains("action=\"http://bff.test/password-reset/request\""),
+            "{status}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_password_page_posts_the_token_and_new_password_to_bff() {
+    let body = get_body(test_config(), "/reset-password.html").await;
+
+    assert!(
+        body.contains("action=\"http://bff.test/password-reset/confirm\""),
+        "{body}"
+    );
+    assert!(body.contains("name=\"token\""), "{body}");
+    assert!(body.contains("name=\"new_password\""), "{body}");
+    assert!(body.contains("minlength=\"8\""), "{body}");
+    assert!(body.contains("maxlength=\"1024\""), "{body}");
+    // The token arrives in the fragment, which only a script can read.
+    assert!(body.contains("src=\"/reset-password.js\""), "{body}");
+    assert!(body.contains("id=\"reset-intro\""), "{body}");
+
+    let body = get_body(test_config(), "/reset-password.html?status=weak_password").await;
+    assert!(body.contains("id=\"reset-weak-password\""), "{body}");
+    // Covers too long as well as too short.
+    assert!(!body.contains("too short"), "{body}");
+}
+
+#[tokio::test]
+async fn reset_password_page_is_neither_cached_nor_named_in_a_referer() {
+    let resp = app(test_config())
+        .oneshot(
+            Request::get("/reset-password.html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Not `no-referrer`: under it the browser sends `Origin: null` on the
+    // form's cross-origin POST, and bff's origin check refuses it.
+    assert_eq!(resp.headers()["referrer-policy"], "strict-origin");
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+}
+
+#[tokio::test]
+async fn reset_password_script_is_served() {
+    let resp = app(test_config())
+        .oneshot(
+            Request::get("/reset-password.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let script = body_string(resp).await;
+    assert!(script.contains("location.hash"), "{script}");
+    // Survives a reload and a rejected password, which both drop the fragment.
+    assert!(script.contains("sessionStorage"), "{script}");
+}
+
+#[tokio::test]
+async fn login_page_links_to_forgot_password_and_confirms_a_reset() {
+    let body = get_body(test_config(), "/login.html").await;
+    assert!(body.contains("id=\"forgot-password-link\""), "{body}");
+    assert!(!body.contains("id=\"login-password-reset\""), "{body}");
+
+    let body = get_body(test_config(), "/login.html?status=password_reset").await;
+    assert!(body.contains("id=\"login-password-reset\""), "{body}");
+}
+
+// The owner of a squatted address confirms the link with a password they
+// don't know yet: the way out has to be right there.
+#[tokio::test]
+async fn confirm_link_page_offers_a_password_reset_next_to_the_password_form() {
+    let body = get_body(
+        test_config(),
+        "/login.html?email=alice%40example.com&has_password=true",
+    )
+    .await;
+
+    assert!(body.contains("id=\"forgot-password-link\""), "{body}");
+}
+
+// The reset link carries no redirect_uri, so the login page reached after a
+// reset uses the same default as the verification page.
+#[tokio::test]
+async fn login_page_after_a_reset_defaults_redirect_uri_to_the_configured_one() {
+    let config = Config {
+        email_link_default_redirect_uri: Some("http://app.test/home".into()),
+        ..test_config()
+    };
+
+    let body = get_body(config.clone(), "/login.html?status=password_reset").await;
+    assert!(
+        body.contains("name=\"redirect_uri\" value=\"http://app.test/home\""),
+        "{body}"
+    );
+
+    let body = get_body(config, "/login.html").await;
+    assert!(
+        body.contains("name=\"redirect_uri\" value=\"http://login.test/\""),
+        "{body}"
+    );
+}
+
+// A finished or dead reset leaves no token behind in the tab.
+#[tokio::test]
+async fn the_pages_a_reset_ends_on_clear_the_stored_token() {
+    const CLEAR: &str = "sessionStorage.removeItem(\"wa_reset_token\")";
+    for (path, clears) in [
+        ("/login.html?status=password_reset", true),
+        ("/forgot-password.html?status=invalid_token", true),
+        ("/login.html", false),
+        ("/forgot-password.html?status=sent", false),
+    ] {
+        let body = get_body(test_config(), path).await;
+        assert_eq!(body.contains(CLEAR), clears, "{path}: {body}");
+    }
+}
+
+// The token only arrives through the script, so without one the form stays
+// hidden behind a pointer back to the email.
+#[tokio::test]
+async fn reset_password_page_shows_the_form_only_once_the_script_has_a_token() {
+    let body = get_body(test_config(), "/reset-password.html").await;
+    // Hidden until the script finds no token, so a normal load doesn't flash it.
+    assert!(body.contains("id=\"reset-no-token\" hidden"), "{body}");
+    assert!(body.contains("<noscript>"), "{body}");
+    assert!(body.contains("id=\"reset-form\" hidden"), "{body}");
+
+    let resp = app(test_config())
+        .oneshot(
+            Request::get("/reset-password.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let script = body_string(resp).await;
+    assert!(script.contains("reset-no-token"), "{script}");
+    assert!(script.contains("reset-weak-password"), "{script}");
+    assert!(script.contains("reset-intro"), "{script}");
+    assert!(script.contains("reset-form"), "{script}");
+}
+
+#[tokio::test]
+async fn forgot_password_page_defaults_redirect_uri_to_the_configured_one() {
+    let config = Config {
+        email_link_default_redirect_uri: Some("http://app.test/home".into()),
+        ..test_config()
+    };
+
+    let body = get_body(config, "/forgot-password.html?status=invalid_token").await;
+    assert!(
+        body.contains("login.html?redirect_uri=http%3A%2F%2Fapp.test%2Fhome"),
+        "{body}"
+    );
 }

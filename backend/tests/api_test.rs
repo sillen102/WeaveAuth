@@ -67,7 +67,7 @@ async fn login_session(app: axum::Router, email: &str, password: &str) -> String
 /// Drives a real authorize -> extracts `code` -> returns it plus the verifier
 /// whose SHA256 matches the challenge sent to /oauth/authorize.
 async fn issue_code(app: axum::Router, code_challenge: &str) -> String {
-    let login_session = login_session(app.clone(), "alice@example.com", "hunter2").await;
+    let login_session = login_session(app.clone(), "alice@example.com", "hunter2-hunter2").await;
 
     let resp = app
         .oneshot(
@@ -141,6 +141,48 @@ async fn password_reset_request_returns_accepted_over_http() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 }
 
+// A list of addresses must never reach the lookup, let alone the mailer.
+#[tokio::test]
+async fn password_reset_request_rejects_a_list_of_emails_over_http() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(
+            Request::post("/oauth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"email": ["alice@example.com", "attacker@example.com"]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
+// bff tells a weak password from a bad token by this exact `reason`.
+#[tokio::test]
+async fn password_reset_confirm_reports_a_weak_password_by_reason_over_http() {
+    let app = app(&test_config()).await.expect("test app builds");
+
+    let resp = app
+        .oneshot(
+            Request::post("/oauth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": "any-token", "new_password": "short"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["reason"], "WeakPassword");
+}
+
 #[tokio::test]
 async fn password_reset_confirm_rejects_an_unknown_token_over_http() {
     let app = app(&test_config()).await.expect("test app builds");
@@ -194,7 +236,7 @@ async fn register_rejects_extra_fields_over_http_when_no_handler_is_configured()
             Request::post("/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"email": "extra@example.com", "password": "hunter2", "company": "Acme"}).to_string(),
+                    serde_json::json!({"email": "extra@example.com", "password": "hunter2-hunter2", "company": "Acme"}).to_string(),
                 ))
                 .unwrap(),
         )
