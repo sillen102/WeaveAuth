@@ -20,6 +20,55 @@ Relevant code:
 - `bff/src/server/api/login.rs`, `register.rs` -- where login and registration hand over to it
 - `templates/emails/` -- the SMTP email templates; `templates/pages/verify-email.html` -- the page
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant L as login
+    participant F as bff
+    participant B as backend
+    participant M as Mail handler
+
+    Note over U,F: login or register returned a verification_session:<br/>bff set wa_verify_session (Path=/verify-email),<br/>with require_verified_email no wa_session
+    U->>L: GET verify-email.html?redirect_uri=...
+    Note over F: on either POST, no wa_verify_session cookie:<br/>303 next?status=session_expired without calling backend
+    alt enter the code
+        U->>F: POST /verify-email {code, redirect_uri, next}
+        F->>B: POST /oauth/email-verification/confirm {verification_session, code}
+        alt right code
+            Note over B: mark verified, delete verification session
+            B-->>F: {login_session}
+            Note over F,B: complete_login, clear wa_verify_session
+            F-->>U: 303 redirect_uri + wa_session cookie
+        else wrong code
+            B-->>F: 400
+            F-->>U: 303 next?status=invalid or code_used_up
+        else locked out
+            B-->>F: 423
+            F-->>U: 303 next?status=locked or locked_until_reset (cookie cleared)
+        else session unknown, expired or already verified
+            B-->>F: 401
+            F-->>U: 303 next?status=session_expired (cookie cleared)
+        end
+    else send a new code
+        U->>F: POST /verify-email/resend {next}
+        F->>B: POST /oauth/email-verification/request
+        opt unverified, outside cooldown, not locked
+            B--)M: new 9-digit code (background)
+        end
+        alt handled
+            B-->>F: 202 {status: sent, cooling_down, locked or locked_until_reset}
+            F-->>U: 303 next?status=... (cookie cleared if locked)
+        else session unknown, expired or already verified
+            B-->>F: 401
+            F-->>U: 303 next?status=session_expired (cookie cleared)
+        else no email handler
+            B-->>F: 503
+            F-->>U: 502
+        end
+    end
+```
+
 ## The verification session
 
 The point of the design: **an account whose email isn't verified is never given a real

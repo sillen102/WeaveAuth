@@ -19,6 +19,46 @@ Relevant code:
 - `backend/src/plugin/` -- the plugin runtime and its capabilities ([docs](../plugins.md))
 - `backend/src/crypto.rs` -- argon2 hashing primitives
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant F as bff
+    participant B as backend
+    participant H as Extra-data handler
+    participant M as Mail handler
+
+    U->>F: POST /register {email, password, redirect_uri, next, ...extra}
+    Note over F: require_trusted_origin (403 if untrusted), per-IP rate limit
+    F->>B: POST /register {email, password, ...extra}
+    Note over B: bound extra fields, validate email, password policy,<br/>argon2 hash, generate user_id
+    opt extra fields present
+        Note over B: 409 if email already taken, 400 if no handler
+        B->>H: {user_id, email, fields}
+        H-->>B: ok (an error fails with 502, no user created)
+    end
+    Note over B: create_user (atomic, 409 if taken)
+    alt rejected
+        B-->>F: 4xx
+        F-->>U: 303 next?error=1
+    else backend failed
+        B-->>F: 5xx
+        F-->>U: 502
+    else created
+        B--)M: verification code (background, if a handler is set)
+        B-->>F: 201
+        F->>B: POST /oauth/login (same credentials)
+        alt login_session
+            Note over F,B: complete_login, as in login
+            F-->>U: 303 redirect_uri + wa_session (+ wa_verify_session if unverified)
+        else verification_session only
+            F-->>U: 303 verify-email.html + wa_verify_session cookie
+        else auto-login failed
+            F-->>U: 303 next (account exists, user signs in)
+        end
+    end
+```
+
 ## Steps
 
 **1. `POST /register`** (bff: `start_register`) -- the registration form's submit target.
@@ -34,10 +74,12 @@ Relevant code:
   submits is collected by `#[serde(flatten)] extra` and forwarded to backend as-is;
   `redirect_uri` and `next` are bff's own and are never forwarded.
 - Posts `{email, password, ...extra}` to backend's `POST /register`.
-  - Backend non-2xx -> `RegisterOutcome::Rejected` -> `303` to `next?error=1`. A plain
+  - Backend 4xx -> `RegisterOutcome::Rejected` -> `303` to `next?error=1`. A plain
     form POST, not a fetch, so the browser gets a friendly bounce rather than a bare
     error body. Every backend rejection reason collapses into this one destination --
     `register.html`'s static copy has no way to distinguish them.
+  - Backend 5xx (including a failed extra-data handler) ->
+    `RegisterError::BackendUnavailable`, a bare `502` with no redirect.
   - Backend `201` -> `RegisterOutcome::Created`, continue below.
 - `auto_login` then replays the same credentials against backend's `POST /oauth/login`
   and hands the resulting `login_session` to `complete_login`, which drives the
@@ -59,6 +101,8 @@ Order matters here; each step gates the next.
   to a webhook or plugin process, limited only by axum's default body-size cap.
 - **Email** is normalized (`normalize_email`) then validated (`EmailAddress::is_valid`)
   -> `400` (`InvalidEmail`).
+- **Password policy** (`validate_new_password`: at least 8 characters, at most 1024
+  bytes) -> `400`.
 - **Password** is hashed with argon2 (`crypto::hash_password`, on the blocking pool).
 - **`user_id` is generated up front**, not left to storage, so the extra-data handler
   can be told which user the fields belong to before that user exists.
@@ -138,13 +182,11 @@ its one generic `Invoke` rpc with `hook: "registration"` over gRPC.
 
 ## Known gaps
 
-- **No password policy** -- any non-empty password is accepted, same as the rest of the
-  app (see the [password reset flow](password-reset.md#known-gaps)).
 - **No rate limiting on backend's `/register`** itself. bff's `/register` is limited per
   IP; backend's endpoint, reachable directly by anything on the internal network, is
   not.
 - **Verification is optional by default** -- `email_verified` stays `false` until the
   user enters the emailed code, and login only requires it with `require_verified_email`.
 - **Failure reasons don't reach the user.** Every backend rejection becomes
-  `next?error=1`, so a taken email and a rejected extra field look identical in the
+  `next?error=1`, so a taken email and an unsupported extra field look identical in the
   browser.

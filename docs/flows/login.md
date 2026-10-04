@@ -20,6 +20,35 @@ Relevant code:
   why it doesn't live in `crypto.rs` itself)
 - `backend/src/model/user.rs` -- `PasswordHash` (the `Argon2`/`Bcrypt` tagged hash)
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant F as bff
+    participant B as backend
+
+    U->>F: POST /login {email, password, redirect_uri, next}
+    Note over F: require_trusted_origin (403 if untrusted), per-IP rate limit
+    F->>B: POST /oauth/login {email, password}
+    Note over B: verify hash (dummy hash for unknown email),<br/>upgrade bcrypt to argon2 if needed
+    alt wrong password or unknown email
+        B-->>F: 401
+        F-->>U: 303 next?error=1
+    else unverified, require_verified_email
+        B-->>F: {verification_session}
+        F-->>U: 303 verify-email.html + wa_verify_session cookie
+    else success
+        B-->>F: {login_session}
+        Note over F,B: complete_login
+        F->>B: GET /oauth/authorize (login_session, code_challenge, redirect_uri)
+        B-->>F: 303 redirect_uri?code=...
+        F->>B: POST /oauth/token (code, code_verifier)
+        B-->>F: access + refresh token
+        Note over F: store tokens under a random session_id
+        F-->>U: 303 redirect_uri + wa_session (+ wa_verify_session if unverified)
+    end
+```
+
 ## Steps
 
 **1. `POST /login`** (bff: `start_login`) -- the login form's submit target.
@@ -113,9 +142,6 @@ written by this app.
 
 ## Known gaps
 
-- **No password policy** on registration or login -- inherited from
-  [`/register`](register.md), documented in the
-  [password reset flow](password-reset.md#known-gaps).
 - **No rate limiting on `/oauth/login`** itself (bff's `/login` has
   `WA_RATE_LIMIT_*`-configured per-IP limiting; backend's own endpoint, reachable
   directly by anything on the internal network, does not).
