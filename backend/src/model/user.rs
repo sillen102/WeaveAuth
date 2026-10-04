@@ -41,9 +41,44 @@ pub(crate) struct User {
     /// the user entered the verification email's code; `false` for a plain
     /// password registration until then.
     pub email_verified: bool,
+    /// Bumped by `UserStorage::set_password`. Every credential is stamped with
+    /// the version it was issued under and refused once it no longer matches
+    /// (see `server::api::current_user`), so a password reset ends every
+    /// session, code and refresh token issued before it -- including one still
+    /// being issued while the reset runs.
+    pub credential_version: u64,
     #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl User {
+    pub(crate) fn stamp(&self) -> CredentialStamp {
+        CredentialStamp {
+            user_id: self.id,
+            version: self.credential_version,
+        }
+    }
+}
+
+/// Who a credential (login session, authorization code, refresh token,
+/// verification session) was issued to, and under which
+/// `User::credential_version`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CredentialStamp {
+    pub user_id: Uuid,
+    pub version: u64,
+}
+
+#[cfg(test)]
+impl CredentialStamp {
+    /// The stamp of a user whose password was never reset.
+    pub(crate) fn initial(user_id: Uuid) -> Self {
+        Self {
+            user_id,
+            version: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -54,6 +89,7 @@ impl User {
             email: String::new(),
             password: None,
             email_verified: false,
+            credential_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

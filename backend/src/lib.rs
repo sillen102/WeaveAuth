@@ -17,6 +17,7 @@
 
 pub mod config;
 pub(crate) mod crypto;
+pub(crate) mod email;
 pub(crate) mod model;
 pub(crate) mod oidc;
 pub(crate) mod plugin;

@@ -31,11 +31,13 @@ Wiring a plugin into a second flow is **a new `hook` name**, not a new rpc or a
 new runtime: `PluginProcess::invoke` is generic over every hook, so a flow only
 needs to build the right `PluginRequest` and interpret the right `data` shape
 back. `crate::server::api::register`, `crate::server::api::token` and
-`crate::server::api::email_verification` are the three callers today, each with its own
-handler trait (`ExtraDataHandler`/`LoginClaimsHandler`/`EmailVerificationHandler`) and `Plugin`/`Webhook`
-implementations living in that endpoint's own file, per the vertical-slice
-rule in `backend/AGENTS.md` -- this module only owns the process/gRPC
-mechanics shared by every hook.
+`crate::email` are the three callers today, each with its own handler trait
+(`ExtraDataHandler`/`LoginClaimsHandler`/`EmailHandler`) and `Plugin`/`Webhook`
+implementations. The first two live in their endpoint's own file, per the
+vertical-slice rule in `backend/AGENTS.md`; `crate::email` is shared by email
+verification and password reset (hooks `email_verification` and
+`password_reset`). This module only owns the process/gRPC mechanics shared by
+every hook.
 
 ## Why a process
 

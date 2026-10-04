@@ -6,6 +6,7 @@ use crate::server::api::{
     oidc::oidc_confirm_link,
     oidc::oidc_providers,
     oidc::start_oidc_login,
+    password_reset::{confirm_password_reset, request_password_reset},
     proxy::proxy_router,
     register::{start_register, start_register_doc},
     verify_email::{resend_verification, verify_email},
@@ -53,6 +54,8 @@ pub(crate) fn router(state: AppState) -> anyhow::Result<Router> {
         .route("/oidc/confirm-link", post(oidc_confirm_link))
         .route("/verify-email", post(verify_email))
         .route("/verify-email/resend", post(resend_verification))
+        .route("/password-reset/request", post(request_password_reset))
+        .route("/password-reset/confirm", post(confirm_password_reset))
         .layer(GovernorLayer::new(auth_governor.clone()))
         .with_state(state.clone());
 

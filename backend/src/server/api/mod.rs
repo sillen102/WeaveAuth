@@ -11,13 +11,12 @@ pub(crate) mod token;
 
 use secrecy::SecretString;
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::crypto;
 use crate::model::email::normalize_email;
-use crate::model::user::{PasswordHash, User};
+use crate::model::user::{CredentialStamp, PasswordHash, User};
 use crate::server::AppState;
-use crate::storage::{SetPasswordOutcome, UserStorage};
+use crate::storage::{UpgradeHashOutcome, UserStorage};
 
 /// A valid Argon2 hash of a fixed, made-up password -- verified against on the
 /// "unknown email" path so it costs the same as the real hash-and-compare
@@ -67,7 +66,7 @@ pub(crate) async fn authenticate_password(
     let user = user.ok_or(AuthenticateError::InvalidCredentials)?;
 
     if matches!(user.password, Some(PasswordHash::Bcrypt(_))) {
-        upgrade_bcrypt_to_argon2(&mut state.users, user.id, password).await;
+        upgrade_bcrypt_to_argon2(&mut state.users, user.stamp(), password).await;
     }
     Ok(user)
 }
@@ -80,23 +79,34 @@ pub(crate) async fn authenticate_password(
 /// swallowing.
 pub(crate) async fn upgrade_bcrypt_to_argon2(
     users: &mut impl UserStorage,
-    user_id: Uuid,
+    stamp: CredentialStamp,
     password: SecretString,
 ) {
+    let user_id = stamp.user_id;
     match crypto::hash_password(password).await {
         Ok(new_hash) => {
             if users
-                .set_password(user_id, PasswordHash::Argon2(new_hash.into()))
+                .upgrade_password_hash(stamp, PasswordHash::Argon2(new_hash.into()))
                 .await
-                != SetPasswordOutcome::Ok
+                != UpgradeHashOutcome::Ok
             {
-                tracing::warn!(user_id = %user_id, "bcrypt-to-argon2 upgrade failed: user not found");
+                tracing::warn!(user_id = %user_id, "bcrypt-to-argon2 upgrade skipped: credentials changed meanwhile");
             }
         }
         Err(e) => {
             tracing::warn!(user_id = %user_id, error = %e, "bcrypt-to-argon2 upgrade failed: re-hashing errored");
         }
     }
+}
+
+/// The user a credential was issued to, or `None` if the user is gone or its
+/// credentials changed since (a password reset). Every redeemed credential
+/// goes through this before it is honored.
+pub(crate) async fn current_user(users: &impl UserStorage, stamp: CredentialStamp) -> Option<User> {
+    users
+        .get_user_by_id(stamp.user_id)
+        .await
+        .filter(|user| user.credential_version == stamp.version)
 }
 
 #[cfg(test)]
@@ -116,7 +126,12 @@ mod tests {
         let user_id = user.id;
         let _ = users.create_user(user).await;
 
-        upgrade_bcrypt_to_argon2(&mut users, user_id, "hunter2".into()).await;
+        upgrade_bcrypt_to_argon2(
+            &mut users,
+            CredentialStamp::initial(user_id),
+            "hunter2".into(),
+        )
+        .await;
 
         let updated = users
             .get_user_by_id(user_id)

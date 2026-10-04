@@ -28,6 +28,13 @@ impl SessionStorage for InMemorySessionStorage {
     async fn get_session(&self, session_id: &str) -> Option<SessionData> {
         self.sessions.lock().await.get(session_id).cloned()
     }
+
+    async fn revoke_all_for_user(&mut self, user_id: uuid::Uuid) {
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, data| data.user_id != user_id);
+    }
 }
 
 impl ExpiryMaintenance for InMemorySessionStorage {
@@ -56,6 +63,24 @@ mod tests {
             refresh_expires_at: Utc::now(),
             user_id: uuid::Uuid::new_v4(),
         }
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_user_drops_only_that_users_sessions() {
+        let mut storage = InMemorySessionStorage::new();
+        let alice = sample_session("alice");
+        let alice_id = alice.user_id;
+        storage.save_session("a1".to_string(), alice.clone()).await;
+        storage.save_session("a2".to_string(), alice).await;
+        storage
+            .save_session("b1".to_string(), sample_session("bob"))
+            .await;
+
+        storage.revoke_all_for_user(alice_id).await;
+
+        assert!(storage.get_session("a1").await.is_none());
+        assert!(storage.get_session("a2").await.is_none());
+        assert!(storage.get_session("b1").await.is_some());
     }
 
     #[tokio::test]

@@ -15,6 +15,11 @@
     <h1>Verify your email</h1>
     {% if status == "locked_until_reset" %}
     <p class="error" id="verify-locked-until-reset">Too many failed attempts. This account is locked. Reset your password to unlock it.</p>
+    <p class="secondary">
+      <a id="forgot-password-link" href="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-get="forgot-password.html?redirect_uri={{ redirect_uri | urlencode | safe }}"
+         hx-target="#page" hx-select="#page-content" hx-push-url="true">Reset password</a>
+    </p>
     {% elif status == "session_expired" or status == "locked" %}
     {% if status == "locked" %}
     <p class="error" id="verify-locked">Too many wrong codes. No codes are accepted or sent right now. Please sign in again{% if retry_after %} in {{ retry_after }}{% endif %}.</p>

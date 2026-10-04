@@ -18,7 +18,7 @@
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use common::config::PublicUrl;
@@ -49,10 +49,12 @@ pub struct Config {
     pub port: u16,
     pub bff_url: String,
     pub own_origin: String,
-    /// Where the verification page sends the user once the code is right,
-    /// when it was opened without a `redirect_uri` (the link in the email).
+    /// Where the user goes after the pages reached from an email link, when
+    /// they come without a `redirect_uri`: the verification page once the code
+    /// is right, the login page after a password reset, and the
+    /// forgot-password page (bff's dead-link redirect carries none either).
     /// Must be on backend's redirect allowlist. Unset: login's own origin.
-    pub verify_default_redirect_uri: Option<String>,
+    pub email_link_default_redirect_uri: Option<String>,
     /// Where login itself reaches bff (for `/oidc/providers`), when
     /// `bff_url` -- the browser-facing address -- doesn't resolve from
     /// login's network. Unset: `bff_url`.
@@ -65,7 +67,7 @@ impl Default for Config {
             port: 8081,
             bff_url: "http://localhost:8080".to_string(),
             own_origin: "http://localhost:8081".to_string(),
-            verify_default_redirect_uri: None,
+            email_link_default_redirect_uri: None,
             bff_internal_url: None,
         }
     }
@@ -76,8 +78,8 @@ const ENV: common::config::EnvTable = &[
     ("WA_BFF_URL", "bff_url"),
     ("WA_LOGIN_PUBLIC_URL", "own_origin"),
     (
-        "WA_VERIFY_DEFAULT_REDIRECT_URI",
-        "verify_default_redirect_uri",
+        "WA_EMAIL_LINK_DEFAULT_REDIRECT_URI",
+        "email_link_default_redirect_uri",
     ),
     ("WA_BFF_INTERNAL_URL", "bff_internal_url"),
 ];
@@ -85,11 +87,11 @@ const ENV: common::config::EnvTable = &[
 impl Config {
     /// Loads config from the env vars in [`ENV`] plus `WA_LOGIN_PORT`, falling
     /// back to defaults for anything unset (an empty
-    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` or `WA_BFF_INTERNAL_URL` counts as
+    /// `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` or `WA_BFF_INTERNAL_URL` counts as
     /// unset). A value that is set but invalid is an error: silently using the
     /// defaults would point the login page at localhost. Under the prod
     /// profile (`WA_PROFILE`, the default) `WA_BFF_URL` and
-    /// `WA_VERIFY_DEFAULT_REDIRECT_URI` must be https and `WA_LOGIN_PUBLIC_URL`
+    /// `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` must be https and `WA_LOGIN_PUBLIC_URL`
     /// an https origin. `own_origin` is stored without a trailing `/`.
     pub fn load() -> anyhow::Result<Self> {
         // `WA_LOGIN_PORT` is applied by hand below, so its error names the variable.
@@ -113,20 +115,22 @@ impl Config {
                 .map_err(|error| anyhow::anyhow!("invalid WA_LOGIN_PORT {raw:?}: {error}"))?;
         }
 
-        config.verify_default_redirect_uri = config
-            .verify_default_redirect_uri
+        config.email_link_default_redirect_uri = config
+            .email_link_default_redirect_uri
             .filter(|raw| !raw.is_empty());
         config.bff_internal_url = config.bff_internal_url.filter(|raw| !raw.is_empty());
-        if let Some(raw) = &config.verify_default_redirect_uri {
+        if let Some(raw) = &config.email_link_default_redirect_uri {
             let url = url::Url::parse(raw).map_err(|error| {
-                anyhow::anyhow!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: {error}")
+                anyhow::anyhow!("invalid WA_EMAIL_LINK_DEFAULT_REDIRECT_URI {raw:?}: {error}")
             })?;
             if !matches!(url.scheme(), "http" | "https") {
-                anyhow::bail!("invalid WA_VERIFY_DEFAULT_REDIRECT_URI {raw:?}: not an http(s) URL");
+                anyhow::bail!(
+                    "invalid WA_EMAIL_LINK_DEFAULT_REDIRECT_URI {raw:?}: not an http(s) URL"
+                );
             }
             common::config::require_https_in_prod(
                 profile,
-                &[("WA_VERIFY_DEFAULT_REDIRECT_URI", raw, PublicUrl::Base)],
+                &[("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", raw, PublicUrl::Base)],
             )?;
         }
 
@@ -142,6 +146,8 @@ pub fn app(config: Config) -> Router {
         .route("/login.html", get(login_page))
         .route("/register.html", get(register_page))
         .route("/verify-email.html", get(verify_email_page))
+        .route("/forgot-password.html", get(forgot_password_page))
+        .route("/reset-password.html", get(reset_password_page))
         .nest_service("/static", files.clone())
         .fallback_service(files)
         .with_state(AppState {
@@ -210,7 +216,12 @@ async fn login_page(
     OriginalUri(uri): OriginalUri,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Html<String>, StatusCode> {
-    let query = page_query(query);
+    let mut query = page_query(query);
+    // The reset link carries no redirect_uri, so the page reached after a
+    // reset falls back like the verification page does.
+    if query.redirect_uri.is_none() && query.status.as_deref() == Some("password_reset") {
+        query.redirect_uri = config.email_link_default_redirect_uri.clone();
+    }
     // Only the confirm-link view (`email` set) names providers.
     let provider_names = match query.email {
         Some(_) => provider_names.get().await,
@@ -347,7 +358,7 @@ async fn verify_email_page(
 ) -> Result<Html<String>, StatusCode> {
     let mut query = page_query(query);
     if query.redirect_uri.is_none() {
-        query.redirect_uri = config.verify_default_redirect_uri.clone();
+        query.redirect_uri = config.email_link_default_redirect_uri.clone();
     }
     render_page(
         "verify-email.html",
@@ -356,6 +367,51 @@ async fn verify_email_page(
         &query,
         &ProviderNames::Unavailable,
     )
+}
+
+async fn forgot_password_page(
+    State(AppState { config, .. }): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Html<String>, StatusCode> {
+    let mut query = page_query(query);
+    // bff's dead-link redirect carries no redirect_uri, like the email links.
+    if query.redirect_uri.is_none() {
+        query.redirect_uri = config.email_link_default_redirect_uri.clone();
+    }
+    render_page(
+        "forgot-password.html",
+        &config,
+        uri.path(),
+        &query,
+        &ProviderNames::Unavailable,
+    )
+}
+
+/// Opened from the reset email with the token in the fragment. The page
+/// script keeps it out of the address bar; these headers keep the page out of
+/// caches and its path out of any Referer. Not `no-referrer`: under it the
+/// browser sends `Origin: null` on the form's POST to bff, which refuses it.
+/// The fragment never goes into a Referer under any policy.
+async fn reset_password_page(
+    State(AppState { config, .. }): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let page = render_page(
+        "reset-password.html",
+        &config,
+        uri.path(),
+        &page_query(query),
+        &ProviderNames::Unavailable,
+    )?;
+    Ok((
+        [
+            (header::REFERRER_POLICY, "strict-origin"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    ))
 }
 
 /// Waits shorter than this are spelled out in seconds, and the page counts
@@ -476,7 +532,7 @@ mod tests {
             let config = Config::load().unwrap();
             assert_eq!(config.port, 8081);
             assert_eq!(config.bff_url, "http://localhost:8080");
-            assert_eq!(config.verify_default_redirect_uri, None);
+            assert_eq!(config.email_link_default_redirect_uri, None);
             Ok(())
         });
     }
@@ -505,13 +561,13 @@ mod tests {
             jail.set_env("WA_BFF_URL", "http://bff.env.test");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.env.test");
             jail.set_env(
-                "WA_VERIFY_DEFAULT_REDIRECT_URI",
+                "WA_EMAIL_LINK_DEFAULT_REDIRECT_URI",
                 "https://app.env.test/home",
             );
 
             let config = Config::load().unwrap();
             assert_eq!(
-                config.verify_default_redirect_uri.as_deref(),
+                config.email_link_default_redirect_uri.as_deref(),
                 Some("https://app.env.test/home")
             );
             assert_eq!(config.port, 9999);
@@ -522,27 +578,29 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_verify_default_redirect_uri_counts_as_unset() {
+    fn an_empty_email_link_default_redirect_uri_counts_as_unset() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_PROFILE", "dev");
-            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "");
+            jail.set_env("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", "");
 
             let config = Config::load().unwrap();
-            assert_eq!(config.verify_default_redirect_uri, None);
+            assert_eq!(config.email_link_default_redirect_uri, None);
             Ok(())
         });
     }
 
     #[test]
-    fn an_unparseable_verify_default_redirect_uri_is_an_error() {
+    fn an_unparseable_email_link_default_redirect_uri_is_an_error() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_PROFILE", "dev");
-            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "/downstream");
+            jail.set_env("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", "/downstream");
 
             let error = Config::load()
                 .expect_err("a relative URL can't be redirected to once the code is spent");
             assert!(
-                error.to_string().contains("WA_VERIFY_DEFAULT_REDIRECT_URI"),
+                error
+                    .to_string()
+                    .contains("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI"),
                 "unhelpful error: {error}"
             );
             Ok(())
@@ -550,15 +608,17 @@ mod tests {
     }
 
     #[test]
-    fn a_verify_default_redirect_uri_must_be_http_or_https() {
+    fn a_email_link_default_redirect_uri_must_be_http_or_https() {
         for value in ["javascript:alert(1)", "mailto:a@example.com"] {
             Jail::expect_with(|jail| {
                 jail.set_env("WA_PROFILE", "dev");
-                jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", value);
+                jail.set_env("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", value);
 
                 let error = Config::load().expect_err("only web URLs can be redirected to");
                 assert!(
-                    error.to_string().contains("WA_VERIFY_DEFAULT_REDIRECT_URI"),
+                    error
+                        .to_string()
+                        .contains("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI"),
                     "{value}: unhelpful error: {error}"
                 );
                 Ok(())
@@ -615,16 +675,22 @@ mod tests {
     }
 
     #[test]
-    fn prod_refuses_an_http_verify_default_redirect_uri() {
+    fn prod_refuses_an_http_email_link_default_redirect_uri() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_BFF_URL", "https://bff.test");
             jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
-            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "http://app.test/home");
+            jail.set_env("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI", "http://app.test/home");
 
             let error = Config::load().unwrap_err().to_string();
-            assert!(error.contains("WA_VERIFY_DEFAULT_REDIRECT_URI"), "{error}");
+            assert!(
+                error.contains("WA_EMAIL_LINK_DEFAULT_REDIRECT_URI"),
+                "{error}"
+            );
 
-            jail.set_env("WA_VERIFY_DEFAULT_REDIRECT_URI", "https://app.test/home");
+            jail.set_env(
+                "WA_EMAIL_LINK_DEFAULT_REDIRECT_URI",
+                "https://app.test/home",
+            );
             Config::load().unwrap();
             Ok(())
         });

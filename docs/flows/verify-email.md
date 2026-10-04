@@ -46,10 +46,12 @@ The `verification_session` is a random 32-byte token held by backend's
 30 minutes (1800s, fixed); the response also carries that lifetime
 (`verification_session_ttl_secs`) so bff's cookie lives exactly as long. It is **not consumed** by
 use, so a wrong code leaves it usable. It is only accepted by `/oauth/email-verification/*`.
-A **password reset revokes every verification session of the account** and clears its code
-state (see the limits below), like it revokes login sessions and refresh tokens: someone who
+A **password reset ends every verification session of the account** and clears its code
+state (see the limits below), like it ends login sessions and refresh tokens: someone who
 squatted the address before the real owner took the account back can't use a session from that
-time afterwards, and can't have burned guesses just before the reset to lock the owner out.
+time afterwards, and can't have burned guesses just before the reset to lock the owner out. The
+session carries the account's credential stamp, so it is refused after a reset even if the
+revocation missed it (see [password reset](password-reset.md#every-earlier-credential-dies)).
 
 **2. bff keeps it in a narrow cookie.** bff puts it in `wa_verify_session`: `HttpOnly`,
 `Max-Age` = the lifetime backend reported, `Path=/verify-email` (so the browser only sends it
@@ -64,7 +66,7 @@ and never in the app.
 
 **3. The page.** `verify-email.html` has one field, the code (no password: the cookie already
 proves who is signing in), and a "send a new code" button. It carries `redirect_uri` along. Opened
-without one (the link in the email), it uses login's `WA_VERIFY_DEFAULT_REDIRECT_URI`, else login's
+without one (the link in the email), it uses login's `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, else login's
 own origin; backend's allowlist must include whichever applies.
 
 **4. Entering the code (`POST /verify-email`, bff).** Form `{code, redirect_uri, next}`.
@@ -84,8 +86,8 @@ own origin; backend's allowlist must include whichever applies.
   `{status: "locked_until_reset"}` -> bff clears `wa_verify_session` and bounces to
   `next?status=locked&retry_after=<secs>` or `next?status=locked_until_reset`. The page shows no
   forms. For `locked` it offers a "Sign in" link (a lock outlasts the verification session); for
-  `locked_until_reset` signing in can't help, so it only says to reset the password (see Known
-  gaps).
+  `locked_until_reset` signing in can't help, so it links to `forgot-password.html` instead
+  ([password reset](password-reset.md)).
 - A right code marks the email verified, **deletes the verification
   session** and returns the `login_session` the login withheld. If the account is *already*
   verified, the code isn't checked and **no login session is given**: the session is deleted and
@@ -177,8 +179,8 @@ verification is required and the account has no live code) and by the resend end
   the code, valid for 15 minutes (900s, fixed). A new code replaces the
   old one. A second code is **not** issued within 60 seconds of the
   last one, so resend can't flood an inbox or keep replacing the code the user is typing.
-- The handler gets `{user_id, email, code, verify_page_url, expires_at}` (`expires_at` is RFC
-  3339, UTC) and runs in a **background task**, so neither registration, login nor the resend
+- The handler gets `{kind: "email_verification", user_id, email, code, verify_page_url,
+  expires_at}` (`expires_at` is RFC 3339, UTC) and runs in a **background task**, so neither registration, login nor the resend
   response waits for SMTP or the plugin. For registration and login, response time can't show
   which requests send mail (the resend response says outright whether it sent):
   - `smtp` renders `templates/emails/verify-email.{subject.txt,txt,html}` and sends a multipart
@@ -188,6 +190,8 @@ verification is required and the account has no live code) and by the resend end
   - `plugin` calls the plugin with `hook: "email_verification"` ([plugins](../plugins.md)).
 - A delivery failure is logged (in the task) and nowhere else: the account already exists and
   the user can ask for a new code.
+
+The same handler sends [password reset](password-reset.md#delivery) mails (`backend/src/email.rs`).
 
 ## Requiring verification
 
@@ -212,8 +216,3 @@ could ride the victim's own verification into a shared account.
 - There is no rate limit on backend's endpoints themselves, only on bff's per IP; the per-user
   limits are the 5-attempt cap, the resend cooldown and the escalating lockout after 10 wrong
   guesses (constants in `storage/in_memory.rs`, not configurable yet).
-- A completed password reset does not verify the address yet (see `TODO.md`).
-- Password reset has no email delivery yet ([password-reset](password-reset.md)), so a user in
-  the lock that lasts until a reset has no way out until it does, short of a backend restart (the
-  lock lives in memory). The hard-lock page tells them to reset their password; once reset emails
-  exist it should link to the reset page.

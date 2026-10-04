@@ -23,7 +23,8 @@ impl Plugin for Probe {
         match request.hook.as_str() {
             "registration" => handle_registration(&request).await,
             "login_claims" => handle_login_claims(&request).await,
-            "email_verification" => handle_email_verification(&request),
+            "email_verification" => write_email(&request, "code"),
+            "password_reset" => write_email(&request, "reset_url"),
             other => Err(Status::unimplemented(format!("unhandled hook {other:?}"))),
         }
     }
@@ -66,13 +67,15 @@ async fn handle_login_claims(request: &PluginRequest) -> Result<Response<PluginR
     }))
 }
 
-/// Writes the verification code to the file named by `EMAIL_OUT`, standing in
-/// for sending the mail, so a test can read the code back.
-fn handle_email_verification(request: &PluginRequest) -> Result<Response<PluginResponse>, Status> {
+/// Writes the recipient and the mail's `field` (the verification code, the
+/// reset link) to the file named by `EMAIL_OUT`, standing in for sending the
+/// mail, so a test can read it back.
+fn write_email(request: &PluginRequest, field: &str) -> Result<Response<PluginResponse>, Status> {
     let out = std::env::var("EMAIL_OUT")
         .map_err(|_| Status::failed_precondition("EMAIL_OUT is not set"))?;
-    let code = string_field(request, "code").ok_or_else(|| Status::invalid_argument("no code"))?;
-    std::fs::write(out, format!("{} {code}", request.email))
+    let value = string_field(request, field)
+        .ok_or_else(|| Status::invalid_argument(format!("no {field}")))?;
+    std::fs::write(out, format!("{} {value}", request.email))
         .map_err(|error| Status::internal(error.to_string()))?;
     Ok(Response::new(PluginResponse { data: None }))
 }

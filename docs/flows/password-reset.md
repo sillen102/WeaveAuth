@@ -1,108 +1,182 @@
 # Password reset flow
 
-Two `backend` endpoints: request a reset token for an email, then redeem it to
-set a new password. Unlike the [OIDC flow](oidc.md), there is no `bff` half --
-nothing browser-facing, no cookies, no redirects. Both endpoints take and
-return JSON.
+A user who can't sign in asks for a reset link by email, opens it, and chooses a
+new password. This is also how the real owner of an address takes an account
+back from someone who registered it first: confirming an OIDC link needs the
+account's current password (see [OIDC](oidc.md)), and a reset gives them one.
 
-**There is no email delivery yet**, and the token only ever exists in storage
-and in `/request`'s own stack frame. Nothing can retrieve it, so the flow can't
-be completed end-to-end. The contract exists so `/confirm` is settled before a
-delivery channel lands.
+Pages live in `login`, the browser-facing routes in `bff`, and the work in
+`backend`:
 
-Relevant code:
-- `backend/src/server/api/password_reset.rs` -- both handlers
+- `templates/pages/forgot-password.html`, `templates/pages/reset-password.html`,
+  `login/static/reset-password.js`
+- `bff/src/server/api/password_reset.rs` -- `/password-reset/request`, `/password-reset/confirm`
+- `backend/src/server/api/password_reset.rs` -- `/oauth/password-reset/request`, `/oauth/password-reset/confirm`
+- `backend/src/email.rs` -- delivery, shared with [verify email](verify-email.md)
 - `backend/src/storage/in_memory.rs` -- `InMemoryPasswordResetTokenStorage`
-- `backend/src/storage/mod.rs` -- `PasswordResetTokenStorage` contract
 
 ## Steps
 
-**1. `POST /oauth/password-reset/request`** (`request_password_reset`)
+**1. Ask for a link.** `forgot-password.html` (linked from the login form, from
+the link-confirm view next to its password field, and from the verification
+page once the account is locked until a reset) posts `email` to bff's
+`POST /password-reset/request`. bff checks the `Origin`, forwards
+`{"email"}` to backend and always answers with a 303 to
+`forgot-password.html?status=sent` ("if an account uses that address, a link is
+on its way"). It answers 502 only if backend is unreachable, which says nothing
+about any account.
 
-Body: `{"email": "..."}`. Always responds **202 Accepted**.
+**2. Backend issues and mails the token.** `POST /oauth/password-reset/request`
+always answers **202**. It looks the address up with `normalize_email`, then
+mails nothing when:
 
-- Email is normalized (`normalize_email`) before lookup, so casing and `+tag`
-  variants hit the same account they registered under.
-- On a match, `save_reset_token` mints 32 bytes from the CSPRNG, base64url
-  encodes them, and stores `sha256(token) -> (user_id, issued_at)`.
-- On no match, nothing happens.
+- no account matches,
+- no email handler is configured (backend warns about that once at startup), or
+- the account got a token less than `password_reset_resend_cooldown_secs` (60s)
+  ago.
 
-Three properties this endpoint holds deliberately:
+Otherwise `issue_reset_token` mints 32 CSPRNG bytes, base64url, and stores
+`sha256(token) -> (user_id, issued_at)`. The user's earlier tokens stay valid
+until one of them is redeemed (see below). The mail goes in a background task to the
+**account's stored address**, never to the request's input: `Alice+x@Example.com`
+finds `alice@example.com`'s account, and the link goes to `alice@example.com`.
+The link is
 
-- **Same response either way.** A 404 for an unknown email would be an
-  account-existence oracle, the same concern `/oauth/login`'s
-  `DUMMY_PASSWORD_HASH` exists to close off.
-- **Stored hashed, not plaintext.** A table of directly-usable reset tokens
-  makes one read of that table an account takeover for every pending reset.
-  The trait contract is what a durable (e.g. Postgres) implementation follows
-  too, so the hashing lives in the storage layer rather than the handler.
-- **A new request supersedes the old one.** Issuing drops any existing token
-  for that user, so only the newest link is live. Otherwise every unexpired
-  token stays independently redeemable -- widening the window a leaked link
-  stays dangerous, and letting an unauthenticated caller grow the table
-  without bound by re-requesting the same address.
+```
+{login_public_url}/reset-password.html#token=<token>
+```
 
-**2. `POST /oauth/password-reset/confirm`** (`confirm_password_reset`)
+The token is in the **fragment**, which browsers never send to a server or in a
+`Referer`. The response is the same whether or not an account exists or a mail
+went out, and the mail is sent in the background so SMTP or the plugin adds no
+delay. This is not a timing-proof guarantee: a known address still costs a token
+lookup and a hash more than an unknown one, and backend's own logs name the
+account on the cooldown path. `/register` answers `409` for a taken address anyway,
+so this endpoint isn't the easiest way to find out who has an account.
 
-Body: `{"token": "...", "new_password": "..."}`. **200 OK** on success,
-**400** if the token is unknown, expired, or already used, **500** if a
-revocation failed.
+**3. Open the link.** login serves `reset-password.html` with
+`Referrer-Policy: strict-origin` and `Cache-Control: no-store`. Not
+`no-referrer`: under it the browser sends `Origin: null` on the form's POST,
+which bff refuses; and no policy ever puts the fragment in a `Referer`. Its
+script copies the token from the fragment into a hidden form field and into the
+tab's `sessionStorage`, and removes the fragment from the address bar with
+`history.replaceState`. On a reload, or after a rejected password, the field is
+filled from `sessionStorage` again. The form starts hidden and the script shows
+it only once it has a token. Without one, the script shows "open the link from
+your email again" instead (a `<noscript>` copy covers a browser without JS), so
+the user isn't sent to a submit that would fail as an expired link. The two
+pages a reset ends on (`login.html?status=password_reset`,
+`forgot-password.html?status=invalid_token`) remove the token from
+`sessionStorage`. Opening the page changes nothing, so a mail scanner that
+follows links can't spend the token.
 
-1. `take_reset_token` hashes the presented token and removes the entry.
-   Missing or older than 30 minutes (1800s, fixed) -> 400.
-   Single-use: the entry is gone whether or not the rest succeeds.
-2. **Revoke** every refresh token, login session and email-verification session
-   ([verify email](verify-email.md)) for the user, and clear their email-verification code state
-   (current code, resend cooldown, failure count, lockout). The last two matter when someone
-   registered the address first: the verification session they hold must not outlive the real
-   owner taking the account back, and guesses they burned on purpose to lock the owner out must
-   not carry over.
-3. Hash `new_password` with Argon2 on `spawn_blocking` -- it's deliberately
-   CPU-heavy synchronous work and would otherwise stall a tokio worker.
-4. `set_password`. `UserNotFound` -> 400, reported as the same token-shaped
-   error since from the caller's side the token no longer resolves to anything.
-5. **Revoke again.**
+**4. Submit the new password.** The form posts `token` and `new_password` to
+bff's `POST /password-reset/confirm`. bff checks the `Origin`, refuses a token
+that isn't 1-128 base64url characters without calling backend, forwards the
+rest, and redirects:
 
-### Why revoke twice
+| Backend answer           | bff redirects to                                         |
+|--------------------------|----------------------------------------------------------|
+| 200 `{user_id}`          | `login.html?status=password_reset`, after dropping every bff session of `user_id` |
+| 400 `WeakPassword`       | `reset-password.html?status=weak_password` (no token; the page still has it) |
+| other 400, bad token     | `forgot-password.html?status=invalid_token`              |
+| anything else            | 502                                                      |
 
-A password reset is the standard remediation for "my account may be
-compromised". That only remediates anything if it also kills the credentials an
-attacker already holds -- otherwise they keep a live refresh token family (TTL
-30 days) straight through the reset.
+The user is **not** signed in: they sign in with the new password next. A forged
+confirm therefore can't drop someone into an account that isn't theirs. Every
+redirect goes to a fixed page on `login_public_url`; nothing from the request
+picks the destination. Neither the reset link nor these redirects carry a
+`redirect_uri`, so the login page reached with `status=password_reset` and
+`forgot-password.html` use `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, like the
+verification page, else login's own origin.
 
-The first pass kills what existed before the call. The second kills anything
-created in the window between them, e.g. a login racing this request with the
-old password. Neither pass may fail silently: `revoke_all_for_user` returns
-`RevokeOutcome`, and `Failed` becomes a 500 rather than a 200 over a reset that
-left stale sessions alive. The in-memory implementation can't fail and always
-returns `Ok`; the trait doc requires durable backends not to swallow errors
-there.
+**5. Backend redeems the token.** `POST /oauth/password-reset/confirm`:
+
+1. `validate_new_password` (at least 8 characters, at most 1024 bytes; the same
+   rule as `/register`). Failure is a 400 `WeakPassword`, and the token is still
+   good, because this check runs before the token is touched.
+2. `take_reset_token` removes the entry. Unknown, used, or older than
+   `password_reset_token_ttl_secs` (30 minutes) gives a 400 `InvalidOrExpiredToken`.
+   A good token also spends every other token the user still holds.
+3. Argon2 hash on `spawn_blocking`.
+4. `set_password`, which also bumps the user's `credential_version`.
+5. `mark_email_verified`: redeeming the token proves control of the mailbox.
+6. Clean-up: revoke the user's refresh tokens, login sessions and verification
+   sessions, and clear their verification-code state (code, cooldown, failure
+   count, lockout). A failure here is logged and the reset still succeeds:
+   the password is already changed, and the stale credentials are refused anyway
+   (below).
+7. Answer `200 {"user_id"}`, so bff can end that user's sessions.
+
+## Every earlier credential dies
+
+Login sessions, authorization codes, refresh tokens and verification sessions
+each carry a `CredentialStamp`: the user id plus the `credential_version` the
+user had when the password (or provider sign-in) behind it was checked. Every
+place that redeems one first calls `current_user`, which refuses the stamp once
+the version has moved on:
+
+- `/oauth/authorize` refuses a login session (`InvalidLoginSession`),
+- `/oauth/token` refuses a code (`InvalidCode`) or refresh token (`InvalidRefreshToken`),
+- the email-verification endpoints refuse a verification session (`InvalidSession`).
+
+The stamp comes from the same snapshot of the user whose password was checked,
+so timing doesn't matter. A login that checked the old password while the reset
+ran, or a refresh rotation in flight, issues a credential with the old version,
+and that credential is refused the first time it's used. A rotated refresh token
+keeps its predecessor's stamp, so a token family started before the reset can't
+renew itself into a valid one.
+
+Two writes that come out of an old proof are refused the same way:
+
+- **Upgrading a bcrypt hash** (`upgrade_password_hash`) writes only while the
+  version still matches. Otherwise a login re-hashing the *old* password could
+  overwrite the new one.
+- **Linking an OIDC identity** (`link_verified_oidc_identity`) after a confirm-link
+  password check writes only while the version still matches. A link outlives
+  any session, so one approved by the old password must not land afterwards.
+
+Access tokens never reach the browser: bff holds them, keyed by the session
+cookie. On a done reset bff drops every one of the user's sessions
+(`SessionStorage::revoke_all_for_user`), so the access tokens it held stop being
+used at once, on every device. This relies on resets coming in through bff, which
+holds because backend is never public. A trusted internal service that calls
+backend's confirm itself has to do the same with the returned `user_id`.
 
 ## Token summary
 
-| Property       | Value                                                    |
-|----------------|----------------------------------------------------------|
-| Entropy        | 32 bytes CSPRNG (`rand::rng()`), base64url, no padding   |
-| At rest        | `sha256(token)` as the map key; plaintext never stored   |
-| TTL            | 30 minutes, fixed            |
-| Reuse          | Single-use, consumed on `/confirm` regardless of outcome |
-| Concurrent     | One live token per user; issuing drops the previous      |
-| Expiry cleanup | `sweep_expired`, run by the background task in `AppState`|
-| Exposure       | Never in a response, never logged                        |
+| Property       | Value                                                        |
+|----------------|--------------------------------------------------------------|
+| Entropy        | 32 bytes CSPRNG (`rand::rng()`), base64url, no padding       |
+| At rest        | `sha256(token)` as the map key; the token itself never stored|
+| TTL            | `Tuning.password_reset_token_ttl_secs`, 30 minutes           |
+| Reuse          | Single-use; a rejected password doesn't spend it             |
+| Per user       | Several live tokens (at most TTL / cooldown); redeeming one spends all |
+| Issuing        | At most one per `password_reset_resend_cooldown_secs` (60s)  |
+| Transport      | URL fragment of login's reset page; then a form field and the tab's `sessionStorage` |
+| Expiry cleanup | `sweep_expired`, run by the background task in `AppState`    |
+| Exposure       | Never in a response, a header or a log line; only the mail, its handler, and the resetting tab's `sessionStorage` until the reset ends |
 
-Unsalted SHA-256 is correct here: the input is 256 bits of CSPRNG output, so
-there is nothing to brute-force, and the lookup has to be deterministic.
+Unsalted SHA-256 is fine here: the input is 256 bits of CSPRNG output, so there
+is nothing to brute-force, and the lookup has to be deterministic.
 
-## Known gaps
+The cooldown is per user and silent. bff's per-IP rate limit covers both routes
+(the auth bucket). An attacker can still mail the owner a fresh link once a
+minute, but that doesn't invalidate the link the owner already has: every link
+stays good until it expires or the owner redeems one. A leaked older link is no
+worse than a leaked newer one, since all of them went to the same inbox.
 
-- **No delivery channel.** See the note at the top.
-- **No rate limiting** on `/request`. Once delivery lands this is an
-  email-bombing vector. The router has no rate limiting on any route today.
-- **No password policy** on `new_password` -- an empty string is accepted.
-  `/register` has the same gap.
-- **`email_verified` stays `false`** after a reset. A completed reset does
-  prove inbox control, so flipping it to `true` is defensible once delivery is
-  real; leaving it false is the conservative direction in the meantime.
-- **`retain` is O(n) per request**, scanning under the store's lock. The table
-  is bounded at one entry per user, so this is fine at current scale; a
-  durable backend gets it free (`DELETE WHERE user_id = $1`).
+## Delivery
+
+Reset mails go through the same handler as verification codes (`email_handler`:
+SMTP, webhook or plugin; see [verify email](verify-email.md#sending-the-code)):
+
+- **SMTP** renders `templates/emails/password-reset.{subject.txt,txt,html}` with
+  `email`, `reset_url` and `expires_at`. Backend refuses to start if any of them
+  is missing.
+- **Webhook** gets `{"kind": "password_reset", "user_id", "email", "reset_url",
+  "expires_at"}`.
+- **Plugin** gets hook `password_reset` with `data` `{reset_url, expires_at}`
+  (see [plugins](../plugins.md)).
+
+Whoever delivers the mail sees the link, the same as with verification codes.

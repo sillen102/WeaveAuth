@@ -101,6 +101,12 @@ pub struct Tuning {
     /// How long a `/oauth/password-reset/request` token stays redeemable.
     /// Roomy: it waits on a human reading an email and clicking a link.
     pub password_reset_token_ttl_secs: i64,
+    /// Minimum time between two reset emails to the same user, so
+    /// `/oauth/password-reset/request` can't flood an inbox. Silent: the
+    /// response is the same either way. Earlier tokens stay valid, so this is
+    /// also what bounds the tokens one user holds (TTL / cooldown); backend
+    /// refuses to start with `0`.
+    pub password_reset_resend_cooldown_secs: i64,
     /// How long an emailed verification code stays valid. Short, since a
     /// 9-digit code is guessable (it also dies after a few wrong attempts).
     pub email_verification_code_ttl_secs: i64,
@@ -125,6 +131,7 @@ impl Default for Tuning {
             oidc_state_ttl_secs: 300,
             pending_oidc_link_ttl_secs: 600,
             password_reset_token_ttl_secs: 1_800,
+            password_reset_resend_cooldown_secs: 60,
             email_verification_code_ttl_secs: 900,
             email_verification_resend_cooldown_secs: 60,
             email_verification_session_ttl_secs: 1_800,
@@ -155,10 +162,11 @@ pub enum EmailHandlerConfig {
         #[serde(default = "default_smtp_timeout_secs")]
         timeout_secs: u64,
     },
-    /// POSTs `{user_id, email, token, verify_url, expires_at}` as JSON to
-    /// this URL; the downstream service sends the email.
+    /// POSTs `{kind, user_id, email, expires_at, ...}` as JSON to this URL
+    /// (see `email::OutboundEmail`); the downstream service sends the email.
     Webhook(WebhookConfig),
-    /// Calls a plugin process with the `email_verification` hook.
+    /// Calls a plugin process with the `email_verification` or
+    /// `password_reset` hook.
     Plugin(PluginSettings),
 }
 

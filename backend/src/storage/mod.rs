@@ -2,7 +2,7 @@ pub(crate) mod in_memory;
 
 use crate::crypto::JwtKeys;
 use crate::model::pkce::CodeChallengeMethod;
-use crate::model::user::{PasswordHash, User};
+use crate::model::user::{CredentialStamp, PasswordHash, User};
 use chrono::{DateTime, Utc};
 use email_address::EmailAddress;
 use secrecy::SecretString;
@@ -137,8 +137,11 @@ pub(crate) trait UserStorage {
         email: &VerifiedEmail,
         new_user_id: Uuid,
     ) -> OidcLinkOutcome;
-    /// Links `(provider, subject)` to `user_id` and marks it `email_verified`.
-    /// `None` if `user_id` no longer exists.
+    /// Links `(provider, subject)` to `stamp.user_id` and marks it
+    /// `email_verified`. `None` if the user no longer exists or its
+    /// `credential_version` moved past `stamp` -- the proof below was given
+    /// against credentials a password reset has since replaced, and a link,
+    /// unlike a session, would outlive the reset for good.
     ///
     /// CALLER MUST have already independently proven the OIDC-authenticated
     /// person controls this specific account -- its password, or a sign-in
@@ -148,18 +151,27 @@ pub(crate) trait UserStorage {
     /// `resolve_oidc_login` refuses to do on its own.
     async fn link_verified_oidc_identity(
         &mut self,
-        user_id: Uuid,
+        stamp: CredentialStamp,
         provider: &str,
         subject: &str,
     ) -> Option<User>;
-    /// Overwrites `user_id`'s password hash (used by `/oauth/password-reset/confirm`
-    /// and, later, a "change password" endpoint). `UserNotFound` if `user_id`
-    /// doesn't exist.
+    /// Replaces `user_id`'s password and bumps its `credential_version`, which
+    /// ends every credential issued before (see `User::credential_version`).
+    /// `UserNotFound` if `user_id` doesn't exist.
     async fn set_password(
         &mut self,
         user_id: Uuid,
         password_hash: PasswordHash,
     ) -> SetPasswordOutcome;
+    /// Re-stores the *same* password under a new hash scheme, leaving
+    /// `credential_version` alone. Only applies if the version still matches
+    /// `stamp`: the re-hash of the old password is slow, and a reset landing
+    /// meanwhile must not be overwritten by it.
+    async fn upgrade_password_hash(
+        &mut self,
+        stamp: CredentialStamp,
+        password_hash: PasswordHash,
+    ) -> UpgradeHashOutcome;
     /// Sets `email_verified` on `user_id`. CALLER MUST have proven control of
     /// the address by checking an `EmailVerificationCodeStorage` code.
     async fn mark_email_verified(&mut self, user_id: Uuid) -> MarkVerifiedOutcome;
@@ -181,6 +193,14 @@ pub(crate) enum SetPasswordOutcome {
     UserNotFound,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum UpgradeHashOutcome {
+    Ok,
+    /// Nothing written: the user is gone or its credentials changed since `stamp`.
+    Stale,
+}
+
 /// A short-lived, single-use proof that `/oauth/login` already authenticated
 /// this user -- `/oauth/authorize` requires one of these before it will issue
 /// a code, which is what makes "authenticate before authorize" a real,
@@ -188,18 +208,17 @@ pub(crate) enum SetPasswordOutcome {
 /// themselves (RFC 6749 4.1.1: the authorization server authenticates the
 /// resource owner before issuing a code).
 pub(crate) trait LoginSessionStorage {
-    async fn create_session(&mut self, user_id: Uuid) -> String;
-    /// Consumes the session token; returns the user id if it existed and
-    /// hasn't expired.
-    async fn take_session(&mut self, token: &str) -> Option<Uuid>;
-    /// Invalidates every outstanding session for `user_id`. Called around a
-    /// password reset -- see `RefreshTokenStorage::revoke_all_for_user`.
+    async fn create_session(&mut self, stamp: CredentialStamp) -> String;
+    /// Consumes the session token; returns its stamp if it existed and
+    /// hasn't expired. The caller still has to check the stamp is current.
+    async fn take_session(&mut self, token: &str) -> Option<CredentialStamp>;
+    /// Deletes every outstanding session for `user_id`. Called after a
+    /// password reset as clean-up: the credential stamp already makes those
+    /// sessions unusable (see `server::api::current_user`).
     ///
-    /// Returns `RevokeOutcome::Failed` if the revocation itself failed (e.g.
-    /// a durable backend's delete errored) -- implementations MUST NOT
-    /// swallow such a failure and report `Ok`. The in-memory implementation
-    /// can't fail, so it always returns `Ok`; a caller relying on this for
-    /// account-takeover remediation needs to know when that's not true.
+    /// Returns `RevokeOutcome::Failed` if the deletion itself failed (e.g. a
+    /// durable backend's delete errored) -- implementations MUST NOT swallow
+    /// such a failure and report `Ok`; the caller logs it.
     async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
 }
 
@@ -217,25 +236,28 @@ pub(crate) trait PkceStorage {
         code_challenge: String,
         code_challenge_method: CodeChallengeMethod,
         redirect_uri: String,
-        user_id: Uuid,
+        stamp: CredentialStamp,
     );
-    /// Removes and returns the (challenge, method, redirect_uri, user_id) bound to
+    /// Removes and returns the (challenge, method, redirect_uri, stamp) bound to
     /// this code -- the caller must additionally check that `redirect_uri` matches
-    /// the one presented at token-exchange time (RFC 6749 4.1.3). `user_id` is who
+    /// the one presented at token-exchange time (RFC 6749 4.1.3). `stamp` is who
     /// `/oauth/login` authenticated before this code was issued (see
     /// `LoginSessionStorage`); `/oauth/token` carries it into the token response so
     /// the authenticated identity survives the exchange instead of being dropped.
     async fn take_code_challenge(
         &mut self,
         code: &str,
-    ) -> Option<(String, CodeChallengeMethod, String, Uuid)>;
+    ) -> Option<(String, CodeChallengeMethod, String, CredentialStamp)>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RefreshTokenOutcome {
     /// Token was valid and unused; now consumed. Carries the user and the
     /// token family so the caller can mint the next token in the same chain.
-    Valid { user_id: Uuid, family_id: Uuid },
+    Valid {
+        stamp: CredentialStamp,
+        family_id: Uuid,
+    },
     /// Token was already used once before. This is either the legitimate
     /// client re-sending a stale token, or an attacker replaying a stolen
     /// one -- either way the chain is no longer trustworthy, so the storage
@@ -251,18 +273,17 @@ pub(crate) enum RefreshTokenOutcome {
 /// the same `family_id`; presenting an already-used token is treated as a
 /// signal the family is compromised (see `RefreshTokenOutcome::Reused`).
 pub(crate) trait RefreshTokenStorage {
-    async fn save_refresh_token(&mut self, token: String, user_id: Uuid, family_id: Uuid);
+    /// `stamp` carries over unchanged on rotation: a refresh proves nothing new.
+    async fn save_refresh_token(&mut self, token: String, stamp: CredentialStamp, family_id: Uuid);
     async fn take_refresh_token(&mut self, token: &str) -> RefreshTokenOutcome;
-    /// Revokes every refresh token belonging to `user_id`, across every
-    /// family -- a password reset is the standard remediation for "my
-    /// account may be compromised", which only actually remediates anything
-    /// if it also kills any refresh token (and login session, see
-    /// `LoginSessionStorage::revoke_all_for_user`) an attacker already holds.
+    /// Deletes every refresh token belonging to `user_id`, across every
+    /// family. Called after a password reset as clean-up: the credential
+    /// stamp already makes those tokens unusable (see
+    /// `server::api::current_user`).
     ///
-    /// Returns `RevokeOutcome::Failed` if the revocation itself failed --
-    /// implementations MUST NOT swallow such a failure and report `Ok`,
-    /// since the caller treats `Ok` here as its guarantee that no stale
-    /// token survived.
+    /// Returns `RevokeOutcome::Failed` if the deletion itself failed --
+    /// implementations MUST NOT swallow such a failure and report `Ok`; the
+    /// caller logs it.
     async fn revoke_all_for_user(&mut self, user_id: Uuid) -> RevokeOutcome;
 }
 
@@ -329,11 +350,27 @@ pub(crate) trait PendingOidcLinkStorage {
 /// `/oauth/password-reset/confirm` sets a new password on the account it was
 /// issued for.
 pub(crate) trait PasswordResetTokenStorage {
-    async fn save_reset_token(&mut self, user_id: Uuid) -> String;
+    /// How long a token stays redeemable; the email states when it expires.
+    fn ttl_secs(&self) -> i64;
+    /// Leaves `user_id`'s earlier tokens working, so someone re-requesting a
+    /// reset for the owner can't kill the link they are about to open. Issues
+    /// nothing while the newest one is younger than the cooldown, which bounds
+    /// both how often anyone can mail the owner and how many tokens one user
+    /// holds (TTL / cooldown).
+    async fn issue_reset_token(&mut self, user_id: Uuid) -> IssueResetOutcome;
     /// Consumes the token; returns the user id it was issued for if it
-    /// existed and hasn't expired. Single-use, same rationale as
+    /// existed and hasn't expired, and then also spends every other token of
+    /// that user. Single-use, same rationale as
     /// `PendingOidcLinkStorage::take_pending_link`.
     async fn take_reset_token(&mut self, token: &str) -> Option<Uuid>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum IssueResetOutcome {
+    Issued(String),
+    /// A token was issued too recently; nothing changed.
+    CoolingDown,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -398,9 +435,9 @@ pub(crate) trait EmailVerificationCodeStorage {
 pub(crate) trait VerificationSessionStorage {
     /// How long a session lasts; handed to bff so its cookie lives exactly as long.
     fn ttl_secs(&self) -> i64;
-    async fn create_session(&mut self, user_id: Uuid) -> String;
+    async fn create_session(&mut self, stamp: CredentialStamp) -> String;
     /// Not consuming: a wrong code must leave it usable for the next try.
-    async fn get_session(&self, token: &str) -> Option<Uuid>;
+    async fn get_session(&self, token: &str) -> Option<CredentialStamp>;
     async fn delete_session(&mut self, token: &str);
     /// Ends every verification session of `user_id`. A password reset calls
     /// this: whoever held one before the reset (the account may have been

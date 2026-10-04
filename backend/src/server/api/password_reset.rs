@@ -5,14 +5,16 @@ pub(crate) use controller::request_password_reset_doc;
 
 mod controller {
     use aide::transform::TransformOperation;
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use common_macros::ErrorResponses;
     use indoc::indoc;
     use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
+    use uuid::Uuid;
 
     use crate::server::AppState;
 
@@ -30,6 +32,12 @@ mod controller {
         pub(super) new_password: String,
     }
 
+    #[derive(Debug, Serialize, JsonSchema)]
+    pub(crate) struct PasswordResetConfirmResponse {
+        /// Whose password was reset, so bff can end that user's sessions.
+        pub(crate) user_id: Uuid,
+    }
+
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
     pub(crate) enum PasswordResetConfirmError {
         #[error("invalid or expired password reset token")]
@@ -38,6 +46,12 @@ mod controller {
             details = "invalid or expired password reset token"
         )]
         InvalidOrExpiredToken,
+        #[error("password does not meet the password policy")]
+        #[error_response(
+            StatusCode::BAD_REQUEST,
+            details = "password must be at least 8 characters and at most 1024 bytes"
+        )]
+        WeakPassword,
         #[error("internal error")]
         #[error_response(StatusCode::INTERNAL_SERVER_ERROR)]
         UnexpectedError,
@@ -52,6 +66,9 @@ mod controller {
                 PasswordResetConfirmServiceError::InvalidOrExpiredToken => {
                     PasswordResetConfirmError::InvalidOrExpiredToken
                 }
+                PasswordResetConfirmServiceError::WeakPassword(_) => {
+                    PasswordResetConfirmError::WeakPassword
+                }
                 PasswordResetConfirmServiceError::UnexpectedError(_) => {
                     PasswordResetConfirmError::UnexpectedError
                 }
@@ -64,10 +81,11 @@ mod controller {
             .id("request_password_reset")
             .summary("Request a password reset")
             .description(indoc! {"
-                Always returns 202, whether or not `email` matches an account, so the response
-                can't be used to enumerate registered addresses. The issued token is never
-                included in the response or logged; delivering it to the account owner is out of
-                scope for this endpoint."})
+                Always returns 202, whether or not `email` matches an account and whether or not
+                a mail went out, so the response can't be used to enumerate registered addresses.
+                On a match, mails a single-use reset link to the account's stored address through
+                the configured email handler, at most once per cooldown. The token is never in the
+                response or a log."})
     }
 
     pub(crate) fn confirm_password_reset_doc(op: TransformOperation) -> TransformOperation {
@@ -75,9 +93,11 @@ mod controller {
             .id("confirm_password_reset")
             .summary("Redeem a password reset token")
             .description(indoc! {"
-                Sets a new password on the account `token` was issued for, and revokes every
-                outstanding refresh token and login session for that account; 400 if the token
-                is unknown, expired, or already used."})
+                Sets a new password on the account `token` was issued for, marks its email
+                verified, and ends every session, code and refresh token issued before. Returns
+                the account's `user_id`, so bff can end its sessions too; 400 if
+                the token is unknown, expired, or already used, or if the password is shorter
+                than 8 characters or longer than 1024 bytes (the token stays usable then)."})
     }
 
     pub(crate) async fn request_password_reset(
@@ -91,152 +111,181 @@ mod controller {
     pub(crate) async fn confirm_password_reset(
         State(mut state): State<AppState>,
         ApiJson(req): ApiJson<PasswordResetConfirmRequest>,
-    ) -> Result<StatusCode, PasswordResetConfirmError> {
-        service::confirm_password_reset(&mut state, &req.token, req.new_password.into()).await?;
-        Ok(StatusCode::OK)
+    ) -> Result<Json<PasswordResetConfirmResponse>, PasswordResetConfirmError> {
+        let user_id =
+            service::confirm_password_reset(&mut state, &req.token, req.new_password.into())
+                .await?;
+        Ok(Json(PasswordResetConfirmResponse { user_id }))
     }
 }
 
 mod service {
+    use chrono::Utc;
     use secrecy::SecretString;
     use thiserror::Error;
+    use uuid::Uuid;
 
     use crate::crypto;
+    use crate::email::{EmailKind, OutboundEmail};
     use crate::model::email::normalize_email;
+    use crate::model::password::{PasswordPolicyError, validate_new_password};
     use crate::model::user::PasswordHash;
     use crate::server::AppState;
     use crate::storage::{
-        EmailVerificationCodeStorage, LoginSessionStorage, PasswordResetTokenStorage,
-        RefreshTokenStorage, RevokeOutcome, SetPasswordOutcome, UserStorage,
-        VerificationSessionStorage,
+        EmailVerificationCodeStorage, IssueResetOutcome, LoginSessionStorage, MarkVerifiedOutcome,
+        PasswordResetTokenStorage, RefreshTokenStorage, RevokeOutcome, SetPasswordOutcome,
+        UserStorage, VerificationSessionStorage,
     };
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum PasswordResetConfirmServiceError {
         #[error("invalid or expired password reset token")]
         InvalidOrExpiredToken,
+        #[error(transparent)]
+        WeakPassword(#[from] PasswordPolicyError),
         #[error("internal error: {0}")]
         UnexpectedError(String),
     }
 
-    /// Issues a single-use password reset token for the account matching
-    /// `email`, if any.
-    ///
-    /// The token is deliberately not surfaced anywhere in this response (nor
-    /// logged) -- delivering it to the account owner is the caller's job
-    /// (e.g. by email), never this endpoint's.
+    /// Mails a reset link to the account matching `email`, if any. Nothing
+    /// here may change the caller's response (no account, no handler, the
+    /// cooldown), or it would tell who has an account; the send runs in the
+    /// background for the same reason.
     pub(crate) async fn request_password_reset(state: &mut AppState, email: &str) {
-        let email = normalize_email(email);
-        if let Some(user) = state.users.get_user_by_email(&email).await {
-            let _token = state.password_reset_tokens.save_reset_token(user.id).await;
-        }
+        let Some(user) = state.users.get_user_by_email(&normalize_email(email)).await else {
+            return;
+        };
+        let Some(handler) = state.email_handler.clone() else {
+            // Warned about once at startup; anyone can trigger this line.
+            tracing::debug!(user_id = %user.id, "password reset requested but no email handler is configured");
+            return;
+        };
+        let token = match state.password_reset_tokens.issue_reset_token(user.id).await {
+            IssueResetOutcome::Issued(token) => token,
+            IssueResetOutcome::CoolingDown => {
+                tracing::info!(user_id = %user.id, "password reset email skipped: resend cooldown");
+                return;
+            }
+        };
 
-        // Same response whether or not `email` matched an account -- an
-        // account-existence oracle here would let a caller enumerate
-        // registered addresses, the same concern `/oauth/login`'s dummy-hash
-        // check (see login.rs) exists to close off.
+        // The token goes in the fragment, which browsers never send to a
+        // server or in a Referer.
+        let login_url = &state.login_public_url;
+        let mail = OutboundEmail {
+            user_id: user.id,
+            email: user.email,
+            expires_at: Utc::now()
+                + chrono::Duration::seconds(state.password_reset_tokens.ttl_secs()),
+            kind: EmailKind::PasswordReset {
+                reset_url: format!("{login_url}/reset-password.html#token={token}"),
+            },
+        };
+        tokio::spawn(async move {
+            if let Err(error) = handler.send(&mail).await {
+                tracing::warn!(%error, user_id = %mail.user_id, "could not deliver password reset email");
+            }
+        });
     }
 
-    /// Redeems a password reset token, setting a new password on the account
-    /// it was issued for.
+    /// Redeems a password reset token: sets the new password, which ends
+    /// every credential issued before (see `User::credential_version`), and
+    /// marks the email verified, since the token proves control of it.
     pub(crate) async fn confirm_password_reset(
         state: &mut AppState,
         token: &str,
         new_password: SecretString,
-    ) -> Result<(), PasswordResetConfirmServiceError> {
+    ) -> Result<Uuid, PasswordResetConfirmServiceError> {
+        // Before the token is spent, so a rejected password can be retried.
+        validate_new_password(&new_password)?;
+
         let user_id = state
             .password_reset_tokens
             .take_reset_token(token)
             .await
             .ok_or(PasswordResetConfirmServiceError::InvalidOrExpiredToken)?;
 
-        // A password reset is the standard remediation for "my account may
-        // be compromised" -- that only actually remediates anything if it
-        // also kills any refresh token or login session an attacker already
-        // holds. Revoked once *before* the password changes (so nothing an
-        // attacker already held survives this call) and once *after* (so a
-        // token/session created in the narrow window between this line and
-        // `set_password` below -- e.g. a concurrent login racing this
-        // request -- doesn't survive it either). Neither revocation is
-        // allowed to fail silently: `RevokeOutcome::Failed` here means a
-        // durable backend's delete errored, which is exactly the case this
-        // whole flow exists to not paper over with a 200.
-        revoke_everything_for(state, user_id).await?;
-
         let password_hash = crypto::hash_password(new_password).await.map_err(|error| {
             PasswordResetConfirmServiceError::UnexpectedError(error.to_string())
         })?;
 
+        // `UserNotFound` can't happen (nothing deletes users); to the caller
+        // the token just no longer resolves to anything.
         match state
             .users
             .set_password(user_id, PasswordHash::Argon2(password_hash.into()))
             .await
         {
             SetPasswordOutcome::Ok => {}
-            // The token was valid a moment ago but the account is gone now --
-            // vanishingly unlikely (nothing in this codebase deletes users),
-            // but report it as the same not-found-shaped error rather than a
-            // 500, since from the caller's perspective the token just doesn't
-            // resolve to anything anymore.
             SetPasswordOutcome::UserNotFound => {
                 return Err(PasswordResetConfirmServiceError::InvalidOrExpiredToken);
             }
         }
+        match state.users.mark_email_verified(user_id).await {
+            MarkVerifiedOutcome::Ok => {}
+            MarkVerifiedOutcome::UserNotFound => {
+                return Err(PasswordResetConfirmServiceError::InvalidOrExpiredToken);
+            }
+        }
 
-        revoke_everything_for(state, user_id).await?;
-
-        Ok(())
+        clean_up_after_reset(state, user_id).await;
+        Ok(user_id)
     }
 
-    async fn revoke_everything_for(
-        state: &mut AppState,
-        user_id: uuid::Uuid,
-    ) -> Result<(), PasswordResetConfirmServiceError> {
-        if state.refresh_tokens.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError(
-                "revoking refresh tokens failed".to_string(),
-            ));
+    /// Drops what the reset already made worthless, plus the verification
+    /// lockout guesses burned before the owner took the account back. A
+    /// failure is logged, not returned: the password is already changed, and
+    /// the credentials left behind are refused by their stale stamp anyway.
+    async fn clean_up_after_reset(state: &mut AppState, user_id: Uuid) {
+        let outcomes = [
+            (
+                "refresh tokens",
+                state.refresh_tokens.revoke_all_for_user(user_id).await,
+            ),
+            (
+                "login sessions",
+                state.login_sessions.revoke_all_for_user(user_id).await,
+            ),
+            (
+                "verification sessions",
+                state
+                    .email_verification
+                    .sessions
+                    .revoke_all_for_user(user_id)
+                    .await,
+            ),
+            (
+                "verification code state",
+                state.email_verification.codes.clear_user(user_id).await,
+            ),
+        ];
+        for (what, outcome) in outcomes {
+            if outcome == RevokeOutcome::Failed {
+                tracing::error!(%user_id, "clearing {what} after a password reset failed");
+            }
         }
-        if state.login_sessions.revoke_all_for_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError(
-                "revoking login sessions failed".to_string(),
-            ));
-        }
-        if state
-            .email_verification
-            .sessions
-            .revoke_all_for_user(user_id)
-            .await
-            == RevokeOutcome::Failed
-        {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError(
-                "revoking verification sessions failed".to_string(),
-            ));
-        }
-        if state.email_verification.codes.clear_user(user_id).await == RevokeOutcome::Failed {
-            return Err(PasswordResetConfirmServiceError::UnexpectedError(
-                "clearing email verification codes failed".to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use crate::model::user::{PasswordHash, User};
+    use crate::email::EmailKind;
+    use crate::model::user::{CredentialStamp, PasswordHash, User};
     use crate::server::AppState;
-    use crate::server::api::email_verification::test_support::lock_out;
+    use crate::server::api::email_verification::test_support::{
+        Sent, assert_nothing_sent, install_recorder, lock_out, next_sent,
+    };
     use crate::storage::{CheckCodeOutcome, EmailVerificationCodeStorage, IssueCodeOutcome};
     use crate::storage::{
         LoginSessionStorage, PasswordResetTokenStorage, RefreshTokenStorage, UserStorage,
         VerificationSessionStorage,
     };
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
     use common::extract::ApiJson;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     fn state() -> AppState {
@@ -263,29 +312,20 @@ mod tests {
             email_verification: crate::server::api::email_verification::EmailVerification::disabled(
             ),
             password_reset_tokens:
-                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800),
+                crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 0),
             max_bcrypt_cost: 12,
             extra_data_handler: None,
             login_claims_handler: None,
+            email_handler: None,
+            login_public_url: String::new(),
         }
     }
 
-    #[tokio::test]
-    async fn request_returns_accepted_for_a_known_email_and_issues_a_token() {
-        let mut state = state();
-        let user = User {
-            email: "alice@example.com".to_string(),
-            ..User::default()
-        };
-        let _ = state.users.create_user(user).await;
-
-        let req = PasswordResetRequestRequest {
-            email: "alice@example.com".to_string(),
-        };
-        let status = request_password_reset(State(state.clone()), ApiJson(req)).await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(state.password_reset_tokens.token_count().await, 1);
+    async fn issued_token(state: &mut AppState, user_id: Uuid) -> String {
+        match state.password_reset_tokens.issue_reset_token(user_id).await {
+            crate::storage::IssueResetOutcome::Issued(token) => token,
+            crate::storage::IssueResetOutcome::CoolingDown => unreachable!("expected a token"),
+        }
     }
 
     #[tokio::test]
@@ -312,14 +352,15 @@ mod tests {
         };
         let user_id = user.id;
         let _ = state.users.create_user(user).await;
-        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+        let token = issued_token(&mut state, user_id).await;
 
         let req = PasswordResetConfirmRequest {
             token: token.clone(),
             new_password: "new-password".to_string(),
         };
         let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
-        assert_eq!(result, Ok(StatusCode::OK));
+        // bff ends the user's sessions with it.
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
 
         let updated = state.users.get_user_by_id(user_id).await.unwrap();
         assert_ne!(updated.password.unwrap().expose(), ("argon2", "old-hash"));
@@ -331,8 +372,8 @@ mod tests {
         };
         let replay_result = confirm_password_reset(State(state), ApiJson(replay)).await;
         assert_eq!(
-            replay_result,
-            Err(PasswordResetConfirmError::InvalidOrExpiredToken)
+            replay_result.err(),
+            Some(PasswordResetConfirmError::InvalidOrExpiredToken)
         );
     }
 
@@ -352,17 +393,24 @@ mod tests {
         let _ = state.users.create_user(user).await;
         state
             .refresh_tokens
-            .save_refresh_token("refresh-token".to_string(), user_id, Uuid::new_v4())
+            .save_refresh_token(
+                "refresh-token".to_string(),
+                CredentialStamp::initial(user_id),
+                Uuid::new_v4(),
+            )
             .await;
-        let login_session = state.login_sessions.create_session(user_id).await;
-        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+        let login_session = state
+            .login_sessions
+            .create_session(CredentialStamp::initial(user_id))
+            .await;
+        let token = issued_token(&mut state, user_id).await;
 
         let req = PasswordResetConfirmRequest {
             token,
             new_password: "new-password".to_string(),
         };
         let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
-        assert_eq!(result, Ok(StatusCode::OK));
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
 
         assert_eq!(
             state
@@ -392,21 +440,21 @@ mod tests {
         let other = state
             .email_verification
             .sessions
-            .create_session(Uuid::new_v4())
+            .create_session(CredentialStamp::initial(Uuid::new_v4()))
             .await;
         let session = state
             .email_verification
             .sessions
-            .create_session(user_id)
+            .create_session(CredentialStamp::initial(user_id))
             .await;
-        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+        let token = issued_token(&mut state, user_id).await;
 
         let req = PasswordResetConfirmRequest {
             token,
             new_password: "new-password".to_string(),
         };
         let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
-        assert_eq!(result, Ok(StatusCode::OK));
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
 
         assert_eq!(
             state
@@ -450,14 +498,14 @@ mod tests {
                 .await,
             CheckCodeOutcome::Locked { .. }
         ));
-        let token = state.password_reset_tokens.save_reset_token(user_id).await;
+        let token = issued_token(&mut state, user_id).await;
 
         let req = PasswordResetConfirmRequest {
             token,
             new_password: "new-password".to_string(),
         };
         let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
-        assert_eq!(result, Ok(StatusCode::OK));
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
 
         assert!(matches!(
             state.email_verification.codes.issue_code(user_id).await,
@@ -466,12 +514,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_request_invalidates_the_first_token() {
-        // Otherwise every unexpired token from an earlier request stays
-        // independently redeemable, widening the window a leaked link stays
-        // dangerous and letting an unauthenticated caller grow the token
-        // table without bound by re-requesting the same email.
+    async fn a_second_request_leaves_the_first_link_working_and_a_reset_spends_both() {
         let mut state = state();
+        let _rx = with_recorder(&mut state);
+        let user = User {
+            email: "alice@example.com".to_string(),
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let first_token = issued_token(&mut state, user_id).await;
+
+        // Through the real handler: an attacker re-requesting for the owner.
+        assert_eq!(
+            request(&state, "alice@example.com").await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(state.password_reset_tokens.token_count().await, 2);
+
+        let req = PasswordResetConfirmRequest {
+            token: first_token,
+            new_password: "new-password".to_string(),
+        };
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
+        assert_eq!(state.password_reset_tokens.token_count().await, 0);
+    }
+
+    fn with_recorder(state: &mut AppState) -> mpsc::UnboundedReceiver<Sent> {
+        install_recorder(state, false)
+    }
+
+    async fn request(state: &AppState, email: &str) -> StatusCode {
+        let req = PasswordResetRequestRequest {
+            email: email.to_string(),
+        };
+        request_password_reset(State(state.clone()), ApiJson(req)).await
+    }
+
+    fn reset_url_of(sent: Sent) -> String {
+        match sent.kind {
+            EmailKind::PasswordReset { reset_url } => reset_url,
+            other => unreachable!("not a password reset email: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_mails_a_working_reset_link_to_the_stored_address_only() {
+        let mut state = state();
+        let mut rx = with_recorder(&mut state);
         let user = User {
             email: "alice@example.com".to_string(),
             ..User::default()
@@ -479,25 +570,153 @@ mod tests {
         let user_id = user.id;
         let _ = state.users.create_user(user).await;
 
-        let stale_token = state.password_reset_tokens.save_reset_token(user_id).await;
+        // Found through normalization, but the mail goes to the account's own
+        // address, never to what the caller typed.
+        let status = request(&state, " Alice+attacker@Example.com").await;
 
-        // The second issuance goes through the real handler, not another
-        // direct `save_reset_token` call -- this is what actually exercises
-        // `/oauth/password-reset/request`'s behavior instead of just
-        // re-testing the storage layer's own invariant.
-        let req = PasswordResetRequestRequest {
-            email: "alice@example.com".to_string(),
-        };
-        request_password_reset(State(state.clone()), ApiJson(req)).await;
-
-        assert_eq!(
-            state
-                .password_reset_tokens
-                .take_reset_token(&stale_token)
-                .await,
-            None
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let sent = next_sent(&mut rx).await;
+        assert_eq!(sent.email, "alice@example.com");
+        let expires_in = sent.expires_at - chrono::Utc::now();
+        assert!(
+            (1_795..=1_800).contains(&expires_in.num_seconds()),
+            "{expires_in}"
         );
-        assert_eq!(state.password_reset_tokens.token_count().await, 1);
+        let reset_url = reset_url_of(sent);
+        let token = reset_url
+            .strip_prefix("https://login.test/reset-password.html#token=")
+            .expect("token travels in the fragment of login's reset page");
+        let req = PasswordResetConfirmRequest {
+            token: token.to_string(),
+            new_password: "new-password".to_string(),
+        };
+        assert_eq!(
+            confirm_password_reset(State(state.clone()), ApiJson(req))
+                .await
+                .map(|Json(body)| body.user_id),
+            Ok(user_id)
+        );
+        assert!(
+            state
+                .users
+                .get_user_by_id(user_id)
+                .await
+                .unwrap()
+                .password
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_for_an_unknown_email_sends_nothing() {
+        let mut state = state();
+        let mut rx = with_recorder(&mut state);
+
+        let status = request(&state, "nobody@example.com").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_nothing_sent(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_request_within_the_cooldown_sends_nothing_and_answers_the_same() {
+        let mut state = state();
+        state.password_reset_tokens =
+            crate::storage::in_memory::InMemoryPasswordResetTokenStorage::new(1_800, 60);
+        let mut rx = with_recorder(&mut state);
+        let _ = state
+            .users
+            .create_user(User {
+                email: "alice@example.com".to_string(),
+                ..User::default()
+            })
+            .await;
+        assert_eq!(
+            request(&state, "alice@example.com").await,
+            StatusCode::ACCEPTED
+        );
+        let _ = next_sent(&mut rx).await;
+
+        let status = request(&state, "alice@example.com").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_nothing_sent(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn request_issues_no_token_when_no_email_handler_is_configured() {
+        let mut state = state();
+        let _ = state
+            .users
+            .create_user(User {
+                email: "alice@example.com".to_string(),
+                ..User::default()
+            })
+            .await;
+
+        let status = request(&state, "alice@example.com").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(state.password_reset_tokens.token_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn confirm_rejects_a_weak_password_without_spending_the_token() {
+        let mut state = state();
+        let user = User {
+            email: "alice@example.com".to_string(),
+            password: Some(PasswordHash::Argon2("old-hash".into())),
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let token = issued_token(&mut state, user_id).await;
+
+        let weak = PasswordResetConfirmRequest {
+            token: token.clone(),
+            new_password: "short".to_string(),
+        };
+        let result = confirm_password_reset(State(state.clone()), ApiJson(weak)).await;
+        assert_eq!(result.err(), Some(PasswordResetConfirmError::WeakPassword));
+        let unchanged = state.users.get_user_by_id(user_id).await.unwrap();
+        assert_eq!(unchanged.password.unwrap().expose(), ("argon2", "old-hash"));
+
+        let retry = PasswordResetConfirmRequest {
+            token,
+            new_password: "long-enough".to_string(),
+        };
+        let result = confirm_password_reset(State(state), ApiJson(retry)).await;
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
+    }
+
+    #[tokio::test]
+    async fn confirm_marks_the_email_verified() {
+        // Redeeming the token proves control of the mailbox it was sent to.
+        let mut state = state();
+        let user = User {
+            email: "alice@example.com".to_string(),
+            email_verified: false,
+            ..User::default()
+        };
+        let user_id = user.id;
+        let _ = state.users.create_user(user).await;
+        let token = issued_token(&mut state, user_id).await;
+
+        let req = PasswordResetConfirmRequest {
+            token,
+            new_password: "new-password".to_string(),
+        };
+        let result = confirm_password_reset(State(state.clone()), ApiJson(req)).await;
+
+        assert_eq!(result.map(|Json(body)| body.user_id), Ok(user_id));
+        assert!(
+            state
+                .users
+                .get_user_by_id(user_id)
+                .await
+                .unwrap()
+                .email_verified
+        );
     }
 
     #[tokio::test]
