@@ -81,6 +81,10 @@ future direct caller (e.g. an SPA built straight against backend, bypassing bff)
 skipping authentication by calling things in the wrong order — the ordering is enforced
 by backend's own state, not by convention.
 
+Every bff and backend route that takes request input rejects malformed input (a missing field, a wrong
+content type, a repeated query key) with the same JSON error body as any other failure, with
+`reason: "InvalidRequest"` and status `400`, `415` or `422` -- never a plain-text message.
+
 ### Third-party login (OIDC) and account linking
 
 `GET /oauth/oidc/login?provider={provider}` / `GET /oauth/oidc/callback?provider={provider}` (backend) let
@@ -115,14 +119,17 @@ checked OIDC id_token). This is enforced by the type system, not just a doc comm
 future caller can't accidentally create an account for an address the provider never
 confirmed.
 
-Every bff and backend route that takes request input rejects malformed input (a missing field, a wrong
-content type, a repeated query key) with the same JSON error body as any other failure, with
-`reason: "InvalidRequest"` and status `400`, `415` or `422` -- never a plain-text message.
+### bff routes
 
-bff routes. Two independent per-IP rate-limit buckets (`tower_governor`) sit in front: one shared by `/login` + `/register`, one shared by every
-proxied route — hammering one side can't burn the other's budget. `/health` is
-exempt (a cheap liveness check infra commonly polls, shouldn't get caught in either
-bucket):
+Three independent per-client rate-limit buckets (`tower_governor`) sit in front: one shared by
+`/login`, `/register`, `/oidc/*`, `/verify-email*` and `/password-reset/*`, and one for `/docs`
+and `/openapi.json`, both sized by `WA_RATE_LIMIT_MAX_ATTEMPTS`, plus one shared by every proxied
+route, sized by `rate_limit_proxy_max_attempts` in `config.yaml` (YAML-only; `6000` for `dev`,
+else `600`, per 60 seconds, since every API call a frontend makes draws from it; `0` stops bff
+from starting) — hammering one can't burn another's budget. A client is its IPv4 address or
+its IPv6 /64. Behind a reverse proxy, set `WA_TRUSTED_PROXIES`, or every client shares the proxy's
+bucket. `/health` is exempt (a cheap liveness check infra commonly polls, shouldn't get caught in
+any bucket):
 
 | Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                                                                                                                              |
 |--------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -227,9 +234,51 @@ routes:
 ```
 
 Any request whose path starts with `path_prefix` (longest prefix wins if more than one
-matches) is forwarded to `upstream_url` with that prefix stripped, `Cookie` dropped, and
+matches) is forwarded to `upstream_url` with that prefix stripped and
 `Authorization: Bearer <access_token>` set from the session looked up via the request's
-`wa_session` cookie. No session → `401`. If the access token has expired, bff refreshes it first: a rejected refresh token → `401`; backend unreachable or failing during the refresh → `502`. No matching route → `404`.
+`wa_session` cookie. Next to it, bff forwards only `Content-Type` (`REQUEST_HEADERS` in
+`bff/src/server/api/proxy.rs`): every other client header is dropped, `Cookie`, `Accept`,
+`Upgrade` and any `X-Forwarded-*`/`Forwarded` included, and bff adds no forwarding headers of
+its own (hyper still sets `Host` to the upstream's, and `Content-Length` or chunked framing for a
+body). WebSocket isn't proxied: a handshake reaches the upstream as a plain `GET`. A header an
+upstream needs gets added to `REQUEST_HEADERS`; adding `Upgrade` also means extending the
+`Origin` check below to WebSocket handshakes.
+
+The browser attaches the session cookie to any same-site request, and an upstream treats the
+bearer token bff adds as CSRF-safe. So a proxied request that can change state, any method but
+`GET`/`HEAD`/`OPTIONS`, must come from a `WA_TRUSTED_ORIGINS` origin or bff's own (`Origin`,
+falling back to `Referer`), or gets `403`. bff answers no CORS yet (see `TODO.md`), so in
+practice only a frontend served through bff itself can use the proxy; a cross-origin entry in
+`WA_TRUSTED_ORIGINS` lets that origin send CORS-simple writes it can't read the answer to. The
+check assumes an upstream changes nothing on `GET`/`HEAD`/`OPTIONS`: `SameSite=Lax` still sends
+the cookie on a cross-site top-level `GET` navigation, so an upstream must not change state on
+those methods, nor honour a `_method` query override on them.
+
+Upstream responses keep only `Content-Type`, `Content-Disposition`, `Content-Security-Policy` and
+`Cache-Control` (`RESPONSE_HEADERS`): the headers that only shape that one response, which an
+upstream needs to keep its content (an uploaded file, say) from rendering or running on bff's
+origin, or from being cached for another user. bff then always sets `X-Content-Type-Options:
+nosniff`, and `Cache-Control: no-store` when the upstream sent none. A cache in front of bff sees
+the cookie, not the `Authorization` the upstream answered, so a `Cache-Control` naming none of
+`public`, `s-maxage`, a bare `private` or `no-store` gets `private` added: shared caches keep it
+out, as RFC 9111 §3.5 would for an `Authorization` request. Stricter than the RFC,
+`must-revalidate` doesn't count (upstreams send it on per-user data, and bff drops the `ETag`
+a revalidation would use). A field-qualified `private="…"` doesn't either, since it only keeps
+the named fields out. Everything else is dropped, so `Location`, `ETag` and the like don't reach
+the browser, and a `HEAD` response loses the upstream's `Content-Length` (hyper frames it from
+the empty body).
+
+Proxied content shares bff's origin, and most other response headers would act on bff itself,
+beyond the upstream's `path_prefix`: `Set-Cookie` and `Clear-Site-Data` would hit bff's own
+cookie (`wa_session`), `Service-Worker-Allowed` would let a service worker see bff's own routes
+(`/login`'s form POST, with the password, included), and `Strict-Transport-Security`/`Alt-Svc`
+would change how the browser reaches bff's host. A route with `path_prefix: "/"` gets a
+root-scoped service worker without any header: it trusts that upstream with everything bff
+serves.
+
+No session → `401`. If the access token has expired, bff refreshes it first: a rejected refresh
+token → `401`; backend unreachable or failing during the refresh → `502`. No matching route →
+`404`.
 
 The `redirect_uri` a caller's login form submits to bff's `/login` is not separately
 allowlisted by bff — it's forwarded as-is to backend's `/oauth/authorize`, and
@@ -440,12 +489,13 @@ Only the variables below are read, and a YAML key can set anything they can. The
 | `WA_REDIRECT_URI_ALLOWLIST`                              | backend             | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/`     | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`. Exact string match, hence the trailing slash — matches login's own default `redirect_uri` while `WA_DEFAULT_REDIRECT_URI` and `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` are unset. The derived default doesn't include them; set this explicitly when using them: sign-in from the pages that fall back to them ends in a `400` from `/oauth/authorize` otherwise, and nothing complains at startup                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `WA_DEFAULT_REDIRECT_URI`                                | login               | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/`     | Where the user goes after a login page opened without a `redirect_uri` (a bare visit to `login.html` or `register.html`, say), and the fallback for the pages `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` covers. Must be on `WA_REDIRECT_URI_ALLOWLIST`. Empty counts as unset; a value that isn't an absolute http(s) URL (https under `prod`) stops login from starting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`                     | login               | `WA_DEFAULT_REDIRECT_URI`                                   | Overrides `WA_DEFAULT_REDIRECT_URI` for the pages reached from an email link, which carry no `redirect_uri`: the verification page after the correct code, the login page after a password reset (`login.html?status=password_reset`), and `forgot-password.html`. Must be on `WA_REDIRECT_URI_ALLOWLIST`. Empty counts as unset; a value that isn't an absolute http(s) URL (https under `prod`) stops login from starting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `WA_TRUSTED_ORIGINS`                                     | bff                 | `WA_LOGIN_PUBLIC_URL`, else `http://localhost:8081`         | Comma-separated origins allowed to POST to `/login`/`/register` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `WA_TRUSTED_ORIGINS`                                     | bff                 | `WA_LOGIN_PUBLIC_URL`, else `http://localhost:8081`         | Comma-separated origins allowed to POST to every bff form route (`/login`, `/register`, `/oidc/confirm-link`, `/verify-email*`, `/password-reset/*`), and (with bff's own origin) to send state-changing proxied requests: any method but `GET`/`HEAD`/`OPTIONS` (checked against `Origin`, falling back to `Referer`) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF") or riding the session cookie into an upstream (CSRF). List every frontend origin that calls the proxy. One list grants both rights: an origin added for the proxy can also POST the form routes, and the login page's origin can also write through the proxy                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `WA_SESSION_COOKIE_NAME`                                 | bff                 | `wa_session`                                                | Name of the HttpOnly session cookie set after login                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `WA_ACCESS_TOKEN_TTL_SECS`                               | backend             | `900`                                                       | How long an access token stays valid. 1 to 315360000 (10 years), and at most `WA_JWT_KEY_ROTATION_INTERVAL_SECS` minus 90000 (25 hours; see that row) when that is set                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `WA_REFRESH_TOKEN_TTL_SECS`                              | backend             | `2592000` (30 days)                                         | How long a refresh token stays redeemable. 1 to 315360000 (10 years)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `WA_JWT_KEY_ROTATION_INTERVAL_SECS`                      | backend             | 30 days, or longer if `WA_ACCESS_TOKEN_TTL_SECS` needs it   | How long a JWT signing key stays active before the next one takes over. The next key is published 24 hours before it signs, and the replaced key stays in `/.well-known/jwks.json` for `WA_ACCESS_TOKEN_TTL_SECS` plus 1 hour (margin for verifier `exp` leeway and clock skew). Those 25 hours plus `WA_ACCESS_TOKEN_TTL_SECS` must fit inside this value, or backend refuses to start; that keeps at most two keys published. Left unset, it is the longer of 30 days and that sum, so a long access token TTL never fails this check. 1 to 315360000. Keys are in memory, so a restart starts a fresh key and rotation clock, and access tokens signed before it stop verifying                                                                                                                                                                                                                                                        |
-| `WA_RATE_LIMIT_MAX_ATTEMPTS`                             | bff                 | `100` for `dev`, else `10`                                  | Burst size, over a 60 second window, for `/login`/`/register`'s per-IP rate limit (`tower_governor`) — independent bucket per route                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `WA_RATE_LIMIT_MAX_ATTEMPTS`                             | bff                 | `100` for `dev`, else `10`                                  | Burst size, replenished over a 60 second window, of bff's auth (`/login`, `/register`, `/oidc/*`, `/verify-email*`, `/password-reset/*`, all sharing one) and docs per-client rate-limit buckets (`tower_governor`; see the bff routes above). The proxied routes' bucket has its own size, `rate_limit_proxy_max_attempts`. `0` stops bff from starting; above `60000` a bucket refills like `60000` (one attempt per millisecond at most) |
+| `WA_TRUSTED_PROXIES`                                     | bff                 | *(unset)*                                                   | Comma-separated addresses or CIDR ranges (a `trusted_proxies:` list in `config.yaml` works too) of the reverse proxies in front of bff (e.g. `10.0.0.0/8, 172.30.0.2`), as bff sees them connect, not their public addresses. A request from one of them is rate-limited on the client address in its `X-Forwarded-For` (the rightmost entry that isn't itself a trusted proxy, or the leftmost if every entry is one; an `ip:port` entry counts as its address). Only `X-Forwarded-For` is read, not RFC 7239 `Forwarded`. An entry that is no address at all stops the walk, and the proxy's own address is used, logged once. From anyone else the header is ignored and the peer address counts. Unset behind a proxy, every client shares the proxy's budget. Under `prod`, an entry wider than IPv4 `/8` or IPv6 `/32` stops bff from starting (a guard against typos like `0.0.0.0/1`, not a check that the range is private): clients in such a range could claim any address and dodge the limit |
 | `WA_DOCS_ENABLED`                                        | bff                 | `true` for `dev`, else `false`                              | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off for `prod` — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `WA_OIDC_<KEY>_CLIENT_ID`, `WA_OIDC_<KEY>_CLIENT_SECRET` | backend             | *(unset)*                                                   | Override the `client_id`/`client_secret` of the `oidc_providers` entry named `<key>` (upper-cased), so the secret can stay out of `config.yaml`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `WA_EMAIL_SMTP_PASSWORD`                                 | backend             | *(unset)*                                                   | Password for an `email_handler` of `kind: smtp`; wins over `password` in `config.yaml`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -470,8 +520,8 @@ members):
   `weaveauth::server::app`) covering `/health`, `/register` + `/oauth/login` +
   `/oauth/authorize` + `/oauth/token`'s full authenticate-then-authorize round trip,
   and allowlist/PKCE/single-use/TTL behavior.
-- `bff`: unit tests inline (`config.rs`, `storage/in_memory.rs`, and `proxy.rs`'s pure
-  `is_hop_by_hop`/`extract_cookie` helpers) plus `bff/tests/pkce_flow.rs` (the full
+- `bff`: unit tests inline (`config.rs`, `storage/in_memory.rs`, `cookie.rs`,
+  `rate_limit.rs`, `server/mod.rs`'s expiry sweep and `proxy.rs`'s `refresh_session`) plus `bff/tests/pkce_flow.rs` (the full
   server-to-server login exchange including credential verification, its failure
   modes, and that backend is never browser-visible), `bff/tests/register.rs`
   (registration forwarding + its `next`/`?error=1` redirect), and `bff/tests/proxy.rs`
@@ -485,7 +535,7 @@ members):
 
 Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim-trixie` builder compiles
 the three services plus `weaveauth-launcher` and `weaveauth-plugin-exec`. The `gcr.io/distroless/cc-debian13`
-runtime (no shell) copies them plus `/app/login/static` and `/app/templates` (`pages/` for the login pages, `emails/` for the emails), and
+runtime (no shell) copies them plus `/app/login/static`, `/app/templates` (`pages/` for the login pages, `emails/` for the emails) and an empty `/app/backend` (backend finds its templates at `/app/backend/../templates`), and
 runs `weaveauth-launcher`, which starts all three and exits when any one of them does.
 Everything runs as `weaveauth` (1000) with no capabilities. The exception is
 `weaveauth-plugin-exec` (`WA_SETUID_HELPER`), which has `CAP_SETUID`/`CAP_SETGID` as file
@@ -499,12 +549,23 @@ doesn't forward `SIGTERM`, so use `docker run --init` for a prompt `docker stop`
 The image runs the `prod` profile, which won't start on localhost defaults: give it
 `WA_BFF_URL` and `WA_LOGIN_PUBLIC_URL` (https) and `WA_BACKEND_URL`. To try it locally,
 use `dev` instead. Backend's port isn't published: bff and login reach it inside the container,
-and backend must never be exposed.
+and backend must never be exposed. Backend listens on every interface, so in Kubernetes give the
+pod a NetworkPolicy, on a network plugin that enforces it (pods can otherwise reach each other on
+any port): allow 8080/8081 from the ingress controller only, and 1983 only from the services you
+trust to call backend directly, such as ones fetching `/.well-known/jwks.json` to verify access
+tokens. Set `WA_BACKEND_URL` to the in-cluster Service address, so it works as the issuer those
+services discover from. Set `WA_TRUSTED_PROXIES` to the ingress controller's pod addresses (or
+their range), or every client shares one rate-limit bucket. A range is only safe while that
+NetworkPolicy lets nothing but the ingress reach 8080: any pod in it could otherwise send its own
+`X-Forwarded-For` and pick its own rate-limit key.
 
 ```bash
 docker build -t weaveauth .
 docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 -e WA_PROFILE=dev weaveauth
 ```
+
+To run it the way production should, under `prod` behind a TLS proxy on a private network,
+see [local-prod/](local-prod/README.md).
 
 ## License
 

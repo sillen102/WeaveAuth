@@ -1,0 +1,15 @@
+# The only thing on the public network: terminates TLS and forwards to bff/login over `edge`.
+{
+	admin off
+	auto_https disable_redirects
+}
+
+login.localhost:8443 {
+	tls /certs/server.crt /certs/server.key
+	reverse_proxy weaveauth:8081
+}
+
+bff.localhost:8443 {
+	tls /certs/server.crt /certs/server.key
+	reverse_proxy weaveauth:8080
+}

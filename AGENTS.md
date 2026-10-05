@@ -200,11 +200,17 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   dependency), and only then replies to the browser with one 303 to the caller's
   `redirect_uri`. This relies on backend's `/oauth/authorize` having no interactive
   step.
-- `bff/src/server/api/proxy.rs` — `.fallback(proxy)` in the router: any request not
-  matching `/health` or `/login` is checked against `Config::routes` (longest
+- `bff/src/server/api/proxy.rs` — `.fallback(proxy)` in the router: any request no
+  other route matches is checked against `Config::routes` (longest
   `path_prefix` wins), the session cookie is resolved to an access token via
   `InMemorySessionStorage`, and the request is forwarded to `upstream_url` (prefix
-  stripped) with `Cookie` dropped and `Authorization: Bearer <token>` set. `401` on
+  stripped) with `Authorization: Bearer <token>` plus the client headers in
+  `REQUEST_HEADERS` (just `Content-Type`); everything else (`Cookie`, `Upgrade`, any forwarding
+  header) is dropped, and bff adds no `X-Forwarded-*` of its own, so WebSocket isn't proxied.
+  Responses keep only `RESPONSE_HEADERS` (`Content-Type`, `Content-Disposition`,
+  `Content-Security-Policy`, `Cache-Control`), plus bff's `X-Content-Type-Options: nosniff`
+  and a `Cache-Control: no-store` default (`private` added when the upstream's leaves shared
+  caching open). Non-safe methods need a trusted `Origin` first (`403`). `401` on
   missing/unknown session, `404` on no matching route.
 - `login/src/lib.rs` — thin `app(Config) -> Router`: one `/login` handler that
   redirects into bff's `/login`, plus `ServeDir` over `login/static/`. No PKCE logic
@@ -235,6 +241,8 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   Each plugin hook defaults to its own user (`wa-registration` 1001, `wa-login-claims`
   1002, `wa-email` 1003). `system-tests/docker/Dockerfile.plugin-test` builds on it, adding the probe
   plugin for `system-tests/tests/plugin_privsep_flow.rs`.
+- `local-prod/` — docker compose that runs the image as one container under `prod`; only the
+  TLS proxy (Caddy) is on the public network; throwaway local CA from `gen-certs.sh`.
 
 ## Conventions
 
@@ -274,7 +282,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   with (the static-dir root is baked from `CARGO_MANIFEST_DIR` at compile time).
 - Deployer-replaceable templates live in the top-level `templates/` (`pages/` for login, `emails/` for backend's
   email). Both crates bake the path as `<crate>/../templates/...` at compile time, so Docker must copy
-  `/app/templates` and keep `/app/login` present. Never put templates back under a crate directory.
+  `/app/templates` and keep `/app/login` and `/app/backend` present (the image copies an
+  empty `/app/backend` for this; without it backend can't resolve `../templates` and won't
+  boot). Never put templates back under a crate directory.
 - If a backend or bff route is added, update the route table in `README.md`.
 - Backend must never be deployed with a public-facing listener/ingress — only bff and
   login are meant to be internet-exposed; a trusted internal service may reach backend

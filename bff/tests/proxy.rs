@@ -1,6 +1,6 @@
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path};
+use axum::extract::{ConnectInfo, Path, Query};
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -10,7 +10,7 @@ use tower::ServiceExt;
 use weaveauth_bff::config::{Config, RouteConfig};
 use weaveauth_bff::server::app;
 
-/// tower_governor's `PeerIpKeyExtractor` reads `ConnectInfo<SocketAddr>`,
+/// The rate limiter's key extractor reads `ConnectInfo<SocketAddr>`,
 /// which `axum::serve` only populates via `into_make_service_with_connect_info`
 /// -- these tests call the router directly via `oneshot`, so it has to be
 /// inserted by hand.
@@ -41,6 +41,8 @@ fn test_config(backend_url: String, routes: Vec<RouteConfig>) -> Config {
         routes,
         trusted_origins: vec!["http://login.test".into()],
         rate_limit_max_attempts: 1000,
+        rate_limit_proxy_max_attempts: 1000,
+        trusted_proxies: vec![],
         docs_enabled: false,
         login_public_url: "http://login.test".into(),
     }
@@ -166,24 +168,73 @@ async fn stub_backend_with_expiry(
 async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let router = Router::new().route(
-        "/whoami/{id}",
-        get(
-            |Path(id): Path<String>, headers: axum::http::HeaderMap| async move {
-                let auth = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let has_cookie = headers.contains_key("cookie");
-                format!("id={id} auth={auth} cookie={has_cookie}")
-            },
-        ),
-    );
+    let router = Router::new()
+        .route(
+            "/whoami/{id}",
+            get(
+                |Path(id): Path<String>, headers: axum::http::HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let has_cookie = headers.contains_key("cookie");
+                    format!("id={id} auth={auth} cookie={has_cookie}")
+                },
+            ),
+        )
+        .route(
+            "/headers",
+            get(echo_headers).post(echo_headers).options(echo_headers),
+        )
+        .route(
+            "/cache-control",
+            get(
+                |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    ([("cache-control", query["value"].clone())], "body")
+                },
+            ),
+        )
+        .route(
+            "/every-header",
+            get(|| async {
+                (
+                    [
+                        ("content-type", "text/plain"),
+                        ("content-disposition", "attachment"),
+                        ("content-security-policy", "sandbox"),
+                        ("cache-control", "private"),
+                        ("x-content-type-options", "bogus"),
+                        ("set-cookie", "wa_session=fixated; Path=/"),
+                        ("clear-site-data", "\"cookies\""),
+                        ("service-worker-allowed", "/"),
+                        (
+                            "strict-transport-security",
+                            "max-age=63072000; includeSubDomains",
+                        ),
+                        ("alt-svc", "h3=\"evil.test:443\""),
+                        ("x-upstream", "anything"),
+                    ],
+                    "body",
+                )
+            }),
+        );
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     Ok((format!("http://{addr}"), handle))
+}
+
+async fn echo_headers(
+    headers: axum::http::HeaderMap,
+) -> Json<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut seen = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in &headers {
+        seen.entry(name.to_string())
+            .or_default()
+            .push(value.to_str().unwrap_or("<binary>").to_string());
+    }
+    Json(seen)
 }
 
 fn extract_session_cookie(set_cookie: &str) -> String {
@@ -378,6 +429,7 @@ async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
         .oneshot(with_test_peer(
             Request::post("/api/echo")
                 .header("cookie", &cookie)
+                .header("origin", "http://login.test")
                 .body(Body::from("hello upstream"))?,
         ))
         .await?;
@@ -425,27 +477,25 @@ async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
 #[tokio::test]
 async fn proxy_rate_limit_is_independent_from_the_auth_bucket() -> anyhow::Result<()> {
     // Hammering the proxy fallback shouldn't burn /login's budget, and vice
-    // versa -- they're two separate buckets, not one shared across all routes.
+    // versa -- they're separate buckets, each sized by its own setting.
     let (backend, _bh) = stub_backend().await?;
     let mut config = test_config(backend, vec![]);
     config.rate_limit_max_attempts = 1;
+    config.rate_limit_proxy_max_attempts = 2;
     let app = app(config).unwrap();
 
-    let first_proxy_hit = app
-        .clone()
-        .oneshot(with_test_peer(
-            Request::get("/no-such-route").body(Body::empty())?,
-        ))
-        .await?;
-    assert_eq!(first_proxy_hit.status(), StatusCode::NOT_FOUND);
-
-    let second_proxy_hit = app
-        .clone()
-        .oneshot(with_test_peer(
-            Request::get("/another-no-such-route").body(Body::empty())?,
-        ))
-        .await?;
-    assert_eq!(second_proxy_hit.status(), StatusCode::TOO_MANY_REQUESTS);
+    let proxy_hit = || async {
+        let resp = app
+            .clone()
+            .oneshot(with_test_peer(
+                Request::get("/no-such-route").body(Body::empty())?,
+            ))
+            .await?;
+        anyhow::Ok(resp.status())
+    };
+    assert_eq!(proxy_hit().await?, StatusCode::NOT_FOUND);
+    assert_eq!(proxy_hit().await?, StatusCode::NOT_FOUND);
+    assert_eq!(proxy_hit().await?, StatusCode::TOO_MANY_REQUESTS);
 
     // The proxy bucket being exhausted doesn't touch /login's separate one.
     let login_resp = app.oneshot(login_request("http://admin.test/")?).await?;
@@ -665,5 +715,178 @@ async fn unparseable_refresh_response_is_bad_gateway() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    Ok(())
+}
+
+/// Sends `req` (with the session cookie added) through a proxy app routing
+/// `/api` to the stub upstream, returning the response.
+async fn through_proxy(
+    req: axum::http::request::Builder,
+) -> anyhow::Result<axum::response::Response> {
+    let (backend, _bh) = stub_backend().await?;
+    let (upstream, _uh) = stub_upstream().await?;
+    let app = app(test_config(
+        backend.clone(),
+        vec![RouteConfig {
+            path_prefix: "/api".into(),
+            upstream_url: upstream,
+        }],
+    ))
+    .unwrap();
+    let cookie = seeded_cookie(app.clone(), &backend).await?;
+    let req = req.header("cookie", &cookie).body(Body::empty())?;
+    Ok(app.oneshot(with_test_peer(req)).await?)
+}
+
+#[tokio::test]
+async fn only_allowlisted_headers_and_the_bearer_token_reach_the_upstream() -> anyhow::Result<()> {
+    let mut req = Request::get("/api/headers");
+    for (name, value) in [
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+        ("user-agent", "test"),
+        ("x-request-id", "req-1"),
+        ("x-forwarded-for", "6.6.6.6"),
+        ("forwarded", "for=6.6.6.6"),
+        ("x-forwarded-host", "evil.test"),
+        ("x-real-ip", "6.6.6.6"),
+        ("x-original-url", "/admin"),
+        ("authorization", "Bearer forged"),
+        ("connection", "Upgrade, authorization, content-type"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ("sec-websocket-version", "13"),
+    ] {
+        req = req.header(name, value);
+    }
+    let resp = through_proxy(req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let seen: std::collections::BTreeMap<String, Vec<String>> = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        seen.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["authorization", "content-type", "host"]
+    );
+    assert_eq!(seen["authorization"], ["Bearer stub-access-token"]);
+    assert_eq!(seen["content-type"], ["application/json"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_post_from_a_trusted_origin_or_bff_itself_is_forwarded() -> anyhow::Result<()> {
+    for origin in ["http://login.test", "http://bff.test"] {
+        let resp = through_proxy(Request::post("/api/headers").header("origin", origin)).await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{origin}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_post_from_another_origin_is_forbidden() -> anyhow::Result<()> {
+    let resp =
+        through_proxy(Request::post("/api/headers").header("origin", "https://evil.test")).await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp =
+        through_proxy(Request::post("/api/headers").header("referer", "https://evil.test/page"))
+            .await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_non_safe_method_naming_no_origin_is_forbidden() -> anyhow::Result<()> {
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let resp = through_proxy(Request::builder().method(method).uri("/api/headers")).await?;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn safe_methods_need_no_origin() -> anyhow::Result<()> {
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let resp = through_proxy(Request::builder().method(method).uri("/api/headers")).await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{method}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_allowlisted_upstream_headers_reach_the_browser() -> anyhow::Result<()> {
+    let resp = through_proxy(Request::get("/api/every-header")).await?;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut names: Vec<_> = resp.headers().keys().map(|name| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "cache-control",
+            "content-disposition",
+            "content-security-policy",
+            "content-type",
+            "x-content-type-options",
+        ]
+    );
+    assert_eq!(resp.headers()["cache-control"], "private");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    assert_eq!(&body[..], b"body");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_proxied_response_without_caching_rules_is_not_stored() -> anyhow::Result<()> {
+    let resp = through_proxy(Request::get("/api/headers")).await?;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    Ok(())
+}
+
+/// The `Cache-Control` the browser gets when the upstream sends `upstream`.
+async fn cache_control_through_proxy(upstream: &str) -> anyhow::Result<String> {
+    let uri = format!(
+        "/api/cache-control?value={}",
+        percent_encoding::utf8_percent_encode(upstream, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let resp = through_proxy(Request::get(uri)).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let values: Vec<&str> = resp
+        .headers()
+        .get_all("cache-control")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<_, _>>()?;
+    Ok(values.join(", "))
+}
+
+#[tokio::test]
+async fn a_cacheable_proxied_response_is_kept_out_of_shared_caches() -> anyhow::Result<()> {
+    for upstream in [
+        "max-age=60",
+        "max-age=60, must-revalidate",
+        "max-age=60, private=\"x-foo\"",
+    ] {
+        assert_eq!(
+            cache_control_through_proxy(upstream).await?,
+            format!("{upstream}, private")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_upstream_that_settles_shared_caching_is_left_alone() -> anyhow::Result<()> {
+    for upstream in [
+        "public, max-age=60",
+        "max-age=60, S-MAXAGE=30",
+        "private",
+        "no-store",
+    ] {
+        assert_eq!(cache_control_through_proxy(upstream).await?, upstream);
+    }
     Ok(())
 }
