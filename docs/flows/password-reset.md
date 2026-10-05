@@ -254,7 +254,7 @@ backend's confirm itself has to do the same with the returned `user_id`.
 | Mail scanners following the link | Opening the page has no side effect; only the form POST spends the token. |
 | Brute-forcing or dumping tokens | 256-bit CSPRNG token; stored only as `sha256(token)`. |
 | Two confirms racing with one token | `take_reset_token` removes the entry atomically. |
-| Email bombing | Silent 60s per-user cooldown plus bff's per-IP rate limit. Backend refuses to start with a cooldown <= 0, since it also caps the live tokens per user. |
+| Email bombing | Silent 60s per-user cooldown plus bff's [per-client rate limit](../../README.md#bff-routes). Backend refuses to start with a cooldown <= 0, since it also caps the live tokens per user. |
 | Re-requesting to kill the owner's link | Earlier links stay valid; redeeming any one spends them all. |
 | A weak password spending the token | The password policy runs before the token is taken. |
 | Empty or huge password via the API | `validate_new_password`: >= 8 characters, <= 1024 bytes (bounds Argon2 work). |
@@ -284,7 +284,7 @@ backend's confirm itself has to do the same with the returned `user_id`.
 Unsalted SHA-256 is fine here: the input is 256 bits of CSPRNG output, so there
 is nothing to brute-force, and the lookup has to be deterministic.
 
-The cooldown is per user and silent. bff's per-IP rate limit covers both routes
+The cooldown is per user and silent. bff's [per-client rate limit](../../README.md#bff-routes) covers both routes
 (the auth bucket). An attacker can still mail the owner a fresh link once a
 minute, but that doesn't invalidate the link the owner already has: every link
 stays good until it expires or the owner redeems one. A leaked older link is no

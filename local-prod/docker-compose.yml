@@ -1,0 +1,78 @@
+# The shipped image, as one container under the prod profile, behind TLS.
+# Run ./gen-certs.sh once first. See README.md.
+#
+#   host 127.0.0.1:8443 ── caddy ──(edge)── weaveauth (bff 8080, login 8081, backend 1983)
+#                                               └──(internal)── mail (SMTP, STARTTLS required)
+#   host 127.0.0.1:8025 ──(mail-ui)── mail (web UI)
+name: weaveauth-local-prod
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+    networks:
+      public:
+      edge:
+        # Pinned: bff trusts X-Forwarded-For from this address only.
+        ipv4_address: 172.30.0.2
+    depends_on: [weaveauth]
+
+  weaveauth:
+    image: weaveauth
+    build:
+      context: ..
+    init: true
+    restart: unless-stopped
+    read_only: true
+    # ponytail: no plugins here; mounting one needs SETUID/SETGID back (docs/plugins.md#deploying).
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      WA_PROFILE: prod
+      WA_BFF_URL: https://bff.localhost:8443
+      WA_LOGIN_PUBLIC_URL: https://login.localhost:8443
+      # Also the issuer (`iss`): services on `internal` discover the signing keys from it.
+      WA_BACKEND_URL: http://weaveauth:1983
+      WA_CONFIG_FILE: /etc/weaveauth/config.yaml
+      WA_TRUSTED_PROXIES: 172.30.0.2
+      # Only the local CA: the container's sole outbound TLS peer is `mail`.
+      SSL_CERT_FILE: /etc/weaveauth/ca.crt
+    volumes:
+      - ./config.yaml:/etc/weaveauth/config.yaml:ro
+      - ./certs/ca.crt:/etc/weaveauth/ca.crt:ro
+    # All three ports answer on both networks: caddy and mail can reach backend (1983) too.
+    networks: [edge, internal]
+    depends_on: [mail]
+
+  mail:
+    image: axllent/mailpit:v1.31
+    restart: unless-stopped
+    environment:
+      MP_SMTP_TLS_CERT: /certs/server.crt
+      MP_SMTP_TLS_KEY: /certs/server.key
+      MP_SMTP_REQUIRE_STARTTLS: "true"
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:8025:8025"
+    networks: [internal, mail-ui]
+
+networks:
+  public: {}
+  # internal: true = no route out and no published ports.
+  edge:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          # Dynamic addresses come from the upper half, so caddy's pinned .2 is never taken.
+          ip_range: 172.30.0.128/25
+  internal:
+    internal: true
+  # Only so the mail UI can be published to the host; nothing else joins it.
+  mail-ui: {}

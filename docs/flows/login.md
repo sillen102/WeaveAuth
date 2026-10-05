@@ -28,7 +28,7 @@ sequenceDiagram
     participant B as backend
 
     U->>F: POST /login {email, password, redirect_uri, next}
-    Note over F: require_trusted_origin (403 if untrusted), per-IP rate limit
+    Note over F: require_trusted_origin (403 if untrusted), per-client rate limit
     F->>B: POST /oauth/login {email, password}
     Note over B: verify hash (dummy hash for unknown email),<br/>upgrade bcrypt to argon2 if needed
     alt wrong password or unknown email
@@ -143,6 +143,6 @@ written by this app.
 ## Known gaps
 
 - **No rate limiting on `/oauth/login`** itself (bff's `/login` has
-  `WA_RATE_LIMIT_*`-configured per-IP limiting; backend's own endpoint, reachable
+  the `WA_RATE_LIMIT_MAX_ATTEMPTS`-configured [per-client rate limit](../../README.md#bff-routes); backend's own endpoint, reachable
   directly by anything on the internal network, does not).
 - **No legacy-user import endpoint** -- see above.

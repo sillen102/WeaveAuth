@@ -38,6 +38,7 @@ RUN printf '%s\n' \
         'wa-registration:x:1001:' \
         'wa-login-claims:x:1002:' \
         'wa-email:x:1003:' > /etc/group.runtime
+RUN mkdir /empty
 
 # Stage 2: Runtime. No shell and no package manager; backend execs plugin
 # binaries directly, so none is needed.
@@ -53,8 +54,10 @@ COPY --from=builder /app/target/release/weaveauth-launcher /usr/local/bin/weavea
 COPY --from=builder /app/target/release/weaveauth-plugin-exec /usr/local/bin/weaveauth-plugin-exec
 COPY --from=builder /app/login/static /app/login/static
 # Deployer-replaceable templates: pages/ (login, register, ...) and emails/. Both services
-# read them from here (baked in at build time as /app/<crate>/../templates).
+# read them from here (baked in at build time as /app/<crate>/../templates), so
+# /app/backend must exist (empty) for the `..` to resolve.
 COPY --from=builder /app/templates /app/templates
+COPY --from=builder /empty /app/backend
 ENV WA_SETUID_HELPER=/usr/local/bin/weaveauth-plugin-exec
 USER weaveauth
 EXPOSE 1983 8080 8081

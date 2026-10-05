@@ -13,6 +13,8 @@ fn docs_config() -> Config {
         routes: vec![],
         trusted_origins: vec![],
         rate_limit_max_attempts: 1000,
+        rate_limit_proxy_max_attempts: 1000,
+        trusted_proxies: vec![],
         docs_enabled: true,
         login_public_url: "http://login.test".into(),
     }

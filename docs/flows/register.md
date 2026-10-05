@@ -29,7 +29,7 @@ sequenceDiagram
     participant M as Mail handler
 
     U->>F: POST /register {email, password, redirect_uri, next, ...extra}
-    Note over F: require_trusted_origin (403 if untrusted), per-IP rate limit
+    Note over F: require_trusted_origin (403 if untrusted), per-client rate limit
     F->>B: POST /register {email, password, ...extra}
     Note over B: bound extra fields, validate email, password policy,<br/>argon2 hash, generate user_id
     opt extra fields present
@@ -66,7 +66,8 @@ sequenceDiagram
 - `require_trusted_origin` runs first, before backend is contacted -- an untrusted
   `Origin`/`Referer` gets `403` without spending a round trip. Same login-CSRF concern
   as `/login`.
-- Rate-limited per client IP in the shared auth bucket (`WA_RATE_LIMIT_*`), the same one
+- Rate-limited per client ([bff routes](../../README.md#bff-routes)) in the shared auth bucket
+  (`WA_RATE_LIMIT_MAX_ATTEMPTS`), the same one
   `/login` and the OIDC routes use, so registration spam can't burn the proxy's budget
   or get its own.
 - The form's named fields are `email`, `password`, `redirect_uri` (where the browser

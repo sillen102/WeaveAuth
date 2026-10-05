@@ -18,12 +18,14 @@ fn test_config(backend_url: String) -> Config {
         routes: vec![],
         trusted_origins: vec!["http://login.test".into()],
         rate_limit_max_attempts: 1000,
+        rate_limit_proxy_max_attempts: 1000,
+        trusted_proxies: vec![],
         docs_enabled: false,
         login_public_url: "http://login.test".into(),
     }
 }
 
-/// The rate limiter keys on `ConnectInfo<SocketAddr>`, which `axum::serve`
+/// The rate limiter's key extractor reads `ConnectInfo<SocketAddr>`, which `axum::serve`
 /// only populates via `into_make_service_with_connect_info` -- these tests
 /// call the router directly via `oneshot`, so it has to be inserted by hand.
 fn with_test_peer(mut req: Request<Body>) -> Request<Body> {

@@ -18,12 +18,14 @@ fn test_config(backend_url: String) -> Config {
         routes: vec![],
         trusted_origins: vec!["http://login.test".into()],
         rate_limit_max_attempts: 1000,
+        rate_limit_proxy_max_attempts: 1000,
+        trusted_proxies: vec![],
         docs_enabled: false,
         login_public_url: "http://login.test".into(),
     }
 }
 
-/// tower_governor's `PeerIpKeyExtractor` reads `ConnectInfo<SocketAddr>`,
+/// The rate limiter's key extractor reads `ConnectInfo<SocketAddr>`,
 /// which `axum::serve` only populates via `into_make_service_with_connect_info`
 /// -- these tests call the router directly via `oneshot`, so it has to be
 /// inserted by hand.
@@ -266,6 +268,64 @@ async fn rate_limits_repeated_attempts_from_the_same_ip() -> anyhow::Result<()> 
         )?)
         .await?;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+/// Every test request comes from 127.0.0.1, standing in for the proxy.
+fn register_request_forwarded_for(user: &str, client: &str) -> anyhow::Result<Request<Body>> {
+    let mut req = register_request(
+        user,
+        "http://admin.test/",
+        "http://login.test/register.html",
+    )?;
+    req.headers_mut().insert("x-forwarded-for", client.parse()?);
+    Ok(req)
+}
+
+#[tokio::test]
+async fn clients_behind_a_trusted_proxy_are_rate_limited_separately() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let mut config = test_config(backend);
+    config.rate_limit_max_attempts = 1;
+    config.trusted_proxies = vec!["127.0.0.1/32".parse()?];
+    let app = app(config).unwrap();
+
+    let alice = app
+        .clone()
+        .oneshot(register_request_forwarded_for("alice", "198.51.100.1")?)
+        .await?;
+    assert_eq!(alice.status(), StatusCode::SEE_OTHER);
+
+    let bob = app
+        .clone()
+        .oneshot(register_request_forwarded_for("bob", "198.51.100.2")?)
+        .await?;
+    assert_eq!(bob.status(), StatusCode::SEE_OTHER);
+
+    let same_ip_other_user = app
+        .oneshot(register_request_forwarded_for("carol", "198.51.100.1")?)
+        .await?;
+    assert_eq!(same_ip_other_user.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarded_for_from_an_untrusted_peer_does_not_buy_a_new_budget() -> anyhow::Result<()> {
+    let (backend, _h) = stub_backend().await?;
+    let mut config = test_config(backend);
+    config.rate_limit_max_attempts = 1;
+    let app = app(config).unwrap();
+
+    let first = app
+        .clone()
+        .oneshot(register_request_forwarded_for("alice", "198.51.100.1")?)
+        .await?;
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+
+    let spoofed = app
+        .oneshot(register_request_forwarded_for("bob", "198.51.100.2")?)
+        .await?;
+    assert_eq!(spoofed.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
 }
 

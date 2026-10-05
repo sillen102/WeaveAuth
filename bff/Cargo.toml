@@ -11,7 +11,7 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 aide = { workspace = true, features = ["axum", "axum-form", "scalar"] }
 schemars = { workspace = true }
-axum-reverse-proxy = "2.2"
+axum-reverse-proxy = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true, features = ["derive"] }
@@ -31,7 +31,9 @@ secrecy = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
 figment = { workspace = true, features = ["yaml", "env", "test"] }
 dotenvy = { workspace = true }
-tower_governor = "0.8"
+tower_governor = { workspace = true }
+governor = { workspace = true }
+ipnet = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

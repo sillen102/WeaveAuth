@@ -1,0 +1,10 @@
+# Mounted read-only as WA_CONFIG_FILE, read by both backend and bff. A key only one of them
+# knows is ignored by the other; one both know (`profile`, `port`, `bff_url`, `login_public_url`)
+# applies to both, so a `port:` here would put both on the same port and stop the container.
+# Everything else comes from env in docker-compose.yml.
+email_handler:
+  kind: smtp
+  host: mail
+  port: 1025
+  tls: starttls
+  from: WeaveAuth <no-reply@weaveauth.localhost>

@@ -44,7 +44,7 @@ once it does grow beyond a single module. Request/response struct fields that te
 set directly are declared `pub(super)` (visible to the whole file, including `tests`)
 instead of `pub(crate)` or public -- no need for public constructors or `#[cfg(test)]`-only
 accessors just to be testable. The same goes for private helper functions a sibling `tests`
-module needs to reach, like `proxy.rs`'s `is_hop_by_hop` and `extract_cookie`.
+module needs to reach.
 
 This mirrors the pattern already used elsewhere in the crate for non-endpoint code:
 `config.rs`, `origin_check.rs`, and `storage/in_memory.rs` each keep their own
@@ -101,8 +101,10 @@ Two things about that docs router are load-bearing:
   cheap and repeated by tooling, so sharing the auth bucket would let them starve real
   login/register attempts.
 
-Documented routes share the auth governor instance rather than building their own, so
-pulling an endpoint into its own `ApiRouter` doesn't hand it a second rate-limit budget.
+The buckets are built once, in `RateLimits` (`src/server/rate_limit.rs`), which also holds
+the client-address key extractor. Documented routes share `RateLimits::auth` rather than
+getting their own, so pulling an endpoint into its own `ApiRouter` doesn't hand it a second
+rate-limit budget.
 
 ## Where HTTP-level tests still go
 

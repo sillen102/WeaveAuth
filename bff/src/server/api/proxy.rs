@@ -1,20 +1,23 @@
-pub(crate) use controller::proxy_router;
+pub(crate) use controller::{proxy_router, proxy_trusted_origins};
 
 mod controller {
     use axum::Router;
     use axum::extract::{Request, State};
-    use axum::http::StatusCode;
     use axum::http::header;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use axum::middleware::{self, Next};
     use axum::response::Response;
-    use axum_reverse_proxy::ReverseProxy;
+    use axum_reverse_proxy::{ProxyPolicy, ReverseProxy, XForwardedFor};
     use common::model::token::TokenType;
     use common_macros::ErrorResponses;
     use secrecy::ExposeSecret;
+    use std::sync::Arc;
     use thiserror::Error;
 
+    use crate::config::Config;
     use crate::server::AppState;
     use crate::server::cookie::extract_cookie;
+    use crate::server::origin_check::require_trusted_origin;
 
     use super::service::{self, ProxyServiceError};
 
@@ -30,6 +33,12 @@ mod controller {
             details = "backend returned an unexpected response"
         )]
         BackendUnavailable,
+        #[error("request did not come from a trusted origin")]
+        #[error_response(
+            StatusCode::FORBIDDEN,
+            details = "request did not come from a trusted origin"
+        )]
+        UntrustedOrigin,
     }
 
     impl From<ProxyServiceError> for ProxyError {
@@ -45,16 +54,20 @@ mod controller {
     }
 
     /// One `axum-reverse-proxy` service per configured route, merged, gated by
-    /// session auth. The proxy crate handles path stripping, header/body
-    /// forwarding, and hop-by-hop header removal.
+    /// session auth. The proxy crate handles path stripping and body
+    /// forwarding; bff decides the headers (see [`authenticate`]), so the crate
+    /// must not add forwarding headers of its own.
     pub(crate) fn proxy_router(state: AppState) -> Router {
         let routes = state
             .config
             .routes
             .iter()
             .fold(Router::new(), |router, route| {
-                let upstream: Router =
-                    ReverseProxy::new(&route.path_prefix, &route.upstream_url).into();
+                let upstream: Router = ReverseProxy::new(&route.path_prefix, &route.upstream_url)
+                    .with_policy(
+                        ProxyPolicy::default().with_x_forwarded_for(XForwardedFor::Preserve),
+                    )
+                    .into();
                 router.merge(upstream)
             });
 
@@ -63,13 +76,56 @@ mod controller {
             .fallback(axum::http::StatusCode::NOT_FOUND)
     }
 
-    /// Swaps the session cookie for the upstream `Authorization: Bearer <token>`
-    /// header before handing the request to the reverse proxy.
+    /// The origins trusted to send state-changing proxied requests:
+    /// `trusted_origins` plus bff's own, for a frontend served through bff.
+    pub(crate) fn proxy_trusted_origins(config: &Config) -> anyhow::Result<Arc<[String]>> {
+        let bff_origin = url::Url::parse(&config.bff_url)?
+            .origin()
+            .ascii_serialization();
+        Ok(config
+            .trusted_origins
+            .iter()
+            .cloned()
+            .chain([bff_origin])
+            .collect())
+    }
+
+    /// Client headers an upstream receives, next to bff's `Authorization`.
+    /// `Upgrade` stays out until `needs_trusted_origin` also gates WebSocket
+    /// handshakes, which are `GET`s.
+    const REQUEST_HEADERS: [HeaderName; 1] = [header::CONTENT_TYPE];
+
+    /// Upstream headers the browser receives: ones that only shape that one
+    /// response, which an upstream needs to keep its content from running on
+    /// bff's origin or being cached for someone else. Proxied content shares
+    /// bff's origin, so most others (`Set-Cookie`, `Clear-Site-Data`,
+    /// `Service-Worker-Allowed`, `Strict-Transport-Security`, `Alt-Svc`) would
+    /// act on bff itself, beyond the upstream's `path_prefix`.
+    const RESPONSE_HEADERS: [HeaderName; 4] = [
+        header::CONTENT_TYPE,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_SECURITY_POLICY,
+        header::CACHE_CONTROL,
+    ];
+
+    /// Guards the proxy: requires a trusted origin for anything that can change
+    /// state, sends the upstream [`REQUEST_HEADERS`] plus `Authorization: Bearer
+    /// <token>`, and passes only [`RESPONSE_HEADERS`] back, always with
+    /// `X-Content-Type-Options: nosniff` and the caching rules of
+    /// [`keep_out_of_shared_caches`].
     async fn authenticate(
         State(mut state): State<AppState>,
         mut req: Request,
         next: Next,
     ) -> Result<Response, ProxyError> {
+        if needs_trusted_origin(req.method()) {
+            require_trusted_origin(req.headers(), &state.proxy_trusted_origins).map_err(
+                |error| {
+                    tracing::warn!(%error, "proxied request rejected");
+                    ProxyError::UntrustedOrigin
+                },
+            )?;
+        }
         let session_id = extract_cookie(req.headers(), &state.config.session_cookie_name)
             .ok_or(ProxyServiceError::Unauthenticated)?;
         let access_token = service::resolve_bearer_token(&mut state, &session_id).await?;
@@ -80,10 +136,74 @@ mod controller {
                 tracing::warn!(%error, "session access token is not a valid header value");
                 ProxyServiceError::Unauthenticated
             })?;
-        req.headers_mut().remove(header::COOKIE);
-        req.headers_mut().insert(header::AUTHORIZATION, auth_value);
+        let mut upstream = allowed(req.headers(), &REQUEST_HEADERS);
+        upstream.insert(header::AUTHORIZATION, auth_value);
+        *req.headers_mut() = upstream;
 
-        Ok(next.run(req).await)
+        let mut response = next.run(req).await;
+        let headers = response.headers_mut();
+        *headers = allowed(headers, &RESPONSE_HEADERS);
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+        keep_out_of_shared_caches(headers);
+        Ok(response)
+    }
+
+    /// `Cache-Control` directives that settle whether a shared cache may store
+    /// a response to an `Authorization` request. Stricter than RFC 9111 §3.5:
+    /// `must-revalidate` is left out, as upstreams send it on per-user data to
+    /// mean "revalidate when stale".
+    const SHARED_CACHE_DIRECTIVES: [&str; 4] = ["public", "s-maxage", "private", "no-store"];
+
+    /// A cache in front of bff sees a cookie, not the `Authorization` the upstream
+    /// answered, so it would store per-user responses RFC 9111 §3.5 keeps out of
+    /// shared caches. No `Cache-Control` becomes `no-store`; one naming none of
+    /// [`SHARED_CACHE_DIRECTIVES`] gets `private` added. A field-qualified
+    /// `private="…"` doesn't count: it keeps only the named fields out of shared
+    /// caches (RFC 9111 §5.2.2.7).
+    fn keep_out_of_shared_caches(headers: &mut HeaderMap) {
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return;
+        }
+        let settled = headers
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            // ponytail: no quoted strings; `no-cache="a, private, b"` reads as a bare `private`.
+            .flat_map(|value| value.split(','))
+            .map(|directive| match directive.split_once('=') {
+                Some((name, _)) => (name.trim(), true),
+                None => (directive.trim(), false),
+            })
+            .filter(|(name, has_argument)| !(*has_argument && name.eq_ignore_ascii_case("private")))
+            .any(|(name, _)| {
+                SHARED_CACHE_DIRECTIVES
+                    .iter()
+                    .any(|known| name.eq_ignore_ascii_case(known))
+            });
+        if !settled {
+            headers.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+        }
+    }
+
+    fn allowed(headers: &HeaderMap, names: &[HeaderName]) -> HeaderMap {
+        let mut kept = HeaderMap::new();
+        for name in names {
+            for value in headers.get_all(name) {
+                kept.append(name.clone(), value.clone());
+            }
+        }
+        kept
+    }
+
+    /// The browser attaches the session cookie to any same-site request, and
+    /// bff turns it into a bearer token upstreams trust. So a non-safe method
+    /// must come from a trusted origin, as `/login` must.
+    fn needs_trusted_origin(method: &Method) -> bool {
+        !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
     }
 }
 
@@ -235,6 +355,8 @@ mod tests {
             routes: vec![],
             trusted_origins: vec![],
             rate_limit_max_attempts: 1000,
+            rate_limit_proxy_max_attempts: 1000,
+            trusted_proxies: vec![],
             docs_enabled: false,
             login_public_url: "http://login.test".into(),
         })

@@ -272,6 +272,8 @@ mod tests {
             routes: vec![],
             trusted_origins,
             rate_limit_max_attempts: 1000,
+            rate_limit_proxy_max_attempts: 1000,
+            trusted_proxies: vec![],
             docs_enabled: false,
             login_public_url: "http://login.test".into(),
         })

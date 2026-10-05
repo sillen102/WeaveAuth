@@ -122,7 +122,7 @@ applies.
 **4. Entering the code (`POST /verify-email`, bff).** Form `{code, redirect_uri, next}`.
 
 - `require_trusted_origin`, then `next` must be a same-origin path or a trusted origin
-  (`is_safe_redirect_target`, `400` otherwise), then the shared per-IP auth rate limit.
+  (`is_safe_redirect_target`, `400` otherwise), then the shared per-client auth rate limit ([bff routes](../../README.md#bff-routes)).
 - No `wa_verify_session` cookie: `303` to `next?status=session_expired` (the page then asks the
   user to sign in again, which issues a new session).
 - Otherwise bff sends `{verification_session, code}` to backend's
@@ -191,7 +191,7 @@ not merely slow.
 
 **The limits.** All live in `UserCodes` (`storage/in_memory.rs`), kept **per user** rather than
 per code, IP or session: a code being used up doesn't reset them, rotating IPs doesn't get round
-bff's per-IP rate limit, and signing in again for a fresh verification session doesn't help.
+bff's [per-client rate limit](../../README.md#bff-routes), and signing in again for a fresh verification session doesn't help.
 
 - A code survives **5 wrong attempts**; the fifth deletes it (`code_used_up`).
 - A new code isn't issued within the **resend cooldown** of the last one (default 60s), however
@@ -263,6 +263,6 @@ could ride the victim's own verification into a shared account.
   A durable implementation is a new impl of the same traits.
 - The `wa_verify_session` cookie must reach bff from the login page's form. It is cross-site
   capable on https; on plain http, login and bff have to be same-site (as in local dev).
-- There is no rate limit on backend's endpoints themselves, only on bff's per IP; the per-user
+- There is no rate limit on backend's endpoints themselves, only bff's [per-client one](../../README.md#bff-routes); the per-user
   limits are the 5-attempt cap, the resend cooldown and the escalating lockout after 10 wrong
   guesses (constants in `storage/in_memory.rs`, not configurable yet).

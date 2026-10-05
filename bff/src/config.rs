@@ -1,5 +1,8 @@
 use common::config::{EnvTable, Profile, PublicUrl};
-use serde::{Deserialize, Serialize};
+use ipnet::{IpNet, Ipv4Net};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteConfig {
@@ -28,11 +31,21 @@ pub struct Config {
     /// auto-submit one and log a victim into an attacker-controlled account
     /// ("login CSRF"). Unset: just `login_public_url`.
     pub trusted_origins: Vec<String>,
-    /// Max `/login` or `/register` attempts a single client IP gets within
-    /// [`RATE_LIMIT_WINDOW_SECS`], independently for each endpoint -- Argon2 raises
-    /// the cost of a single guess, but doesn't stop a flood of guesses or
-    /// registration spam on its own. Unset: 10 for prod, 100 for dev.
+    /// Burst size of the auth and docs rate-limit buckets (see `RateLimits`), per
+    /// client and replenished over [`RATE_LIMIT_WINDOW_SECS`]. `0` stops startup;
+    /// above 60000 it refills like 60000 (the refill interval bottoms out at 1ms).
+    /// Argon2 raises the cost of a single guess, but doesn't stop a flood of
+    /// guesses or registration spam on its own. Unset: 10 for prod, 100 for dev.
     pub rate_limit_max_attempts: u32,
+    /// Burst size of the proxy rate-limit bucket, per client, replenished over
+    /// [`RATE_LIMIT_WINDOW_SECS`]; every proxied call draws from it. `0` stops
+    /// startup. Unset: 600 for prod, 6000 for dev.
+    pub rate_limit_proxy_max_attempts: u32,
+    /// Reverse proxies (addresses or CIDR ranges) whose `X-Forwarded-For` the
+    /// rate limiter believes. Empty: every client is keyed on its peer (IPv6:
+    /// its /64), so behind a proxy all of them share the proxy's budget.
+    #[serde(deserialize_with = "ip_nets")]
+    pub trusted_proxies: Vec<IpNet>,
     /// Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`).
     /// Unset: on for dev only. bff is the internet-facing service, and these
     /// are unauthenticated endpoints describing the auth surface, so a
@@ -55,12 +68,14 @@ impl Default for Config {
             routes: Vec::new(),
             trusted_origins: vec!["http://localhost:8081".to_string()],
             rate_limit_max_attempts: 10,
+            rate_limit_proxy_max_attempts: 600,
+            trusted_proxies: Vec::new(),
             docs_enabled: false,
         }
     }
 }
 
-/// The scalar settings that have an env var; `WA_TRUSTED_ORIGINS` is a list.
+/// The scalar settings that have an env var; the ones in [`ENV_LISTS`] are lists.
 const ENV: EnvTable = &[
     ("WA_PROFILE", "profile"),
     ("WA_BFF_PORT", "port"),
@@ -72,7 +87,10 @@ const ENV: EnvTable = &[
     ("WA_DOCS_ENABLED", "docs_enabled"),
 ];
 
-const ENV_LISTS: EnvTable = &[("WA_TRUSTED_ORIGINS", "trusted_origins")];
+const ENV_LISTS: EnvTable = &[
+    ("WA_TRUSTED_ORIGINS", "trusted_origins"),
+    ("WA_TRUSTED_PROXIES", "trusted_proxies"),
+];
 
 impl Config {
     /// Whether cookies should carry the `Secure` flag -- derived from `bff_url`
@@ -103,6 +121,26 @@ impl Config {
                 ),
             ],
         )?;
+        if config.rate_limit_max_attempts == 0 {
+            anyhow::bail!(
+                "WA_RATE_LIMIT_MAX_ATTEMPTS (rate_limit_max_attempts) must be at least 1"
+            );
+        }
+        if config.rate_limit_proxy_max_attempts == 0 {
+            anyhow::bail!("rate_limit_proxy_max_attempts must be at least 1");
+        }
+        if profile == Profile::Prod
+            && let Some(too_wide) = config
+                .trusted_proxies
+                .iter()
+                .find(|net| too_wide_to_trust(net))
+        {
+            anyhow::bail!(
+                "WA_TRUSTED_PROXIES (trusted_proxies) contains {too_wide}, wider than IPv4 /8 or IPv6 /32, which \
+                 would let clients in it pick their own rate-limit key; list the proxies' own \
+                 addresses"
+            );
+        }
         // Compared verbatim with browsers' `Origin` header, which has no trailing `/`.
         config.login_public_url = config.login_public_url.trim_end_matches('/').to_string();
 
@@ -112,11 +150,51 @@ impl Config {
         if !user.contains("rate_limit_max_attempts") && profile == Profile::Dev {
             config.rate_limit_max_attempts = 100;
         }
+        if !user.contains("rate_limit_proxy_max_attempts") && profile == Profile::Dev {
+            config.rate_limit_proxy_max_attempts = 6000;
+        }
         if !user.contains("docs_enabled") {
             config.docs_enabled = profile == Profile::Dev;
         }
 
         Ok(config)
+    }
+}
+
+/// Accepts a bare address as a single-host network, which `IpNet` alone refuses.
+fn ip_nets<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<IpNet>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .iter()
+        .map(|entry| {
+            entry
+                .parse::<IpNet>()
+                .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                .map(v4_mapped_as_v4)
+                .map_err(|_| D::Error::custom(format!("not an IP address or CIDR: {entry:?}")))
+        })
+        .collect()
+}
+
+/// The rate limiter compares canonical (IPv4) client addresses, which an
+/// `::ffff:a.b.c.d` network would never contain.
+fn v4_mapped_as_v4(net: IpNet) -> IpNet {
+    match net {
+        IpNet::V6(v6) if v6.prefix_len() >= 96 => v6
+            .addr()
+            .to_ipv4_mapped()
+            .and_then(|v4| Ipv4Net::new(v4, v6.prefix_len() - 96).ok())
+            .map_or(net, IpNet::V4),
+        _ => net,
+    }
+}
+
+/// Whether `prod` refuses this `trusted_proxies` entry: wider than IPv4 /8 or
+/// IPv6 /32. A typo guard against ranges like `0.0.0.0/1`; it doesn't check
+/// that a range is private (IPv6's ULA range, `fc00::/7`, is refused too).
+fn too_wide_to_trust(net: &IpNet) -> bool {
+    match net {
+        IpNet::V4(v4) => v4.prefix_len() < 8,
+        IpNet::V6(v6) => v6.prefix_len() < 32,
     }
 }
 
@@ -260,6 +338,141 @@ trusted_origins:
     }
 
     #[test]
+    fn trusted_proxies_take_cidrs_and_bare_addresses() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_TRUSTED_PROXIES", "10.0.0.0/8, 172.30.0.2, ::1");
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.trusted_proxies,
+                vec![
+                    "10.0.0.0/8".parse::<IpNet>().unwrap(),
+                    "172.30.0.2/32".parse().unwrap(),
+                    "::1/128".parse().unwrap(),
+                ]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn v4_mapped_trusted_proxies_are_stored_as_v4() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env(
+                "WA_TRUSTED_PROXIES",
+                "::ffff:172.30.0.2, ::ffff:10.0.0.0/104",
+            );
+
+            let config = Config::load().unwrap();
+            assert_eq!(
+                config.trusted_proxies,
+                vec![
+                    "172.30.0.2/32".parse::<IpNet>().unwrap(),
+                    "10.0.0.0/8".parse().unwrap(),
+                ]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_refuses_trusted_proxy_ranges_wider_than_v4_8_or_v6_32() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            for too_wide in ["10.0.0.0/8, ::/0", "0.0.0.0/1, 128.0.0.0/1", "2001::/31"] {
+                jail.set_env("WA_TRUSTED_PROXIES", too_wide);
+                let error = Config::load().unwrap_err().to_string();
+                assert!(error.contains("WA_TRUSTED_PROXIES"), "{too_wide}: {error}");
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_accepts_a_trusted_proxy_range() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            jail.set_env("WA_TRUSTED_PROXIES", "10.0.0.0/8, 2001:db8::/32");
+
+            assert!(Config::load().is_ok());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn dev_allows_trusting_every_address() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_TRUSTED_PROXIES", "0.0.0.0/0");
+
+            assert!(Config::load().is_ok());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_rate_limit_of_zero_stops_startup() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_RATE_LIMIT_MAX_ATTEMPTS", "0");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_RATE_LIMIT_MAX_ATTEMPTS"), "{error}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_proxy_rate_limit_of_zero_stops_startup() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "rate_limit_proxy_max_attempts: 0\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("rate_limit_proxy_max_attempts"), "{error}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_proxy_rate_limit_is_set_apart_from_the_auth_one() {
+        Jail::expect_with(|jail| {
+            jail.create_file("config.yaml", "rate_limit_proxy_max_attempts: 42\n")?;
+            jail.set_env("WA_CONFIG_FILE", "config.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.rate_limit_proxy_max_attempts, 42);
+            assert_eq!(config.rate_limit_max_attempts, 100);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_trusted_proxy_that_is_not_an_address_stops_startup() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_TRUSTED_PROXIES", "caddy");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("caddy"), "{error}");
+            Ok(())
+        });
+    }
+
+    #[test]
     fn trusted_origins_defaults_to_login_public_url_when_unset() {
         Jail::expect_with(|jail| {
             jail.set_env("WA_PROFILE", "dev");
@@ -354,6 +567,7 @@ trusted_origins:
 
             let config = Config::load().unwrap();
             assert_eq!(config.rate_limit_max_attempts, 100);
+            assert_eq!(config.rate_limit_proxy_max_attempts, 6000);
             assert!(config.docs_enabled);
             Ok(())
         });
