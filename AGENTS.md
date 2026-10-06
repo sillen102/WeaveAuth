@@ -211,7 +211,10 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   `Content-Security-Policy`, `Cache-Control`), plus bff's `X-Content-Type-Options: nosniff`
   and a `Cache-Control: no-store` default (`private` added when the upstream's leaves shared
   caching open). Non-safe methods need a trusted `Origin` first (`403`). `401` on
-  missing/unknown session, `404` on no matching route.
+  missing/unknown session, `404` on no matching route. The routes sit inside a `tower-http`
+  `CorsLayer` for the same trusted origins (credentials, `REQUEST_HEADERS` only), outermost
+  (above the governor). `tower-http` answers every `OPTIONS` itself, so `OPTIONS` needs no
+  session, isn't rate limited and is never proxied.
 - `login/src/lib.rs` — thin `app(Config) -> Router`: one `/login` handler that
   redirects into bff's `/login`, plus `ServeDir` over `login/static/`. No PKCE logic
   here — that all lives in `bff`. Its one outbound call is bff's `/oidc/providers`, for

@@ -7,7 +7,7 @@ use crate::server::api::{
     oidc::oidc_providers,
     oidc::start_oidc_login,
     password_reset::{confirm_password_reset, request_password_reset},
-    proxy::proxy_router,
+    proxy::{proxy_cors, proxy_router},
     register::{start_register, start_register_doc},
     verify_email::{resend_verification, verify_email},
 };
@@ -56,7 +56,12 @@ pub(crate) fn router(state: AppState) -> Router {
 
     let docs = docs.layer(GovernorLayer::new(limits.docs));
 
-    let proxy_routes = proxy_router(state).layer(GovernorLayer::new(limits.proxy));
+    let cors = proxy_cors(state.proxy_trusted_origins.clone());
+    // CORS above the governor: a 429 stays readable cross-origin, but every `OPTIONS`
+    // is answered by CORS before the session check, the governor and the upstream.
+    let proxy_routes = proxy_router(state)
+        .layer(GovernorLayer::new(limits.proxy))
+        .layer(cors);
 
     let mut app = Router::new()
         .route("/health", get(health))

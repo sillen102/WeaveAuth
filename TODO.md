@@ -19,14 +19,6 @@
       behaviour; bff would check that header itself, so it stays out of `REQUEST_HEADERS`.
       Lower priority than the items above -- the two
       mitigations hold today.
-- [ ] **CORS on the proxy.** bff is meant to sit behind a browser frontend, but it answers no
-      CORS: it adds no `Access-Control-Allow-*` headers, drops `Origin` and
-      `Access-Control-Request-*` before forwarding (so an upstream can't answer either), and a
-      preflight carries no cookie, so it gets `401`. Only a frontend served through bff itself
-      works today; one on another origin can't read any proxied response or send any preflighted
-      request (`PUT`/`DELETE`/`PATCH`, custom headers). Answer preflights and set
-      `Access-Control-Allow-Origin`/`-Credentials` for `proxy_trusted_origins`, before the session
-      check.
 - [ ] **Per-account login throttle in backend.** bff's rate limit is per client address, so a
       botnet spread over many addresses can still guess one account's password, and anything on
       the internal network that calls backend's `/oauth/login` directly isn't limited at all.
