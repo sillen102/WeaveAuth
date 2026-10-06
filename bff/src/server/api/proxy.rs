@@ -1,4 +1,4 @@
-pub(crate) use controller::{proxy_router, proxy_trusted_origins};
+pub(crate) use controller::{proxy_cors, proxy_router, proxy_trusted_origins};
 
 mod controller {
     use axum::Router;
@@ -12,7 +12,9 @@ mod controller {
     use common_macros::ErrorResponses;
     use secrecy::ExposeSecret;
     use std::sync::Arc;
+    use std::time::Duration;
     use thiserror::Error;
+    use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 
     use crate::config::Config;
     use crate::server::AppState;
@@ -76,7 +78,8 @@ mod controller {
             .fallback(axum::http::StatusCode::NOT_FOUND)
     }
 
-    /// The origins trusted to send state-changing proxied requests:
+    /// The origins trusted to use the proxy from a browser: to send state-changing
+    /// requests and to read its responses cross-origin (see [`proxy_cors`]). That is
     /// `trusted_origins` plus bff's own, for a frontend served through bff.
     pub(crate) fn proxy_trusted_origins(config: &Config) -> anyhow::Result<Arc<[String]>> {
         let bff_origin = url::Url::parse(&config.bff_url)?
@@ -88,6 +91,24 @@ mod controller {
             .cloned()
             .chain([bff_origin])
             .collect())
+    }
+
+    /// CORS for the proxied routes, for exactly `origins` (see
+    /// [`proxy_trusted_origins`]), with credentials. Methods are mirrored from the
+    /// preflight; headers are limited to [`REQUEST_HEADERS`], the only ones bff
+    /// forwards, so the browser fails a request that bff would strip a header from.
+    /// A predicate, so the validated strings need no fallible `HeaderValue` conversion.
+    /// `tower-http` answers every `OPTIONS` itself, trusted `Origin` or not.
+    pub(crate) fn proxy_cors(origins: Arc<[String]>) -> CorsLayer {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                origins.iter().any(|o| o.as_bytes() == origin.as_bytes())
+            }))
+            .allow_credentials(true)
+            .allow_methods(AllowMethods::mirror_request())
+            .allow_headers(REQUEST_HEADERS)
+            .expose_headers([header::CONTENT_DISPOSITION])
+            .max_age(Duration::from_secs(600))
     }
 
     /// Client headers an upstream receives, next to bff's `Authorization`.
@@ -201,7 +222,8 @@ mod controller {
 
     /// The browser attaches the session cookie to any same-site request, and
     /// bff turns it into a bearer token upstreams trust. So a non-safe method
-    /// must come from a trusted origin, as `/login` must.
+    /// must come from a trusted origin, as `/login` must. `OPTIONS` never gets
+    /// here while the CORS layer answers it first; it stays safe in case that changes.
     fn needs_trusted_origin(method: &Method) -> bool {
         !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
     }
@@ -342,9 +364,31 @@ mod tests {
     // end-to-end via `bff/tests/proxy.rs` instead. `refresh_session` has no
     // such constraint and is worth pinning directly: it's the one piece of
     // this file that's a plain, directly-callable async fn.
+    use super::controller::proxy_trusted_origins;
     use super::service::*;
     use crate::config::Config;
     use crate::server::AppState;
+
+    fn trusted(origins: &[&str]) -> anyhow::Result<Vec<String>> {
+        let config = Config {
+            bff_url: "https://bff.test".into(),
+            trusted_origins: origins.iter().map(|o| o.to_string()).collect(),
+            ..Config::default()
+        };
+        Ok(proxy_trusted_origins(&config)?.to_vec())
+    }
+
+    #[test]
+    fn trusted_origins_gain_bffs_own() {
+        assert_eq!(
+            trusted(&["https://app.test", "http://localhost:3000"]).unwrap(),
+            [
+                "https://app.test",
+                "http://localhost:3000",
+                "https://bff.test"
+            ]
+        );
+    }
 
     fn state_with_backend(backend_url: &str) -> AppState {
         AppState::new(Config {

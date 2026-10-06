@@ -16,8 +16,8 @@ pub struct Config {
     /// Bff's own public origin.
     pub bff_url: String,
     pub backend_url: String,
-    /// Login's public origin: the one origin trusted to POST to `/login` and
-    /// `/register` unless `trusted_origins` says otherwise.
+    /// Login's public origin, and the default for `trusted_origins` (see there for what
+    /// that grants).
     pub login_public_url: String,
     pub session_cookie_name: String,
     /// Proxy routes: incoming requests whose path starts with `path_prefix` are
@@ -25,11 +25,13 @@ pub struct Config {
     /// token swapped in as `Authorization: Bearer <token>`, replacing the cookie.
     /// Only configurable via the YAML file -- there's no sane env-var shape for a list.
     pub routes: Vec<RouteConfig>,
-    /// Origins allowed to POST to `/login` and `/register` (checked against the
-    /// request's `Origin` header, falling back to `Referer`) -- these are plain
-    /// cross-origin form POSTs by design, so without this check any site could
-    /// auto-submit one and log a victim into an attacker-controlled account
-    /// ("login CSRF"). Unset: just `login_public_url`.
+    /// Origins trusted by the browser-facing routes: allowed to POST to every form
+    /// route and to send state-changing proxied requests (checked against the
+    /// request's `Origin` header, falling back to `Referer`) -- plain cross-origin
+    /// form POSTs by design, so without this check any site could auto-submit one
+    /// and log a victim into an attacker-controlled account ("login CSRF") -- and
+    /// allowed to read proxied responses cross-origin, with credentials (CORS).
+    /// Bare origins, https under `prod`. Unset: just `login_public_url`.
     pub trusted_origins: Vec<String>,
     /// Burst size of the auth and docs rate-limit buckets (see `RateLimits`), per
     /// client and replenished over [`RATE_LIMIT_WINDOW_SECS`]. `0` stops startup;
@@ -144,8 +146,31 @@ impl Config {
         // Compared verbatim with browsers' `Origin` header, which has no trailing `/`.
         config.login_public_url = config.login_public_url.trim_end_matches('/').to_string();
 
-        if !user.contains("trusted_origins") {
+        let derived = !user.contains("trusted_origins");
+        if derived {
             config.trusted_origins = vec![config.login_public_url.clone()];
+        }
+        let source = if derived {
+            "WA_LOGIN_PUBLIC_URL (login_public_url), which WA_TRUSTED_ORIGINS defaults to,"
+        } else {
+            "WA_TRUSTED_ORIGINS (trusted_origins) entry"
+        };
+        // Each one may read credentialed proxy responses (CORS), so https in prod.
+        for origin in &mut config.trusted_origins {
+            *origin = origin.trim_end_matches('/').to_string();
+            // Compared verbatim with the browser's `Origin`, so it must be in its serialized form.
+            let is_origin = url::Url::parse(origin)
+                .is_ok_and(|url| url.origin().ascii_serialization() == *origin);
+            anyhow::ensure!(
+                is_origin,
+                "{source} {origin:?} must be an origin such as https://app.example.com \
+                 (scheme and host, lowercase, no path, no default port, no *)"
+            );
+            anyhow::ensure!(
+                profile != Profile::Prod || origin.starts_with("https://"),
+                "{source} {origin:?} must be https for the prod profile. \
+                 Set WA_PROFILE=dev for local development"
+            );
         }
         if !user.contains("rate_limit_max_attempts") && profile == Profile::Dev {
             config.rate_limit_max_attempts = 100;
@@ -513,6 +538,84 @@ trusted_origins:
             assert_eq!(
                 Config::load().unwrap().trusted_origins,
                 vec!["https://login.env.test".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_trusted_origin_that_is_not_a_bare_origin_stops_startup_naming_it() {
+        for profile in ["dev", "prod"] {
+            for bad in [
+                "*",
+                "https://app.test/path",
+                "app.test",
+                "https://app.test?x=1",
+                "https://App.test",
+                "https://app.test:443",
+            ] {
+                Jail::expect_with(|jail| {
+                    jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+                    jail.set_env("WA_PROFILE", profile);
+                    jail.set_env("WA_BFF_URL", "https://bff.test");
+                    jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+                    jail.set_env("WA_TRUSTED_ORIGINS", format!("https://ok.test,{bad}"));
+
+                    let error = Config::load().unwrap_err().to_string();
+                    assert!(
+                        error.contains("WA_TRUSTED_ORIGINS") && error.contains(&format!("{bad:?}")),
+                        "{profile} {bad}: {error}"
+                    );
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_login_public_url_is_reported_as_itself_when_trusted_origins_defaults_to_it() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test:443");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("WA_LOGIN_PUBLIC_URL"), "{error}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_refuses_an_http_trusted_origin_naming_it_but_dev_allows_it() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            jail.set_env("WA_TRUSTED_ORIGINS", "https://ok.test,http://app.test");
+
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("\"http://app.test\""), "{error}");
+
+            jail.set_env("WA_PROFILE", "dev");
+            assert!(Config::load().is_ok());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prod_accepts_https_trusted_origins_and_drops_a_trailing_slash() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_CONFIG_FILE", "/nonexistent/path.yaml");
+            jail.set_env("WA_BFF_URL", "https://bff.test");
+            jail.set_env("WA_LOGIN_PUBLIC_URL", "https://login.test");
+            jail.set_env(
+                "WA_TRUSTED_ORIGINS",
+                "https://app.test/, https://other.test",
+            );
+
+            assert_eq!(
+                Config::load().unwrap().trusted_origins,
+                ["https://app.test", "https://other.test"]
             );
             Ok(())
         });

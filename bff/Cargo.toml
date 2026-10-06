@@ -13,7 +13,7 @@ aide = { workspace = true, features = ["axum", "axum-form", "scalar"] }
 schemars = { workspace = true }
 axum-reverse-proxy = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["trace", "cors"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

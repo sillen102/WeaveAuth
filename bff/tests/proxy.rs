@@ -183,10 +183,7 @@ async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)
                 },
             ),
         )
-        .route(
-            "/headers",
-            get(echo_headers).post(echo_headers).options(echo_headers),
-        )
+        .route("/headers", get(echo_headers).post(echo_headers))
         .route(
             "/cache-control",
             get(
@@ -723,6 +720,15 @@ async fn unparseable_refresh_response_is_bad_gateway() -> anyhow::Result<()> {
 async fn through_proxy(
     req: axum::http::request::Builder,
 ) -> anyhow::Result<axum::response::Response> {
+    send_to_app(req, true).await
+}
+
+/// Sends `req` to an app with `/api` routed to the stub upstream, with or without the
+/// session cookie.
+async fn send_to_app(
+    req: axum::http::request::Builder,
+    with_session: bool,
+) -> anyhow::Result<axum::response::Response> {
     let (backend, _bh) = stub_backend().await?;
     let (upstream, _uh) = stub_upstream().await?;
     let app = app(test_config(
@@ -733,9 +739,14 @@ async fn through_proxy(
         }],
     ))
     .unwrap();
-    let cookie = seeded_cookie(app.clone(), &backend).await?;
-    let req = req.header("cookie", &cookie).body(Body::empty())?;
-    Ok(app.oneshot(with_test_peer(req)).await?)
+    let req = if with_session {
+        req.header("cookie", seeded_cookie(app.clone(), &backend).await?)
+    } else {
+        req
+    };
+    Ok(app
+        .oneshot(with_test_peer(req.body(Body::empty())?))
+        .await?)
 }
 
 #[tokio::test]
@@ -806,7 +817,7 @@ async fn every_non_safe_method_naming_no_origin_is_forbidden() -> anyhow::Result
 
 #[tokio::test]
 async fn safe_methods_need_no_origin() -> anyhow::Result<()> {
-    for method in ["GET", "HEAD", "OPTIONS"] {
+    for method in ["GET", "HEAD"] {
         let resp = through_proxy(Request::builder().method(method).uri("/api/headers")).await?;
         assert_eq!(resp.status(), StatusCode::OK, "{method}");
     }
@@ -823,10 +834,14 @@ async fn only_allowlisted_upstream_headers_reach_the_browser() -> anyhow::Result
     assert_eq!(
         names,
         [
+            // The CORS layer's, on every response, even one without an `Origin`.
+            "access-control-allow-credentials",
+            "access-control-expose-headers",
             "cache-control",
             "content-disposition",
             "content-security-policy",
             "content-type",
+            "vary",
             "x-content-type-options",
         ]
     );
@@ -888,5 +903,142 @@ async fn an_upstream_that_settles_shared_caching_is_left_alone() -> anyhow::Resu
     ] {
         assert_eq!(cache_control_through_proxy(upstream).await?, upstream);
     }
+    Ok(())
+}
+
+fn preflight(origin: &str) -> axum::http::request::Builder {
+    Request::options("/api/headers")
+        .header("origin", origin)
+        .header("access-control-request-method", "PUT")
+        .header("access-control-request-headers", "content-type,x-custom")
+}
+
+fn header<'a>(resp: &'a axum::response::Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn a_preflight_from_a_trusted_origin_is_answered_without_a_session() -> anyhow::Result<()> {
+    for origin in ["http://login.test", "http://bff.test"] {
+        let resp = send_to_app(preflight(origin), false).await?;
+
+        assert!(resp.status().is_success(), "{origin}: {}", resp.status());
+        assert_eq!(header(&resp, "access-control-allow-origin"), Some(origin));
+        assert_eq!(
+            header(&resp, "access-control-allow-credentials"),
+            Some("true")
+        );
+        assert_eq!(header(&resp, "access-control-allow-methods"), Some("PUT"));
+        assert!(header(&resp, "access-control-max-age").is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_preflight_from_another_origin_is_not_allowed() -> anyhow::Result<()> {
+    let resp = send_to_app(preflight("https://evil.test"), false).await?;
+
+    // Answered by bff: proxied, it would get 401 (no session).
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert_eq!(header(&resp, "access-control-allow-origin"), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_preflight_may_only_ask_for_headers_bff_forwards() -> anyhow::Result<()> {
+    let resp = send_to_app(preflight("http://login.test"), false).await?;
+
+    assert_eq!(
+        header(&resp, "access-control-allow-headers"),
+        Some("content-type")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn any_options_is_answered_by_bff_without_a_session_or_the_upstream() -> anyhow::Result<()> {
+    for path in ["/api/headers", "/no-such-route"] {
+        for with_session in [false, true] {
+            let resp = send_to_app(Request::options(path), with_session).await?;
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path}, session: {with_session}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+            assert!(body.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxied_responses_carry_cors_headers_for_a_trusted_origin_only() -> anyhow::Result<()> {
+    let resp =
+        through_proxy(Request::get("/api/headers").header("origin", "http://login.test")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        header(&resp, "access-control-allow-origin"),
+        Some("http://login.test")
+    );
+    assert_eq!(
+        header(&resp, "access-control-allow-credentials"),
+        Some("true")
+    );
+
+    let resp =
+        through_proxy(Request::get("/api/headers").header("origin", "https://evil.test")).await?;
+    assert_eq!(header(&resp, "access-control-allow-origin"), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unauthenticated_request_still_carries_cors_headers() -> anyhow::Result<()> {
+    let resp = send_to_app(
+        Request::get("/api/headers").header("origin", "http://login.test"),
+        false,
+    )
+    .await?;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        header(&resp, "access-control-allow-origin"),
+        Some("http://login.test")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn form_routes_get_no_cors_headers() -> anyhow::Result<()> {
+    let resp = send_to_app(preflight("http://login.test").uri("/login"), false).await?;
+
+    assert_eq!(header(&resp, "access-control-allow-origin"), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rate_limited_proxy_response_still_carries_cors_headers() -> anyhow::Result<()> {
+    let (backend, _bh) = stub_backend().await?;
+    let mut config = test_config(backend, vec![]);
+    config.rate_limit_proxy_max_attempts = 1;
+    let app = app(config).unwrap();
+    let hit = || {
+        app.clone().oneshot(with_test_peer(
+            Request::get("/no-such-route")
+                .header("origin", "http://login.test")
+                .body(Body::empty())
+                .unwrap(),
+        ))
+    };
+
+    assert_eq!(hit().await?.status(), StatusCode::NOT_FOUND);
+    let resp = hit().await?;
+
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        header(&resp, "access-control-allow-origin"),
+        Some("http://login.test")
+    );
     Ok(())
 }
