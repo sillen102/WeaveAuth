@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block title %}Verify your email{% endblock title %}
+{% block page %}
+<main class="card">
+  <h1>Verify your email</h1>
+  {{ messages(flow=flow) }}
+  {{ form(flow=flow, groups=["default", "code"]) }}
+</main>
+{% endblock page %}

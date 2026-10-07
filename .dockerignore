@@ -1,4 +1,12 @@
-target
+**/target
 .git
 .idea
 **/.env
+**/mutants.out*
+lcov.info
+local-prod/certs
+ory/checks/logs/
+**/.env.*
+.claude/
+.agents/
+prompts/

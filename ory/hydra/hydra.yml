@@ -1,0 +1,50 @@
+# Secrets and the DSN come from env (SECRETS_SYSTEM, SECRETS_COOKIE, DSN); the hooks API key replaces
+# @WA_HOOKS_API_KEY@ at start (start.sh).
+serve:
+  public:
+    port: 4444
+  admin:
+    port: 4445
+
+urls:
+  self:
+    issuer: https://login.localhost:8443
+  login: https://login.localhost:8443/login
+  consent: https://login.localhost:8443/consent
+  logout: https://login.localhost:8443/logout
+  error: https://login.localhost:8443/error
+  post_logout_redirect: https://bff.localhost:8443/logged-out
+  # Hydra disables the Kratos session itself when a logout completes.
+  identity_provider:
+    url: http://kratos:4434
+
+strategies:
+  access_token: jwt
+  scope: exact
+
+oauth2:
+  pkce:
+    enforced: true
+  token_hook:
+    url: http://weaveauth:1983/hydra/token-hook
+    auth:
+      type: api_key
+      config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
+  # Only the claim names the deployer's login_claims webhook may return; keep in step with it.
+  allowed_top_level_claims: [roles, email, email_verified]
+  mirror_top_level_claims: false
+  grant:
+    refresh_token:
+      rotation_grace_period: 10s
+      rotation_grace_reuse_count: 2
+
+ttl:
+  access_token: 15m
+  id_token: 15m
+  refresh_token: 720h
+  auth_code: 5m
+  login_consent_request: 30m
+
+log:
+  level: info
+  leak_sensitive_values: false

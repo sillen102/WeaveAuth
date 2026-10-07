@@ -1,0 +1,133 @@
+# Base Kratos config (verified-email-first). Secrets and the DSN come from env (SECRETS_COOKIE,
+# SECRETS_CIPHER, DSN); the hooks API key replaces @WA_HOOKS_API_KEY@ when start.sh renders the file.
+# The URLs are local-prod's; see ory/README.md for what to change for a deployment.
+serve:
+  public:
+    base_url: https://login.localhost:8443/
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/kratos/identity.schema.json
+
+session:
+  lifespan: 24h
+  cookie:
+    # Login's WA_KRATOS_SESSION_COOKIE must equal name (Kratos' default is ory_kratos_session).
+    same_site: Lax
+
+oauth2_provider:
+  url: http://hydra-admin:4445
+
+selfservice:
+  default_browser_return_url: https://login.localhost:8443/settings
+  allowed_return_urls:
+    - https://bff.localhost:8443/
+    - https://login.localhost:8443/
+  methods:
+    password:
+      enabled: true
+      config:
+        haveibeenpwned_enabled: true
+        ignore_network_errors: false
+        min_password_length: 8
+    code:
+      enabled: true
+    passkey:
+      enabled: true
+      config:
+        rp:
+          id: login.localhost
+          display_name: WeaveAuth
+          origins:
+            - https://login.localhost:8443
+    oidc:
+      enabled: true
+      config:
+        base_redirect_uri: https://login.localhost:8443/
+        providers: []
+  flows:
+    registration:
+      enabled: true
+      ui_url: https://login.localhost:8443/registration
+      # Per method (global `after.hooks` can't hold show_verification_ui or session). No `session` hook:
+      # nobody is signed in until the address is verified; with a login_challenge Kratos accepts the
+      # Hydra login after verification.
+      after:
+        password: &after-registration
+          hooks:
+            - hook: web_hook
+              config:
+                id: after-registration
+                url: http://weaveauth:1983/kratos/after-registration
+                method: POST
+                body: file:///etc/kratos/hooks/after-registration.jsonnet
+                auth:
+                  type: api_key
+                  config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
+            - hook: show_verification_ui
+        passkey: *after-registration
+        oidc: *after-registration
+    login:
+      ui_url: https://login.localhost:8443/login
+      after:
+        hooks:
+          - hook: require_verified_address
+    verification:
+      enabled: true
+      use: code
+      ui_url: https://login.localhost:8443/verification
+    recovery:
+      enabled: true
+      use: code
+      ui_url: https://login.localhost:8443/recovery
+      after:
+        hooks:
+          - hook: web_hook
+            config:
+              id: after-recovery
+              url: http://weaveauth:1983/kratos/after-recovery
+              method: POST
+              body: file:///etc/kratos/hooks/after-recovery.jsonnet
+              auth:
+                type: api_key
+                config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
+    settings:
+      ui_url: https://login.localhost:8443/settings
+      after:
+        password:
+          # The hook ends the app's session, so a saved password goes to sign-in
+          # (Kratos asks for it again).
+          default_browser_return_url: https://login.localhost:8443/login
+          hooks:
+            - hook: web_hook
+              config:
+                id: after-password-change
+                url: http://weaveauth:1983/kratos/after-password-change
+                method: POST
+                body: file:///etc/kratos/hooks/after-password-change.jsonnet
+                auth:
+                  type: api_key
+                  config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
+      privileged_session_max_age: 15m
+      required_aal: highest_available
+    logout:
+      after:
+        default_browser_return_url: https://login.localhost:8443/login
+    error:
+      ui_url: https://login.localhost:8443/error
+
+courier:
+  smtp:
+    connection_uri: smtp://mail:1025/
+    from_address: no-reply@weaveauth.localhost
+    from_name: WeaveAuth
+  # Templates missing here fall back to Kratos's built-in ones.
+  template_override_path: /etc/kratos/courier-templates
+
+log:
+  level: info
+  leak_sensitive_values: false

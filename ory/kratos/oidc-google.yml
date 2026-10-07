@@ -1,0 +1,16 @@
+# Loaded when its absolute path is in KRATOS_CONFIG_EXTRA (/etc/kratos/oidc-google.yml); start.sh then
+# requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET. Asks Google for the email and profile only; to
+# also read the phone number for hooks' `profile_apis.google`, load oidc-google-phone.yml instead.
+# Redirect URI to register at Google: https://login.localhost:8443/self-service/methods/oidc/callback/google
+selfservice:
+  methods:
+    oidc:
+      config:
+        providers:
+          - id: google
+            provider: google
+            label: Google
+            client_id: "@GOOGLE_CLIENT_ID@"
+            client_secret: "@GOOGLE_CLIENT_SECRET@"
+            mapper_url: file:///etc/kratos/oidc/google.jsonnet
+            scope: [email, profile]

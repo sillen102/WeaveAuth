@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+{% block title %}Account settings{% endblock title %}
+{% block page %}
+<main class="card">
+  {% if recovering(flow=flow) %}
+  <h1>Set a new password</h1>
+  {{ messages(flow=flow) }}
+  {{ form(flow=flow, groups=["password"]) }}
+  {% else %}
+  <h1>Account settings</h1>
+  {{ messages(flow=flow) }}
+  {{ form(flow=flow, groups=["profile"]) }}
+  {{ form(flow=flow, groups=["password"]) }}
+  {{ form(flow=flow, groups=["oidc"]) }}
+  {{ form(flow=flow, groups=["passkey"]) }}
+  {{ form(flow=flow, groups=["webauthn"]) }}
+  {{ form(flow=flow, groups=["totp"]) }}
+  {{ form(flow=flow, groups=["lookup_secret"]) }}
+  {% endif %}
+</main>
+{% endblock page %}

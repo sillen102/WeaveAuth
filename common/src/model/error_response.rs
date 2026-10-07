@@ -1,8 +1,7 @@
 use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ErrorResponse {
     /// The timestamp when the error occurred.
     pub timestamp: DateTime<Utc>,

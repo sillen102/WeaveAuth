@@ -8,36 +8,60 @@ Agent guide for the WeaveAuth repo. Follow these conventions.
 
 ## Overview
 
-Cargo workspace. The services: Axum backend (`backend/`, binary `weaveauth`, port
-1983, **not exposed publicly**), the BFF (`bff/`, binary `weaveauth-bff`, port 8080 —
-owns PKCE, the OAuth client role, and the session cookie), and an optional thin static
-login page (`login/`, binary `weaveauth-login`, port 8081, just redirects into bff).
-The rest are support crates: `common/` + `common/macros/` (shared models, the
-`ErrorResponses` derive), `plugin-sdk/rust/` (the plugin gRPC contract, generated from
-`plugin-sdk/proto/` — backend depends on it for the client side), and `system-tests/`
-(cross-service tests, plus the probe plugins as bin targets). `plugin-sdk/go/` is a Go
-module outside the Cargo workspace, built by its own mise tasks.
+WeaveAuth sits on **Ory Kratos** (identities: password, Google/social, passkeys, recovery,
+verification, email) and **Ory Hydra** (OIDC, JWT access tokens, JWKS, refresh), which run as
+their own containers from the official images, configured under `ory/`. The Cargo workspace is the
+part WeaveAuth owns:
+
+- `bff/` (binary `weaveauth-bff`, public port 8080, internal port 8082): the OAuth/OIDC client of
+  Hydra. Owns PKCE, the `wa_session` cookie and the tokens behind it, and proxies configured
+  routes upstream with a Bearer JWT.
+- `login/` (binary `weaveauth-login`, port 8081): the server-rendered UI for Kratos' flows and
+  Hydra's login/consent/logout challenges, and the only way a browser (or anything public) reaches
+  Kratos.
+- `hooks/` (binary `weaveauth-hooks`, port 1983, **internal only**): the web hooks Kratos and
+  Hydra call (claims, registration, recovery purge) and the deployer's webhook
+  contracts.
+- `common/` + `common/macros/`: shared config loading, error types and the `ErrorResponses`
+  derive, request extractors, the rate limiter.
+- `launcher/`: `weaveauth-launcher`, the container entrypoint (std-only).
+- `system-tests/`: cross-service tests against real Kratos and Hydra containers.
+
+`ory/`, `local-prod/` and `testing/` are not workspace members: `ory/` is Ory's configuration
+(plus `ory/checks/`, the driver for the behaviour checks), `local-prod/` a docker compose of the
+whole stack behind TLS, `testing/` standalone test doubles.
 
 ## Commands
 
-- Workspace tests: `cargo test` (bff's PKCE/session flow: `bff/tests/pkce_flow.rs`;
-  login's redirect: `login/tests/redirect_test.rs`; backend's are unit tests inline)
-- Run everything: `mise run services` from the repo root. Each crate also has its own
-  `mise.toml` (`dev`/`build`/`test`/`lint` tasks); `mise run dev` from inside a crate
-  directory is equivalent to `cargo run` there — **the cwd matters**: `backend` and
-  `bff` look for `config.yaml` as a bare relative path (see below), so `cargo run -p
-  <crate>` from the repo root won't find it and silently falls back to hardcoded
-  defaults instead of erroring.
-- `cargo test` does **not** cover `plugin-sdk/go` (a separate Go module). `mise run
-  test` does — use it after touching the plugin contract or the Go SDK.
+- Workspace tests: `cargo test` (or `mise run test`). Each crate has its own tests: hooks'
+  HTTP-level tests in `hooks/tests/`, bff's in `bff/tests/` (login/callback, logout, back-channel
+  logout, internal revoke, refresh, proxy), login's in `login/tests/` (pages, the Kratos proxy,
+  the Hydra challenge chains). `mise run test-docker` runs the system tests that need a Docker
+  daemon (`cargo test -p weaveauth-system-tests --features docker`: real Kratos, Hydra and
+  Postgres via testcontainers); `mise run system-tests` runs the rest of that crate.
+- Run the services on the host: `mise run services` from the repo root (hooks, bff and login).
+  Each crate also has its own `mise.toml` (`dev`/`build`/`test`/`lint` tasks); `mise run dev` from
+  inside a crate directory is equivalent to `cargo run` there — **the cwd matters**: `hooks` and
+  `bff` look for `config.yaml` as a bare relative path (see below), so `cargo run -p <crate>` from
+  the repo root won't find it, and the default `prod` profile then refuses to start (missing settings).
+  `services` does not start Ory; hooks, bff and login need a Kratos and a Hydra they can reach.
+- Run everything on one machine: `mise run all` (`dev/docker-compose.yml`: Postgres, Kratos, Hydra,
+  Mailpit with configs rendered from `ory/` by `dev/render.sh`; plus `services` and the test apps
+  on the host). `mise run dev-ory-down` stops the containers and drops their data. A change to
+  `ory/kratos/kratos.yml` or `ory/hydra/hydra.yml` needs
+  `sh dev/render.sh && docker compose -f dev/docker-compose.yml restart kratos hydra`.
+- Run the whole stack in containers, with Ory: `mise run ory-up` (`local-prod/`, which needs
+  `./gen-certs.sh` and `./gen-secrets.sh` run once; see `local-prod/README.md`), `mise run ory-down`
+  (also drops the Postgres data, `docker compose down -v`).
+- Rotate Hydra's signing keys: `mise run rotate-keys` (against the `local-prod` stack; the runbook,
+  including removing the old keys, is in `ory/README.md`).
 - Full build: `cargo build --workspace --release`
 - No linter/formatter is configured beyond `cargo clippy` (each crate's `mise.toml` has
   a `lint` task). Keep `cargo fmt`-style output manually.
 - `mise run crap` runs `cargo llvm-cov --workspace` (the whole test suite, instrumented)
   and feeds the LCOV to `cargo crap`, listing functions with CRAP score >= 30 and failing
   (`--fail-above`) if any scores above 30. It is not part of `lint` because of the
-  test-suite runtime. Writes `lcov.info` (git-ignored). Probe plugins run as subprocesses,
-  so code only they exercise shows 0% coverage.
+  test-suite runtime. Writes `lcov.info` (git-ignored).
 - After changing code, run cargo-crap scoped to the touched files, like `cargo-mutants`:
   `cargo llvm-cov -p <package> --lcov --output-path lcov.info`, then
   `cargo crap --path <file> --lcov lcov.info --fail-above`. Fix any function over 30 by
@@ -51,7 +75,7 @@ module outside the Cargo workspace, built by its own mise tasks.
   - **Layer separation**: Service/business-logic errors must NOT contain HTTP knowledge. Do NOT use `#[error_response(...)]` or import `StatusCode` in service modules. HTTP error mapping belongs in the controller/handler layer only.
   - **Pattern**: Define two error types per endpoint: (1) `XyzServiceError` in `service` module with only `#[derive(Debug, Error, ...)]`, (2) `XyzError` in `controller` module with `ErrorResponses` and `#[error_response(...)]` attributes. Implement `From<XyzServiceError> for XyzError` in controller to enable automatic conversion via `?` operator.
   - **Item order within a module**: top-down, public-first, types-before-consumers.
-    - `controller`: imports, request struct(s), response struct, error enum, `_doc()` fn,
+    - `controller`: imports, request struct(s), response struct, error enum,
       then the handler fn last (it's the assembly of everything declared above it).
     - `service`: error enum first, then the public entry fn, then private helpers below
       it in call order.
@@ -66,7 +90,7 @@ module outside the Cargo workspace, built by its own mise tasks.
     it at that spot.
   - **Detailed logs, opaque responses.** What the caller sees is fixed and generic: the
     `#[error_response(...)]` status and its static `details` text (or none), never an upstream
-    message, status code, URL, hostname, file path, plugin output, or anything derived from a
+    message, status code, URL, hostname, file path, webhook output, or anything derived from a
     cause. The cause lives only in the log, where it should be as detailed as it can be: say
     what failed and against what, and keep the whole chain (`common::error::cause_chain`),
     because `Display` on reqwest/hyper errors drops the source ("error sending request" without
@@ -112,14 +136,13 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 - when a reviewer or the author doubts a test is doing anything,
 - on request.
 
-- Run via `mise run mutants -- -p weaveauth` (backend's package name; or `-p
-  weaveauth-bff`/`-p weaveauth-login`) from the repo root. Everything after `--` is
+- Run via `mise run mutants -- -p weaveauth-hooks` (or `-p weaveauth-bff`/`-p
+  weaveauth-login`) from the repo root. Everything after `--` is
   forwarded straight to `cargo mutants`, so scope to one file with `--file
-  backend/src/crypto.rs`, or a function/line with `--file ... --function name` /
+  hooks/src/webhook.rs`, or a function/line with `--file ... --function name` /
   `--line N`, to keep a run fast. Don't try `CARGO_INCREMENTAL=1`: `~/.cargo/config.toml`
-  sets `sccache` as the `rustc-wrapper`, which refuses to run incremental at all (also
-  why root `Cargo.toml` has `profile.dev.incremental = false`); forcing it off via
-  `RUSTC_WRAPPER=""` to allow incremental was tried and measured *slower* overall
+  sets `sccache` as the `rustc-wrapper`, which refuses to run incremental at all; forcing
+  it off via `RUSTC_WRAPPER=""` to allow incremental was tried and measured *slower* overall
   (loses sccache's cross-crate cache reuse, which mattered more than incremental's
   per-mutant savings) — not worth the complexity.
 - It builds each mutant, runs the test suite, and reports mutants that survived (no
@@ -132,9 +155,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   from missed to unviable rather than to caught, nothing was proven. Force it by hand and
   check the test actually fails.
 - Likewise, a package-scoped run only runs **that package's** tests. Mutating
-  `plugin-sdk/rust` reports its own `serve`/`Debug` mutants as missed even though
-  `system-tests/tests/plugin_auth.rs` catches both -- confirm cross-package coverage by
-  hand before treating one as a gap.
+  `common` reports mutants as missed that only a test in `hooks`, `bff` or `login` (or
+  `system-tests`) catches -- confirm cross-package coverage by hand before treating one as a
+  gap.
 - Always scope it to the touched file(s); fix surviving mutants by strengthening the
   test, not the implementation.
 - Slow on a full crate (rebuild + test run per mutant) — a workspace-wide run is not
@@ -148,7 +171,7 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   `.cargo/mutants.toml` by default, not a workspace-root `mutants.toml`.
 - A surviving mutant that only changes whether a log line fires (not any return value,
   stored state, or response) is treated as accepted noise, not chased with log-capture
-  test infrastructure — e.g. `upgrade_bcrypt_to_argon2`'s `!=`/`==` on the `set_password` outcome only
+  test infrastructure — e.g. a `!=`/`==` on a revoke outcome that only
   gates a `tracing::warn!`. Record the reasoning in the commit body when leaving one
   unaddressed.
 - When a run does happen for security-relevant behavior, record the surviving-then-fixed
@@ -177,130 +200,152 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 
 ## Architecture
 
-- Root `Cargo.toml` is a virtual workspace: `members = ["backend", "bff", "login"]`.
-- `backend/src/server/mod.rs` — `AppState::new(&Config)` + `router(AppState)`. PKCE
-  storage (`InMemoryPkceStorage`) is single-use and TTL'd; `redirect_uri` is
-  allowlist-checked in `server/api/authorize.rs`. `model/user.rs` /
-  `InMemoryUserStorage` and `model/session.rs` / `InMemorySessionStorage` exist but are
-  intentionally unwired (real user auth and session ownership are deferred to bff).
-- `bff/src/server/mod.rs` — `AppState::new(Config)` + `router(AppState)`, also exposed
-  as `app(Config)` for tests. Owns `InMemorySessionStorage` (session_id →
-  access/refresh token). The `http_client` has `redirect::Policy::none()` — needed so
-  `/login` can read the raw `Location` header off backend's `/oauth/authorize` response
-  instead of auto-following it.
-- `bff/src/server/api/login.rs` — `start_login` forwards the caller's `redirect_uri`
-  (the *final* browser destination; required, `400` if missing) to
-  backend's `/oauth/authorize` unchecked; bff keeps no allowlist of its own.
-  Backend's `400` (not allowlisted) is distinguished from other backend failures and
-  surfaced as `400`, not the generic `502` — see the `reqwest::StatusCode::BAD_REQUEST`
-  check before the redirection check. The whole PKCE exchange runs server-to-server
-  inside this one request handler: `GET`s backend's `/oauth/authorize` (extracts
-  `code` from the un-followed 303's `Location`), `POST`s backend's `/oauth/token`,
-  mints a session, sets the `Set-Cookie` header directly (no cookie crate
-  dependency), and only then replies to the browser with one 303 to the caller's
-  `redirect_uri`. This relies on backend's `/oauth/authorize` having no interactive
-  step.
-- `bff/src/server/api/proxy.rs` — `.fallback(proxy)` in the router: any request no
-  other route matches is checked against `Config::routes` (longest
-  `path_prefix` wins), the session cookie is resolved to an access token via
-  `InMemorySessionStorage`, and the request is forwarded to `upstream_url` (prefix
-  stripped) with `Authorization: Bearer <token>` plus the client headers in
-  `REQUEST_HEADERS` (just `Content-Type`); everything else (`Cookie`, `Upgrade`, any forwarding
-  header) is dropped, and bff adds no `X-Forwarded-*` of its own, so WebSocket isn't proxied.
-  Responses keep only `RESPONSE_HEADERS` (`Content-Type`, `Content-Disposition`,
-  `Content-Security-Policy`, `Cache-Control`), plus bff's `X-Content-Type-Options: nosniff`
-  and a `Cache-Control: no-store` default (`private` added when the upstream's leaves shared
-  caching open). Non-safe methods need a trusted `Origin` first (`403`). `401` on
-  missing/unknown session, `404` on no matching route. The routes sit inside a `tower-http`
-  `CorsLayer` for the same trusted origins (credentials, `REQUEST_HEADERS` only), outermost
-  (above the governor). `tower-http` answers every `OPTIONS` itself, so `OPTIONS` needs no
-  session, isn't rate limited and is never proxied.
-- `login/src/lib.rs` — thin `app(Config) -> Router`: one `/login` handler that
-  redirects into bff's `/login`, plus `ServeDir` over `login/static/`. No PKCE logic
-  here — that all lives in `bff`. Its one outbound call is bff's `/oidc/providers`, for
-  the provider names on the link-confirm view.
-- `login/src/main.rs` — axum + tower-http `ServeDir` over `login/static/`. STATIC_DIR
-  baked at compile time via `concat!(env!("CARGO_MANIFEST_DIR"), "/static")`; recompile
-  needed only because the dir path is baked, not the HTML itself.
-- `backend/src/plugin/mod.rs` — `PluginProcess`: spawns the deployer's plugin binary as
-  a child, waits for it to answer, supervises/restarts it, and calls it over gRPC on a
-  socket pair whose other end is the child's stdin (no socket file anywhere). The
-  contract is `plugin-sdk/proto`, generated by `plugin-sdk/rust`'s `build.rs` (protoc
-  comes from `protoc-bin-vendored`, so no toolchain install). A plugin is **not
-  sandboxed**. What is enforced: it inherits no environment beyond
-  `WA_PLUGIN_<PLUGIN>_ENV_*`/config `env`; it runs as its own `uid`/`gid` (never 0); and
-  every call carries a startup-generated token (written as the first line on the
-  connection) that its SDK checks. The SDKs exit when the connection closes, which is
-  how a plugin running as another user gets torn down. See
-  `backend/src/plugin/README.md`.
-- `launcher/` — two std-only binaries. `weaveauth-launcher` is the container entrypoint
-  (starts the three services, exits when one does). `weaveauth-plugin-exec` is the only
-  binary with `cap_setuid,cap_setgid`: backend starts plugins through it
-  (`WA_SETUID_HELPER`), and it refuses uid/gid 0 and execs the plugin as its own user.
-  The image installs it `root:weaveauth 0710` (chown before setcap, which chown would
-  clear), so plugins can't run it.
-- `Dockerfile` — multi-stage: builds the services and `launcher/`, and runs them from a
-  distroless runtime as `weaveauth`, with file caps on `weaveauth-plugin-exec` only.
-  Each plugin hook defaults to its own user (`wa-registration` 1001, `wa-login-claims`
-  1002, `wa-email` 1003). `system-tests/docker/Dockerfile.plugin-test` builds on it, adding the probe
-  plugin for `system-tests/tests/plugin_privsep_flow.rs`.
-- `local-prod/` — docker compose that runs the image as one container under `prod`; only the
-  TLS proxy (Caddy) is on the public network; throwaway local CA from `gen-certs.sh`.
+- Root `Cargo.toml` is a workspace: `members = ["hooks", "bff", "common", "common/macros",
+  "launcher", "login"]` (plus `system-tests`).
+- **Ory, not code, is the authorization server and the user store.** Kratos holds identities and
+  credentials (`ory/kratos/identity.schema.json`: `email`, `first_name`, `last_name` required,
+  `phone_number` optional); Hydra issues the tokens (`strategies.access_token: jwt`). Both use
+  Postgres.
+  `ory/README.md` explains every setting and holds the results of the behaviour checks the design
+  rests on; read it before changing `ory/`.
+- **Login chain.** bff `GET /login?redirect_uri=` (exact-match allowlist, PKCE S256, `state`/`nonce`/
+  verifier in the `wa_login` cookie) → Hydra `/oauth2/auth` → login `/login?login_challenge` →
+  Kratos flow rendered by login → Kratos accepts Hydra's login request itself
+  (`oauth2_provider.url`) → Hydra → login `/consent` (auto-accepts for `WA_BFF_CLIENT_ID` and
+  scopes `openid offline_access`) → bff `/callback` (state check, code exchange against Hydra's
+  internal URL with `client_secret_basic`, id_token verification) → one 303 to the allowlisted
+  `redirect_uri` with `wa_session`. Flows are in `docs/flows/`.
+- `bff/src/server/router.rs` — `public_router` (`/login`, `/callback`, `POST /logout`,
+  `/logged-out`, `/health`, and the proxy as the fallback) on `port`, and `internal_router`
+  (`POST /backchannel-logout`, `POST /internal/revoke`) on `internal_port`. The internal one is never
+  routed publicly. `weaveauth_bff::server::apps(config)` builds both for tests (there is no
+  `app()`). `bff/src/hydra/` is its side of Hydra: OAuth2 client calls, JWKS cache, id_token and
+  `logout_token` verification. One slice per endpoint under `bff/src/server/api/`, see
+  `bff/AGENTS.md`.
+- `bff` sessions (`InMemorySessionStorage`: session id → access/refresh/id token, `sub`, `sid`)
+  and the back-channel `jti` store follow the in-memory idiom below, so a restart ends every
+  session. Refresh is single-flight per session (`refresh_lock.rs`): Hydra treats a reused
+  rotated refresh token as theft and revokes the chain.
+- `bff/src/server/api/proxy.rs` — one `axum-reverse-proxy` service per `Config::routes` entry,
+  mounted with `nest_service` at its `path_prefix` (the router strips it once; a `/` route is the
+  router's `fallback_service`), behind `authenticate`: a path with a segment of only dots (raw or encoded once or twice) or an encoded
+  `/` or `\` is `404`, the session cookie is resolved to an access token (refreshed first if due),
+  and the request is forwarded to `upstream_url` with `Authorization: Bearer <token>` plus the
+  client headers in `REQUEST_HEADERS` (`Content-Type`, `Accept`, `Accept-Language` and the `If-*`
+  conditionals); everything else (`Cookie`, `Upgrade`, any forwarding header) is dropped,
+  and bff adds no `X-Forwarded-*` of its own, so WebSocket isn't proxied. Responses keep only
+  `RESPONSE_HEADERS` (`Content-Type`, `Content-Disposition`, `Content-Security-Policy`,
+  `Cache-Control`, `Location`, `Vary`, `ETag`, `Last-Modified`, `WWW-Authenticate`,
+  `Retry-After`), plus bff's `X-Content-Type-Options: nosniff`, a sandboxing CSP when the upstream
+  sent none and a `Cache-Control: no-store` default (`private` added when the upstream's leaves
+  shared caching open). Non-safe methods need a trusted `Origin` first (`403`). `401` on
+  missing/unknown session, `404` on no matching route. Unmatched paths are the router's `404`
+  fallback, outside the session check.
+  The routes sit inside a `tower-http` `CorsLayer` for the same trusted origins (credentials,
+  `REQUEST_HEADERS` only), outermost (above the governor). `tower-http` answers every `OPTIONS`
+  itself, so `OPTIONS` needs no session, isn't rate limited and is never proxied.
+- `login/src/lib.rs` — `app(Config)`, `app_with_pages`, `app_with_templates` (pages glob plus providers dir, for the logo tests), `serve`. Pages (`/login`,
+  `/registration`, `/recovery`, `/verification`, `/settings`, `/error`), Hydra's `/logout` and
+  `/consent` (`challenges.rs`), `/ui.js`, `/static/*`, `/providers/*` (logos), and the one proxy to Kratos public
+  (`GET`/`POST /self-service/*`, `GET /.well-known/ory/*`; two per-client buckets from
+  `common::rate_limit`, plus the per-identifier throttle on password submissions in
+  `throttle.rs`). Templates in `templates/pages/*.html` extend the compiled-in
+  `login/src/layout.html` and render Kratos' flow nodes through the Tera functions `form` and
+  `messages`; deployers supply no script (`login/AGENTS.md`).
+- `hooks/src/server/router.rs` — every route but `/health` behind `Authorization: Bearer
+  <WA_HOOKS_API_KEY>` and a request timeout: `POST /hydra/token-hook` (claims: `email`,
+  `email_verified` from Kratos plus the deployer's `login_claims_handler`; reserved names refused;
+  an inactive identity gets none; fails closed), `POST /kratos/after-registration` (profile APIs, the `registration_handler`
+  webhook; a failure deletes the identity itself, since Kratos runs the hook after persisting),
+  `POST /kratos/after-recovery` (replaces the password with a random one, deletes the passkey/webauthn/
+  totp/lookup credentials and every OIDC link, revokes Kratos sessions, Hydra consent and login sessions and bff's sessions
+  through `POST /internal/revoke`) and `POST /kratos/after-password-change` (the revocations
+  without the purge). See `hooks/AGENTS.md`.
+- `launcher/` — `weaveauth-launcher` runs hooks, bff and login in one container and exits when
+  one does.
+- `Dockerfile` — multi-stage: builds the three services and the launcher, runs them from a
+  distroless runtime as `weaveauth` (1000) with no capabilities and no file caps. It contains no
+  Ory: Kratos and Hydra are separate containers.
+- `local-prod/` — docker compose: the image, Kratos, Hydra (public API on `hydra`, admin API on
+  `hydra-admin`, internal network only), Postgres, Mailpit and a Caddy TLS
+  proxy. Only Caddy is on the public network; Caddy routes `/oauth2/auth` and
+  `/oauth2/sessions/logout` to Hydra and everything else on the login host to login, which alone
+  forwards `/self-service/*` and `/.well-known/ory/*` to Kratos (never route those straight to
+  Kratos: login applies the rate limits). Throwaway local CA from `gen-certs.sh`.
+- `system-tests/` — testcontainers with Kratos and Hydra (the `docker` feature).
+- `testing/` — standalone fixtures outside the workspace: `downstream-service` (the bearer-token
+  demo upstream) and `user-service` (the webhook target of the registration and login-claims hooks)
+  and `user-service`.
 
 ## Conventions
 
-- `backend` and `bff` load an optional YAML overlay (`WA_CONFIG_FILE`, default bare
+- `hooks` and `bff` load an optional YAML overlay (`WA_CONFIG_FILE`, default bare
   `config.yaml` relative to cwd — see the cwd gotcha above) before env vars; env vars
   still win when set. All three services load through `common::config`: defaults, then
-  YAML (backend and bff only; login reads env vars alone), then only the env vars listed
+  YAML (hooks and bff only; login reads env vars alone), then only the env vars listed
   in the crate's `ENV`/`ENV_LISTS` table (so an unlisted `WA_*` var is never read). A
   YAML key can set any `Config` field; an env var exists only when someone needs it per
-  deployment.
-- A setting that can be derived from another is derived in `Config::load` when the
-  deployer didn't set it (`user.contains("key")`), not given its own required input:
-  allowlist/trusted origins from `WA_LOGIN_PUBLIC_URL`, backend's `issuer` from
-  `WA_PORT` (dev only; prod requires `WA_BACKEND_URL`), OIDC `redirect_uri` from
-  `WA_BFF_URL`, and the `WA_PROFILE` (`dev`/`prod`) defaults. `prod` (the default, in
-  all three services) refuses to start unless the browser-facing URLs are https
-  (`require_https_in_prod`; `WA_LOGIN_PUBLIC_URL` must be a bare origin) and backend's
-  own URL is set; test and dev configs set `profile: dev` (`WA_PROFILE=dev` where login
-  runs too, since it reads no YAML). Every service trims a trailing `/` off
-  `WA_LOGIN_PUBLIC_URL` before deriving from it. Lifetimes nobody tunes per deployment
-  go in backend's `Tuning` (code-only) or a constant, not in YAML/env. New scalar config
-  → a field on `Config` + a row in the crate's `ENV` table (if it needs an env var) + a
-  row in `README.md`.
-- Custom environment variables are prefixed with `WA_`.
+  deployment. YAML-only settings: bff's `routes` and `rate_limit_proxy_max_attempts`, hooks'
+  webhook handlers, `profile_apis` and timeouts.
+- `prod` (the default, in all three services) refuses to start unless the browser-facing URLs
+  are https (`require_https_in_prod`) and the internal addresses that have only a localhost
+  default are set: bff's `WA_HYDRA_PUBLIC_URL` and `WA_HYDRA_INTERNAL_URL`, hooks'
+  `WA_KRATOS_ADMIN_URL`, `WA_HYDRA_ADMIN_URL` and `WA_BFF_INTERNAL_URL`; bff also needs a
+  non-empty `redirect_uri_allowlist` and a `WA_BFF_INTERNAL_API_KEY` of 16 or more characters.
+  `WA_BFF_CLIENT_SECRET` and `WA_BFF_INTERNAL_API_KEY` (bff) and `WA_HOOKS_API_KEY` (hooks, to
+  serve; 16 or more characters in `prod`) are required in every profile, hooks also needs
+  `WA_BFF_INTERNAL_API_KEY` to serve, and login needs `WA_KRATOS_PUBLIC_URL` and `WA_HYDRA_ADMIN_URL` in `prod`; an unset key never means an open route. Test and dev
+  configs set `profile: dev` (`WA_PROFILE=dev` where login runs too, since it reads no YAML).
+  Lifetimes nobody tunes per deployment are a constant in code, not YAML/env. New scalar config →
+  a field on `Config` + a row in the crate's `ENV` table (if it needs an env var) + a row in
+  `README.md`.
+- Where a setting lives is fixed: the redirect allowlist is bff's (`WA_REDIRECT_URI_ALLOWLIST`,
+  exact string match, checked at `/login`, `/logout`, `/logged-out` and again at `/callback`);
+  Kratos' `allowed_return_urls` and Hydra's URLs live in `ory/`; the claim names Hydra puts at
+  the top level of a token live in Hydra's `oauth2.allowed_top_level_claims`, which must match
+  what the deployer's claims webhook returns.
+- Custom environment variables are prefixed with `WA_`. Ory's own are not (`DSN`,
+  `SECRETS_COOKIE`, ...) and are set on the Ory containers only.
 - Root `Cargo.toml`'s `[workspace.dependencies]` declares bare version numbers only, no
   features (e.g. `axum = "0.8"`, not `axum = { version = "0.8" }`). Each member crate
   declares the features it needs on its own `{ workspace = true, features = [...] }`
   line. Exception: `default-features = false` is part of the dependency's identity
   shared by every consumer, so it belongs on the root declaration (see `openidconnect`),
   not repeated per member.
-- In-memory storage (backend's PKCE store, bff's session store) follows the same idiom
-  throughout: `Arc<Mutex<HashMap<...>>>`, "take"/remove-on-read for single-use records.
+- In-memory storage (bff's session store and `logout_token` `jti` store, login's throttle)
+  follows the same idiom throughout: `Arc<Mutex<HashMap<...>>>`, "take"/remove-on-read for
+  single-use records.
+- Webhook handlers (hooks) and the Kratos/Hydra clients follow the error rules above: the cause
+  goes in the service error and the log, never in what Kratos, Hydra or a browser sees.
 
 ## Gotchas
 
-- Docker must copy `/app/login/static` to the same absolute path the binary was built
-  with (the static-dir root is baked from `CARGO_MANIFEST_DIR` at compile time).
-- Deployer-replaceable templates live in the top-level `templates/` (`pages/` for login, `emails/` for backend's
-  email). Both crates bake the path as `<crate>/../templates/...` at compile time, so Docker must copy
-  `/app/templates` and keep `/app/login` and `/app/backend` present (the image copies an
-  empty `/app/backend` for this; without it backend can't resolve `../templates` and won't
-  boot). Never put templates back under a crate directory.
-- If a backend or bff route is added, update the route table in `README.md`.
-- Backend must never be deployed with a public-facing listener/ingress — only bff and
-  login are meant to be internet-exposed; a trusted internal service may reach backend
-  directly, but backend itself is never safe to expose.
-- A plugin's stdin is its gRPC connection until the SDK takes it and points fd 0 at
-  `/dev/null`. Code that touches fd 0 before calling `serve` (a probe fixture reading
-  stdin, say) corrupts the HTTP/2 stream, which surfaces as odd transport errors rather
-  than anything pointing at stdin.
-- `plugin-sdk/go` ships **no generated code** on purpose: `Serve` takes a
-  `func(*grpc.Server)` and the plugin author registers their own stubs. Don't reintroduce
-  checked-in `.pb.go` here -- it drifts from the `.proto` with nothing to catch it, and
-  `protoc-gen-go` 1.36+ writes `unsafe` into it. The Rust SDK generates in `build.rs`
-  instead, so it can't go stale.
+- Docker must copy `/app/login/static` and `/app/templates` to the same absolute paths the
+  binaries were built with: login bakes `<crate>/static`, `<crate>/../templates/pages` and `<crate>/../templates/providers` at
+  compile time (`CARGO_MANIFEST_DIR`). Deployer-replaceable page templates and provider logos live in the top-level
+  `templates/pages/` and `templates/providers/`; never put them back under a crate directory.
+- If a bff route or hooks route is added, update the route table in `README.md`; if a Kratos or
+  Hydra setting changes, update `ory/README.md` and the matching `local-prod/` file.
+- hooks (1983) and bff's internal listener (8082) must never be publicly reachable: bff's
+  (`/backchannel-logout`, `/internal/revoke`) and hooks' routes are authorized only by a token or
+  an API key. Kratos and Hydra admin ports are internal too. Only bff's public port and login are
+  meant to be internet-exposed, and Hydra's `/oauth2/auth` and `/oauth2/sessions/logout` through
+  the proxy.
+- Kratos can't read the hooks API key from env: `ory/kratos/start.sh` and `ory/hydra/start.sh`
+  substitute `@WA_HOOKS_API_KEY@` into a copy of the config, so use a hex or base64url key. A
+  second Kratos `-c` file **replaces** arrays rather than merging them (the session-on-registration overlay
+  repeats the web hook for that reason), and a method's own hook list replaces the global one.
+- Hydra 26's `skip_consent` does not bypass `urls.consent`, so login has a `/consent`; Hydra's
+  admin revocation by subject does not fire back-channel logout, so hooks also calls bff's
+  `/internal/revoke`; a JWT access token stays valid until `exp` whatever is revoked, so keep
+  `ttl.access_token` short; `WA_HYDRA_REFRESH_TOKEN_TTL_SECS` (bff) must equal Hydra's
+  `ttl.refresh_token`.
+- Known gaps, documented as current behaviour: a verification started by a *login* ends on Kratos'
+  `/error` after the code is entered (the address is verified; the user signs in again), and hooks
+  cannot see which scopes the user granted at a provider, so `profile_apis[].scope` cannot be
+  enforced.
+- `docker compose down -v` resets everything in `local-prod/`, Postgres included; the secrets in
+  its `.env` belong to that data (regenerate both together).
 - Toggling `RUSTC_WRAPPER`/`CARGO_INCREMENTAL` between builds (e.g. experimenting with
   disabling sccache) can leave `sccache` serving a stale/corrupted cached object for a
   later build with the *same* env — surfaces as unrelated tests failing or passing

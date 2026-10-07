@@ -1,0 +1,19 @@
+[tasks.dev]
+description = "Run development in dev mode"
+# Only on this task: the tests expect WA_PROFILE's prod default and set their own keys.
+# Kratos and Hydra present WA_HOOKS_API_KEY as their web hook API key; hooks presents
+# WA_BFF_INTERNAL_API_KEY to bff's internal listener.
+env = { WA_HOOKS_API_KEY = "dev-hooks-key", WA_BFF_INTERNAL_API_KEY = "dev-bff-internal-api-key" }
+run = "cargo run"
+
+[tasks.build]
+description = "Build the project"
+run = "cargo build"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.lint]
+description = "Run linters"
+run = "cargo clippy --all-targets -- -D warnings"

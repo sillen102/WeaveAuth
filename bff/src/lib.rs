@@ -16,6 +16,9 @@
 )]
 
 pub mod config;
+pub(crate) mod hydra;
 pub(crate) mod model;
 pub mod server;
 pub(crate) mod storage;
+#[cfg(test)]
+mod test_support;

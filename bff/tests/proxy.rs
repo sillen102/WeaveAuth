@@ -1,169 +1,17 @@
-use anyhow::Context;
+//! The proxy: session cookie to bearer token, header filtering, caching rules, CORS.
+
+mod support;
+
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, Query};
+use axum::extract::{Path, Query};
 use axum::http::{Request, StatusCode};
-use axum::routing::{get, post};
-use axum::{Form, Json, Router};
-use common::model::token::GrantType;
-use std::net::SocketAddr;
-use tower::ServiceExt;
-use weaveauth_bff::config::{Config, RouteConfig};
-use weaveauth_bff::server::app;
+use axum::routing::get;
+use axum::{Json, Router};
+use support::{Bff, Session, api_route, cookie_pair, location, query_of};
+use uuid::Uuid;
+use weaveauth_bff::config::RouteConfig;
 
-/// The rate limiter's key extractor reads `ConnectInfo<SocketAddr>`,
-/// which `axum::serve` only populates via `into_make_service_with_connect_info`
-/// -- these tests call the router directly via `oneshot`, so it has to be
-/// inserted by hand.
-fn with_test_peer(mut req: Request<Body>) -> Request<Body> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    req
-}
-
-fn login_request(redirect_uri: &str) -> anyhow::Result<Request<Body>> {
-    Ok(with_test_peer(
-        Request::post("/login")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("origin", "http://login.test")
-            .body(Body::from(format!(
-                "email=alice&password=hunter2&redirect_uri={}&next=http%3A%2F%2Flogin.test%2F",
-                url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>()
-            )))?,
-    ))
-}
-
-fn test_config(backend_url: String, routes: Vec<RouteConfig>) -> Config {
-    Config {
-        port: 8080,
-        bff_url: "http://bff.test".into(),
-        backend_url,
-        session_cookie_name: "wa_session".into(),
-        routes,
-        trusted_origins: vec!["http://login.test".into()],
-        rate_limit_max_attempts: 1000,
-        rate_limit_proxy_max_attempts: 1000,
-        trusted_proxies: vec![],
-        docs_enabled: false,
-        login_public_url: "http://login.test".into(),
-    }
-}
-
-async fn stub_backend() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let router = Router::new()
-        .route(
-            "/oauth/login",
-            post(|| async { Json(serde_json::json!({"login_session": "stub-session"})) }),
-        )
-        .route(
-            "/oauth/authorize",
-            get(
-                |axum::extract::Query(q): axum::extract::Query<
-                    std::collections::HashMap<String, String>,
-                >| async move {
-                    let redirect_uri = q.get("redirect_uri").cloned().unwrap_or_default();
-                    axum::response::Redirect::to(&format!("{redirect_uri}?code=stub-code"))
-                },
-            ),
-        )
-        .route(
-            "/oauth/token",
-            post(|Form(_body): Form<serde_json::Value>| async move {
-                Json(serde_json::json!({
-                    "access_token": "stub-access-token",
-                    "refresh_token": "stub-refresh-token",
-                    "token_type": "Bearer",
-                    "expires_at": chrono::Utc::now() + chrono::Duration::minutes(15),
-                    "refresh_expires_at": chrono::Utc::now() + chrono::Duration::days(30),
-                    "user_id": uuid::Uuid::new_v4(),
-                }))
-            }),
-        );
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    Ok((format!("http://{addr}"), handle))
-}
-
-/// Like `stub_backend`, but its `/oauth/token` route branches on `grant_type`
-/// so refresh-flow tests can control both the initial login's token expiries
-/// and what the refresh grant hands back, and counts how many times it was
-/// asked to refresh so tests can assert on that.
-async fn stub_backend_with_expiry(
-    access_expires_at: chrono::DateTime<chrono::Utc>,
-    refresh_expires_at: chrono::DateTime<chrono::Utc>,
-    refresh_failure: Option<StatusCode>,
-) -> anyhow::Result<(
-    String,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-)> {
-    use axum::response::IntoResponse;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let refresh_calls = Arc::new(AtomicUsize::new(0));
-    let refresh_calls_for_route = refresh_calls.clone();
-    let router = Router::new()
-        .route(
-            "/oauth/login",
-            post(|| async { Json(serde_json::json!({"login_session": "stub-session"})) }),
-        )
-        .route(
-            "/oauth/authorize",
-            get(
-                |axum::extract::Query(q): axum::extract::Query<
-                    std::collections::HashMap<String, String>,
-                >| async move {
-                    let redirect_uri = q.get("redirect_uri").cloned().unwrap_or_default();
-                    axum::response::Redirect::to(&format!("{redirect_uri}?code=stub-code"))
-                },
-            ),
-        )
-        .route(
-            "/oauth/token",
-            post(
-                move |Form(body): Form<std::collections::HashMap<String, String>>| {
-                    let refresh_calls = refresh_calls_for_route.clone();
-                    async move {
-                        if body.get("grant_type").map(String::as_str)
-                            == Some(GrantType::RefreshToken.as_ref())
-                        {
-                            refresh_calls.fetch_add(1, Ordering::SeqCst);
-                            if let Some(status) = refresh_failure {
-                                return (status, "refresh failed").into_response();
-                            }
-                            return Json(serde_json::json!({
-                                "access_token": "refreshed-access-token",
-                                "refresh_token": "refreshed-refresh-token",
-                                "token_type": "Bearer",
-                                "expires_at": chrono::Utc::now() + chrono::Duration::minutes(15),
-                                "refresh_expires_at": chrono::Utc::now() + chrono::Duration::days(30),
-                                "user_id": uuid::Uuid::new_v4(),
-                            }))
-                            .into_response();
-                        }
-                        Json(serde_json::json!({
-                            "access_token": "stub-access-token",
-                            "refresh_token": "stub-refresh-token",
-                            "token_type": "Bearer",
-                            "expires_at": access_expires_at,
-                            "refresh_expires_at": refresh_expires_at,
-                            "user_id": uuid::Uuid::new_v4(),
-                        }))
-                        .into_response()
-                    }
-                },
-            ),
-        );
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    Ok((format!("http://{addr}"), refresh_calls, handle))
-}
+const SUB: Uuid = Uuid::from_u128(0x5b1d3d0e_3a49_4a8f_9f43_1d1f0e0a7b11);
 
 async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -199,6 +47,7 @@ async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)
                     [
                         ("content-type", "text/plain"),
                         ("content-disposition", "attachment"),
+                        ("content-encoding", "identity"),
                         ("content-security-policy", "sandbox"),
                         ("cache-control", "private"),
                         ("x-content-type-options", "bogus"),
@@ -211,11 +60,18 @@ async fn stub_upstream() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)
                         ),
                         ("alt-svc", "h3=\"evil.test:443\""),
                         ("x-upstream", "anything"),
+                        ("location", "/elsewhere"),
+                        ("vary", "accept-language"),
+                        ("etag", "\"v1\""),
+                        ("last-modified", "Tue, 15 Nov 1994 12:45:26 GMT"),
+                        ("www-authenticate", "Bearer realm=\"api\""),
+                        ("retry-after", "120"),
                     ],
                     "body",
                 )
             }),
-        );
+        )
+        .fallback(|uri: axum::http::Uri| async move { format!("path={}", uri.path()) });
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -234,65 +90,34 @@ async fn echo_headers(
     Json(seen)
 }
 
-fn extract_session_cookie(set_cookie: &str) -> String {
-    set_cookie
-        .split(';')
-        .next()
-        .map(str::to_string)
-        .unwrap_or_default()
+/// bff with `routes` proxied, and a logged-in session.
+async fn bff_with_session(routes: Vec<RouteConfig>) -> (Bff, Session) {
+    let bff = Bff::start_with(|config| config.routes = routes).await;
+    let session = bff.login(SUB, Some("sid-1")).await;
+    (bff, session)
 }
 
 #[tokio::test]
 async fn proxies_authenticated_request_swapping_cookie_for_bearer_token() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
     let (upstream, _uh) = stub_upstream().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: upstream,
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
+    let (bff, session) = bff_with_session(vec![api_route(upstream)]).await;
 
-    let login_resp = app
-        .clone()
-        .oneshot(login_request("http://admin.test/")?)
-        .await?;
-    let set_cookie = login_resp
-        .headers()
-        .get("set-cookie")
-        .context("login response missing set-cookie header")?
-        .to_str()?
-        .to_string();
-    let cookie = extract_session_cookie(&set_cookie);
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff.get("/api/whoami/42", Some(&session.cookie)).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
-    let body = String::from_utf8(body.to_vec())?;
-    assert_eq!(body, "id=42 auth=Bearer stub-access-token cookie=false");
+    assert_eq!(
+        String::from_utf8(body.to_vec())?,
+        "id=42 auth=Bearer access-1 cookie=false"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn missing_session_cookie_is_unauthorized() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
+    let (bff, _session) = bff_with_session(vec![api_route("http://unused.test".into())]).await;
 
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42").body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff.get("/api/whoami/42", None).await;
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     Ok(())
@@ -300,40 +125,18 @@ async fn missing_session_cookie_is_unauthorized() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn unknown_session_cookie_is_unauthorized() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
+    let (bff, _session) = bff_with_session(vec![api_route("http://unused.test".into())]).await;
 
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", "wa_session=does-not-exist")
-                .body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff
+        .get("/api/whoami/42", Some("wa_session=does-not-exist"))
+        .await;
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
 
-async fn seeded_cookie(app: Router, backend: &str) -> anyhow::Result<String> {
-    let login_resp = app.oneshot(login_request("http://admin.test/")?).await?;
-    let _ = backend; // kept for call-site clarity
-    let set_cookie = login_resp
-        .headers()
-        .get("set-cookie")
-        .context("login response missing set-cookie header")?
-        .to_str()?
-        .to_string();
-    Ok(extract_session_cookie(&set_cookie))
-}
-
 #[tokio::test]
 async fn longest_matching_prefix_wins() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
     let (general_upstream, _gh) = stub_upstream().await?;
     let (specific_upstream, _sh) = stub_upstream().await?;
     let routes = vec![
@@ -343,19 +146,12 @@ async fn longest_matching_prefix_wins() -> anyhow::Result<()> {
         },
         RouteConfig {
             path_prefix: "/api/v2".into(),
-            upstream_url: specific_upstream.clone(),
+            upstream_url: specific_upstream,
         },
     ];
-    let app = app(test_config(backend.clone(), routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), &backend).await?;
+    let (bff, session) = bff_with_session(routes).await;
 
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/v2/whoami/1")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff.get("/api/v2/whoami/1", Some(&session.cookie)).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
@@ -370,7 +166,6 @@ async fn longest_matching_prefix_wins() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn query_string_is_forwarded_to_upstream() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let upstream_router = Router::new().route(
@@ -380,21 +175,11 @@ async fn query_string_is_forwarded_to_upstream() -> anyhow::Result<()> {
     let _uh = tokio::spawn(async move {
         let _ = axum::serve(listener, upstream_router).await;
     });
+    let (bff, session) = bff_with_session(vec![api_route(format!("http://{addr}"))]).await;
 
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: format!("http://{addr}"),
-    }];
-    let app = app(test_config(backend.clone(), routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), &backend).await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/echo?foo=bar&baz=1")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff
+        .get("/api/echo?foo=bar&baz=1", Some(&session.cookie))
+        .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
@@ -404,7 +189,6 @@ async fn query_string_is_forwarded_to_upstream() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let upstream_router = Router::new().route(
@@ -414,22 +198,16 @@ async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
     let _uh = tokio::spawn(async move {
         let _ = axum::serve(listener, upstream_router).await;
     });
+    let (bff, session) = bff_with_session(vec![api_route(format!("http://{addr}"))]).await;
 
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: format!("http://{addr}"),
-    }];
-    let app = app(test_config(backend.clone(), routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), &backend).await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
+    let resp = bff
+        .send(
             Request::post("/api/echo")
-                .header("cookie", &cookie)
-                .header("origin", "http://login.test")
+                .header("cookie", &session.cookie)
+                .header("origin", "http://app.test")
                 .body(Body::from("hello upstream"))?,
-        ))
-        .await?;
+        )
+        .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
@@ -439,14 +217,9 @@ async fn request_body_is_forwarded_to_upstream() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn unmatched_path_is_not_found() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
-    let app = app(test_config(backend, vec![])).unwrap();
+    let bff = Bff::start().await;
 
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/no-such-route").body(Body::empty())?,
-        ))
-        .await?;
+    let resp = bff.get("/no-such-route", None).await;
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     Ok(())
@@ -456,16 +229,10 @@ async fn unmatched_path_is_not_found() -> anyhow::Result<()> {
 async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
     // /health has no bucket at all -- infra that polls it shouldn't get
     // caught by a limit meant for auth abuse or proxy flooding.
-    let (backend, _bh) = stub_backend().await?;
-    let mut config = test_config(backend, vec![]);
-    config.rate_limit_max_attempts = 1;
-    let app = app(config).unwrap();
+    let bff = Bff::start_with(|config| config.rate_limit_max_attempts = 1).await;
 
     for _ in 0..5 {
-        let resp = app
-            .clone()
-            .oneshot(with_test_peer(Request::get("/health").body(Body::empty())?))
-            .await?;
+        let resp = bff.get("/health", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
     Ok(())
@@ -475,243 +242,28 @@ async fn health_is_exempt_from_rate_limiting() -> anyhow::Result<()> {
 async fn proxy_rate_limit_is_independent_from_the_auth_bucket() -> anyhow::Result<()> {
     // Hammering the proxy fallback shouldn't burn /login's budget, and vice
     // versa -- they're separate buckets, each sized by its own setting.
-    let (backend, _bh) = stub_backend().await?;
-    let mut config = test_config(backend, vec![]);
-    config.rate_limit_max_attempts = 1;
-    config.rate_limit_proxy_max_attempts = 2;
-    let app = app(config).unwrap();
+    let bff = Bff::start_with(|config| {
+        config.rate_limit_max_attempts = 1;
+        config.rate_limit_proxy_max_attempts = 2;
+    })
+    .await;
 
-    let proxy_hit = || async {
-        let resp = app
-            .clone()
-            .oneshot(with_test_peer(
-                Request::get("/no-such-route").body(Body::empty())?,
-            ))
-            .await?;
-        anyhow::Ok(resp.status())
-    };
-    assert_eq!(proxy_hit().await?, StatusCode::NOT_FOUND);
-    assert_eq!(proxy_hit().await?, StatusCode::NOT_FOUND);
-    assert_eq!(proxy_hit().await?, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        bff.get("/no-such-route", None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        bff.get("/no-such-route", None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        bff.get("/no-such-route", None).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 
     // The proxy bucket being exhausted doesn't touch /login's separate one.
-    let login_resp = app.oneshot(login_request("http://admin.test/")?).await?;
-    assert_eq!(login_resp.status(), StatusCode::SEE_OTHER);
-    Ok(())
-}
-
-#[tokio::test]
-async fn access_token_within_the_refresh_leeway_is_refreshed_even_though_not_yet_expired()
--> anyhow::Result<()> {
-    // Still technically valid, but expiring soon enough that the request
-    // could plausibly reach backend after it dies in transit -- the proxy
-    // should refresh it up front rather than gamble on the network being fast.
-    let expiring_very_soon = chrono::Utc::now() + chrono::Duration::seconds(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(expiring_very_soon, refresh_still_valid, None).await?;
-    let (upstream, _uh) = stub_upstream().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: upstream,
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
-    let body = String::from_utf8(body.to_vec())?;
-    assert_eq!(
-        body,
-        "id=42 auth=Bearer refreshed-access-token cookie=false"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn expired_access_token_is_transparently_refreshed() -> anyhow::Result<()> {
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, None).await?;
-    let (upstream, _uh) = stub_upstream().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: upstream,
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
-    let body = String::from_utf8(body.to_vec())?;
-    // Not the token from login (already expired) -- the refreshed one.
-    assert_eq!(
-        body,
-        "id=42 auth=Bearer refreshed-access-token cookie=false"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn refreshed_token_is_persisted_so_a_second_request_does_not_refresh_again()
--> anyhow::Result<()> {
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, None).await?;
-    let (upstream, _uh) = stub_upstream().await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: upstream,
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    for _ in 0..2 {
-        let resp = app
-            .clone()
-            .oneshot(with_test_peer(
-                Request::get("/api/whoami/42")
-                    .header("cookie", &cookie)
-                    .body(Body::empty())?,
-            ))
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    assert_eq!(refresh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    Ok(())
-}
-
-#[tokio::test]
-async fn expired_access_and_refresh_token_is_unauthorized() -> anyhow::Result<()> {
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_also_expired = chrono::Utc::now() - chrono::Duration::seconds(1);
-    let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_also_expired, None).await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    Ok(())
-}
-
-#[tokio::test]
-async fn failed_refresh_call_is_unauthorized() -> anyhow::Result<()> {
-    // Expiry-wise the refresh token still looks valid, but backend rejects
-    // the refresh call itself (e.g. it was already revoked/rotated there).
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) = stub_backend_with_expiry(
-        already_expired,
-        refresh_still_valid,
-        Some(StatusCode::BAD_REQUEST),
-    )
-    .await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    Ok(())
-}
-
-#[tokio::test]
-async fn backend_failing_the_refresh_call_is_bad_gateway_not_unauthorized() -> anyhow::Result<()> {
-    // A 5xx from backend says nothing about the session, so it must not
-    // look like an expired one (which would bounce the user to login).
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) = stub_backend_with_expiry(
-        already_expired,
-        refresh_still_valid,
-        Some(StatusCode::INTERNAL_SERVER_ERROR),
-    )
-    .await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unparseable_refresh_response_is_bad_gateway() -> anyhow::Result<()> {
-    // 200 with a body that isn't a token response: backend answered, but
-    // nothing says the session is dead.
-    let already_expired = chrono::Utc::now() - chrono::Duration::minutes(1);
-    let refresh_still_valid = chrono::Utc::now() + chrono::Duration::days(30);
-    let (backend, _refresh_calls, _bh) =
-        stub_backend_with_expiry(already_expired, refresh_still_valid, Some(StatusCode::OK))
-            .await?;
-    let routes = vec![RouteConfig {
-        path_prefix: "/api".into(),
-        upstream_url: "http://unused.test".into(),
-    }];
-    let app = app(test_config(backend, routes)).unwrap();
-    let cookie = seeded_cookie(app.clone(), "").await?;
-
-    let resp = app
-        .oneshot(with_test_peer(
-            Request::get("/api/whoami/42")
-                .header("cookie", &cookie)
-                .body(Body::empty())?,
-        ))
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let login = bff.start_login("http://app.test/").await;
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
     Ok(())
 }
 
@@ -729,24 +281,14 @@ async fn send_to_app(
     req: axum::http::request::Builder,
     with_session: bool,
 ) -> anyhow::Result<axum::response::Response> {
-    let (backend, _bh) = stub_backend().await?;
     let (upstream, _uh) = stub_upstream().await?;
-    let app = app(test_config(
-        backend.clone(),
-        vec![RouteConfig {
-            path_prefix: "/api".into(),
-            upstream_url: upstream,
-        }],
-    ))
-    .unwrap();
+    let (bff, session) = bff_with_session(vec![api_route(upstream)]).await;
     let req = if with_session {
-        req.header("cookie", seeded_cookie(app.clone(), &backend).await?)
+        req.header("cookie", &session.cookie)
     } else {
         req
     };
-    Ok(app
-        .oneshot(with_test_peer(req.body(Body::empty())?))
-        .await?)
+    Ok(bff.send(req.body(Body::empty())?).await)
 }
 
 #[tokio::test]
@@ -755,6 +297,11 @@ async fn only_allowlisted_headers_and_the_bearer_token_reach_the_upstream() -> a
     for (name, value) in [
         ("content-type", "application/json"),
         ("accept", "application/json"),
+        ("accept-language", "sv"),
+        ("if-match", "\"v1\""),
+        ("if-none-match", "\"v1\""),
+        ("if-modified-since", "Tue, 15 Nov 1994 12:45:26 GMT"),
+        ("if-unmodified-since", "Tue, 15 Nov 1994 12:45:26 GMT"),
         ("user-agent", "test"),
         ("x-request-id", "req-1"),
         ("x-forwarded-for", "6.6.6.6"),
@@ -777,16 +324,26 @@ async fn only_allowlisted_headers_and_the_bearer_token_reach_the_upstream() -> a
 
     assert_eq!(
         seen.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["authorization", "content-type", "host"]
+        [
+            "accept",
+            "accept-language",
+            "authorization",
+            "content-type",
+            "host",
+            "if-match",
+            "if-modified-since",
+            "if-none-match",
+            "if-unmodified-since",
+        ]
     );
-    assert_eq!(seen["authorization"], ["Bearer stub-access-token"]);
+    assert_eq!(seen["authorization"], ["Bearer access-1"]);
     assert_eq!(seen["content-type"], ["application/json"]);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_post_from_a_trusted_origin_or_bff_itself_is_forwarded() -> anyhow::Result<()> {
-    for origin in ["http://login.test", "http://bff.test"] {
+    for origin in ["http://app.test", "http://bff.test"] {
         let resp = through_proxy(Request::post("/api/headers").header("origin", origin)).await?;
         assert_eq!(resp.status(), StatusCode::OK, "{origin}");
     }
@@ -839,11 +396,25 @@ async fn only_allowlisted_upstream_headers_reach_the_browser() -> anyhow::Result
             "access-control-expose-headers",
             "cache-control",
             "content-disposition",
+            "content-encoding",
             "content-security-policy",
             "content-type",
+            "etag",
+            "last-modified",
+            "location",
+            "retry-after",
             "vary",
+            "www-authenticate",
             "x-content-type-options",
         ]
+    );
+    assert_eq!(resp.headers()["content-security-policy"], "sandbox");
+    assert_eq!(resp.headers()["location"], "/elsewhere");
+    assert!(
+        resp.headers()
+            .get_all("vary")
+            .iter()
+            .any(|value| value == "accept-language")
     );
     assert_eq!(resp.headers()["cache-control"], "private");
     assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
@@ -919,7 +490,7 @@ fn header<'a>(resp: &'a axum::response::Response, name: &str) -> Option<&'a str>
 
 #[tokio::test]
 async fn a_preflight_from_a_trusted_origin_is_answered_without_a_session() -> anyhow::Result<()> {
-    for origin in ["http://login.test", "http://bff.test"] {
+    for origin in ["http://app.test", "http://bff.test"] {
         let resp = send_to_app(preflight(origin), false).await?;
 
         assert!(resp.status().is_success(), "{origin}: {}", resp.status());
@@ -946,12 +517,24 @@ async fn a_preflight_from_another_origin_is_not_allowed() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn a_preflight_may_only_ask_for_headers_bff_forwards() -> anyhow::Result<()> {
-    let resp = send_to_app(preflight("http://login.test"), false).await?;
+    let resp = send_to_app(preflight("http://app.test"), false).await?;
 
-    assert_eq!(
-        header(&resp, "access-control-allow-headers"),
-        Some("content-type")
-    );
+    let allowed: Vec<_> = header(&resp, "access-control-allow-headers")
+        .unwrap()
+        .split(',')
+        .collect();
+    for forwarded in [
+        "content-type",
+        "accept",
+        "accept-language",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ] {
+        assert!(allowed.contains(&forwarded), "{forwarded} in {allowed:?}");
+    }
+    assert!(!allowed.contains(&"x-custom"), "{allowed:?}");
     Ok(())
 }
 
@@ -976,11 +559,11 @@ async fn any_options_is_answered_by_bff_without_a_session_or_the_upstream() -> a
 #[tokio::test]
 async fn proxied_responses_carry_cors_headers_for_a_trusted_origin_only() -> anyhow::Result<()> {
     let resp =
-        through_proxy(Request::get("/api/headers").header("origin", "http://login.test")).await?;
+        through_proxy(Request::get("/api/headers").header("origin", "http://app.test")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         header(&resp, "access-control-allow-origin"),
-        Some("http://login.test")
+        Some("http://app.test")
     );
     assert_eq!(
         header(&resp, "access-control-allow-credentials"),
@@ -996,7 +579,7 @@ async fn proxied_responses_carry_cors_headers_for_a_trusted_origin_only() -> any
 #[tokio::test]
 async fn an_unauthenticated_request_still_carries_cors_headers() -> anyhow::Result<()> {
     let resp = send_to_app(
-        Request::get("/api/headers").header("origin", "http://login.test"),
+        Request::get("/api/headers").header("origin", "http://app.test"),
         false,
     )
     .await?;
@@ -1004,14 +587,14 @@ async fn an_unauthenticated_request_still_carries_cors_headers() -> anyhow::Resu
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         header(&resp, "access-control-allow-origin"),
-        Some("http://login.test")
+        Some("http://app.test")
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn form_routes_get_no_cors_headers() -> anyhow::Result<()> {
-    let resp = send_to_app(preflight("http://login.test").uri("/login"), false).await?;
+    let resp = send_to_app(preflight("http://app.test").uri("/login"), false).await?;
 
     assert_eq!(header(&resp, "access-control-allow-origin"), None);
     Ok(())
@@ -1019,26 +602,216 @@ async fn form_routes_get_no_cors_headers() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_rate_limited_proxy_response_still_carries_cors_headers() -> anyhow::Result<()> {
-    let (backend, _bh) = stub_backend().await?;
-    let mut config = test_config(backend, vec![]);
-    config.rate_limit_proxy_max_attempts = 1;
-    let app = app(config).unwrap();
+    let bff = Bff::start_with(|config| config.rate_limit_proxy_max_attempts = 1).await;
     let hit = || {
-        app.clone().oneshot(with_test_peer(
+        bff.send(
             Request::get("/no-such-route")
-                .header("origin", "http://login.test")
+                .header("origin", "http://app.test")
                 .body(Body::empty())
                 .unwrap(),
-        ))
+        )
     };
 
-    assert_eq!(hit().await?.status(), StatusCode::NOT_FOUND);
-    let resp = hit().await?;
+    assert_eq!(hit().await.status(), StatusCode::NOT_FOUND);
+    let resp = hit().await;
 
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         header(&resp, "access-control-allow-origin"),
-        Some("http://login.test")
+        Some("http://app.test")
     );
+    Ok(())
+}
+
+async fn body_of(resp: axum::response::Response) -> anyhow::Result<String> {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok(String::from_utf8(body.to_vec())?)
+}
+
+/// What the upstream's fallback saw as the path of a request to `uri` through `/api`.
+async fn upstream_path(uri: &str) -> anyhow::Result<(StatusCode, String)> {
+    let resp = through_proxy(Request::get(uri)).await?;
+    Ok((resp.status(), body_of(resp).await?))
+}
+
+#[tokio::test]
+async fn the_route_prefix_is_stripped_exactly_once() -> anyhow::Result<()> {
+    assert_eq!(
+        upstream_path("/api/x").await?,
+        (StatusCode::OK, "path=/x".to_string())
+    );
+    assert_eq!(
+        upstream_path("/api/api/x").await?,
+        (StatusCode::OK, "path=/api/x".to_string())
+    );
+    assert_eq!(
+        upstream_path("/api/api/api/x").await?,
+        (StatusCode::OK, "path=/api/api/x".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prefix_matches_whole_path_segments_only() -> anyhow::Result<()> {
+    for uri in ["/apix/x", "/apix", "/ap/x", "/API/x"] {
+        let resp = through_proxy(Request::get(uri)).await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    for uri in ["/api", "/api/", "/api/x"] {
+        let resp = through_proxy(Request::get(uri)).await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_path_that_climbs_or_hides_a_slash_is_not_found_before_the_upstream() -> anyhow::Result<()>
+{
+    for uri in [
+        "/api/../x",
+        "/api/%2e%2e/x",
+        "/api/%2E%2E/x",
+        "/api/.%2e/x",
+        "/api/./x",
+        "/api/%2e/x",
+        "/api/a/../../x",
+        "/api/a/%2e%2e/%2e%2e/x",
+        "/api/a%2fb",
+        "/api/a%2Fb",
+        "/api/a%5cb",
+        "/api/a%5Cb",
+        "/api/..",
+        "/api/..;/x",
+        "/api/%2e%2e;/x",
+        "/api/..;a=b/x",
+        "/api/.;/x",
+        "/api/..%00",
+        "/api/..%00/x",
+        "/api/..%20/x",
+        "/api/%2e%2e%20",
+        "/api/%252e%252e/x",
+        "/api/%252e%252e",
+        "/api/...",
+        "/api/%2e%2e%2e",
+        "/api/a%0ab",
+        "/api/a%7fb",
+    ] {
+        let resp = through_proxy(Request::get(uri)).await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    // Names that merely contain dots or encoded characters are ordinary paths.
+    for uri in ["/api/a..b", "/api/a%20b", "/api/a;b"] {
+        let resp = through_proxy(Request::get(uri)).await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_root_route_proxies_everything_the_endpoints_do_not_take() -> anyhow::Result<()> {
+    let (upstream, _uh) = stub_upstream().await?;
+    let routes = vec![RouteConfig {
+        path_prefix: "/".into(),
+        upstream_url: upstream,
+    }];
+    let (bff, session) = bff_with_session(routes).await;
+
+    let proxied = bff.get("/whoami/7", Some(&session.cookie)).await;
+    assert_eq!(proxied.status(), StatusCode::OK);
+    assert_eq!(
+        body_of(proxied).await?,
+        "id=7 auth=Bearer access-1 cookie=false"
+    );
+    let unauthenticated = bff.get("/whoami/7", None).await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    // bff's own endpoints still win over the root route.
+    assert_eq!(
+        bff.get("/login", None).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(body_of(bff.get("/health", None).await).await?, "ok");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_proxied_response_without_a_csp_is_sandboxed() -> anyhow::Result<()> {
+    let resp = through_proxy(Request::get("/api/headers")).await?;
+
+    assert_eq!(
+        resp.headers()["content-security-policy"],
+        "sandbox; frame-ancestors 'none'"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_upstream_csp_is_not_replaced() -> anyhow::Result<()> {
+    let resp = through_proxy(Request::get("/api/every-header")).await?;
+
+    assert_eq!(resp.headers()["content-security-policy"], "sandbox");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_request_body_past_the_limit_is_not_forwarded_whole() -> anyhow::Result<()> {
+    let (upstream, _uh) = stub_upstream().await?;
+    let (bff, session) = bff_with_session(vec![api_route(upstream)]).await;
+    let too_big = vec![b'x'; 10 * 1024 * 1024 + 1];
+
+    let resp = bff
+        .send(
+            Request::post("/api/headers")
+                .header("cookie", &session.cookie)
+                .header("origin", "http://app.test")
+                .body(Body::from(too_big))?,
+        )
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_session_cookie_sent_twice_is_no_session() -> anyhow::Result<()> {
+    let (upstream, _uh) = stub_upstream().await?;
+    let (bff, session) = bff_with_session(vec![api_route(upstream)]).await;
+
+    let once = bff.get("/api/whoami/1", Some(&session.cookie)).await;
+    assert_eq!(once.status(), StatusCode::OK);
+    let twice = bff
+        .get(
+            "/api/whoami/1",
+            Some(&format!("{}; wa_session=planted", session.cookie)),
+        )
+        .await;
+    assert_eq!(twice.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn over_https_only_the_host_prefixed_session_cookie_is_a_session() -> anyhow::Result<()> {
+    let (upstream, _uh) = stub_upstream().await?;
+    let bff = Bff::start_with(|config| {
+        config.bff_url = "https://bff.test".into();
+        config.routes = vec![api_route(upstream)];
+    })
+    .await;
+    let started = bff.start_login("http://app.test/").await;
+    let url = location(&started);
+    let state = query_of(&url)["state"].clone();
+    let code = bff.hydra.grant(&url, SUB, None);
+    let callback = bff
+        .get(
+            &format!("/callback?code={code}&state={state}"),
+            Some(&cookie_pair(&started, "__Host-wa_login")),
+        )
+        .await;
+    let prefixed = cookie_pair(&callback, "__Host-wa_session");
+
+    let accepted = bff.get("/api/whoami/1", Some(&prefixed)).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let unprefixed = prefixed.replace("__Host-", "");
+    let refused = bff.get("/api/whoami/1", Some(&unprefixed)).await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }

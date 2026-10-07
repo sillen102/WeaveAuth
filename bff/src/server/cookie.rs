@@ -9,12 +9,17 @@ const COOKIE_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
+/// The value of the cookie `cookie_name`; `None` when it is missing or sent more than once,
+/// since a sibling subdomain can plant a second one and the browser's order is no proof of
+/// which is ours.
 pub(crate) fn extract_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie_header.split(';').find_map(|pair| {
+    let mut values = cookie_header.split(';').filter_map(|pair| {
         let (name, value) = pair.trim().split_once('=')?;
         (name == cookie_name).then(|| percent_decode_str(value).decode_utf8_lossy().into_owned())
-    })
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 pub(crate) fn build_cookie(
@@ -27,26 +32,6 @@ pub(crate) fn build_cookie(
     let value = utf8_percent_encode(value, COOKIE_VALUE);
     let secure = if secure { "; Secure" } else { "" };
     format!("{name}={value}; HttpOnly; Path={path}; SameSite=Lax{secure}; Max-Age={max_age_secs}")
-}
-
-/// Like `build_cookie`, but `SameSite=None` instead of `Lax` -- for a cookie
-/// that must survive a cross-site top-level POST (a login-page form
-/// submitting to a bff on a different registrable domain), which `Lax`
-/// blocks. `SameSite=None` is only valid with `Secure`; browsers reject it
-/// otherwise, so this falls back to the ordinary `Lax` cookie when `secure`
-/// is false (plain-http dev, where login and bff are same-site anyway).
-pub(crate) fn build_cross_site_cookie(
-    name: &str,
-    value: &str,
-    path: &str,
-    max_age_secs: i64,
-    secure: bool,
-) -> String {
-    if !secure {
-        return build_cookie(name, value, path, max_age_secs, secure);
-    }
-    let value = utf8_percent_encode(value, COOKIE_VALUE);
-    format!("{name}={value}; HttpOnly; Path={path}; SameSite=None; Secure; Max-Age={max_age_secs}")
 }
 
 /// A `Set-Cookie` value that immediately expires the named cookie.
@@ -82,6 +67,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_cookie_refuses_a_name_sent_twice() -> anyhow::Result<()> {
+        // A sibling subdomain can plant a second cookie of the same name.
+        for header in [
+            "wa_session=planted; wa_session=real",
+            "wa_session=a; other=1; wa_session=a",
+        ] {
+            let headers = headers_with_cookie(header)?;
+            assert_eq!(extract_cookie(&headers, "wa_session"), None, "{header}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn extract_cookie_returns_none_when_name_is_absent() -> anyhow::Result<()> {
         let headers = headers_with_cookie("other=1; another=2")?;
         assert_eq!(extract_cookie(&headers, "wa_session"), None);
@@ -113,26 +111,6 @@ mod tests {
         assert_eq!(
             set_cookie,
             "wa_session=abc; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=60"
-        );
-    }
-
-    #[test]
-    fn build_cross_site_cookie_uses_samesite_none_when_secure() {
-        let set_cookie = build_cross_site_cookie("wa_pending", "tok", "/oidc", 300, true);
-        assert_eq!(
-            set_cookie,
-            "wa_pending=tok; HttpOnly; Path=/oidc; SameSite=None; Secure; Max-Age=300"
-        );
-    }
-
-    #[test]
-    fn build_cross_site_cookie_falls_back_to_lax_without_secure() {
-        // SameSite=None is invalid without Secure -- browsers reject it. Plain
-        // http (dev) keeps the ordinary Lax cookie instead.
-        let set_cookie = build_cross_site_cookie("wa_pending", "tok", "/oidc", 300, false);
-        assert_eq!(
-            set_cookie,
-            "wa_pending=tok; HttpOnly; Path=/oidc; SameSite=Lax; Max-Age=300"
         );
     }
 

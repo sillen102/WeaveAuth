@@ -1,0 +1,20 @@
+{% extends "layout.html" %}
+{% block title %}Create account{% endblock title %}
+{% block page %}
+<main class="card">
+  <h1>Create an account</h1>
+  {{ messages(flow=flow) }}
+  {% if continuing(flow=flow) %}
+  {{ form(flow=flow, groups=["default", "oidc"], missing_only=true) }}
+  {% else %}
+  {{ form(flow=flow, groups=["default", "profile", "password"]) }}
+  {{ form(flow=flow, groups=["passkey", "webauthn"]) }}
+  {% set social = form(flow=flow, groups=["oidc"]) %}
+  {% if social %}
+  <div class="divider"><span>or</span></div>
+  {{ social }}
+  {% endif %}
+  {% endif %}
+  <p class="secondary">Already have an account? <a href="{{ login_url }}">Sign in</a></p>
+</main>
+{% endblock page %}

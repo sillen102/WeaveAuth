@@ -1,0 +1,31 @@
+profile: dev
+# Kratos admin, Hydra admin and bff's internal listener. These are the defaults
+# of the dev profile; the prod profile refuses to start unless they are set
+# (WA_KRATOS_ADMIN_URL, WA_HYDRA_ADMIN_URL, WA_BFF_INTERNAL_URL).
+kratos_admin_url: http://localhost:4434
+hydra_admin_url: http://localhost:4445
+bff_internal_url: http://localhost:8082
+# Local-testing webhooks served by testing/user-service (which only checks that a bearer token is
+# sent).
+# {user_id, email, email_verified, fields} for every new identity; an error fails the registration.
+# Every handler also takes `bearer_token`, sent as `Authorization: Bearer <token>`.
+registration_handler:
+  url: http://localhost:10002/users
+  bearer_token: dev-user-service-token
+# {user_id, email, email_verified, client_id, scopes} on every token mint; the returned claims go into
+# the access token. Don't derive roles from an email that isn't verified.
+login_claims_handler:
+  url: http://localhost:10002/users/claims
+  bearer_token: dev-user-service-token
+# Per Kratos OIDC provider id. After a social sign-up hooks reads the access token Kratos stored for
+# the identity and calls these for claims the id_token doesn't carry. The fields reach the
+# registration handler next to the identity's traits.
+profile_apis:
+  google:
+    - url: https://people.googleapis.com/v1/people/me?personFields=phoneNumbers
+      # A failed call (or a pointer that finds nothing) fails the registration when true.
+      required: false
+      # Must be in the provider's scope list (ory/kratos/oidc-google-phone.yml). Not enforced; see README.
+      scope: https://www.googleapis.com/auth/contacts.readonly
+      claims:
+        phone_number: /phoneNumbers/0/canonicalForm

@@ -1,4 +1,4 @@
-# The only thing on the public network: terminates TLS and forwards to bff/login over `edge`.
+# The only thing on the public network: terminates TLS and forwards over `edge`.
 {
 	admin off
 	auto_https disable_redirects
@@ -6,10 +6,23 @@
 
 login.localhost:8443 {
 	tls /certs/server.crt /certs/server.key
-	reverse_proxy weaveauth:8081
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Hydra's browser endpoints. Everything else of Hydra (token, JWKS, admin) stays internal.
+	@hydra path /oauth2/auth /oauth2/sessions/logout
+	handle @hydra {
+		reverse_proxy hydra:4444
+	}
+
+	# Pages, and /self-service/* + /.well-known/ory/*, which only login may forward to Kratos:
+	# it applies the rate limits. Never route those straight to Kratos.
+	handle {
+		reverse_proxy weaveauth:8081
+	}
 }
 
 bff.localhost:8443 {
 	tls /certs/server.crt /certs/server.key
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	reverse_proxy weaveauth:8080
 }

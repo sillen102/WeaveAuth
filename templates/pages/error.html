@@ -1,0 +1,8 @@
+{% extends "layout.html" %}
+{% block title %}Something went wrong{% endblock title %}
+{% block page %}
+<main class="card">
+  <h1>Something went wrong</h1>
+  <p class="error">{{ error.message }}</p>
+</main>
+{% endblock page %}

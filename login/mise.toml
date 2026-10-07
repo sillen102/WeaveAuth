@@ -1,8 +1,8 @@
 [tasks.dev]
 description = "Run development in dev mode"
 # Only on this task: login reads no config.yaml, and the tests expect WA_PROFILE's prod default.
-# Pages opened without a redirect_uri (a bare visit, email links) land on the local
-# downstream, the one entry in backend/config.yaml's redirect_uri_allowlist.
+# A page opened without a login challenge or a flow sends the browser through bff's /login
+# to the local downstream, which has to be on bff's redirect_uri_allowlist.
 env = { WA_PROFILE = "dev", WA_DEFAULT_REDIRECT_URI = "http://localhost:8080/downstream" }
 run = "cargo run"
 

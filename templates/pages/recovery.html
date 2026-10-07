@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block title %}Recover your account{% endblock title %}
+{% block page %}
+<main class="card">
+  <h1>Recover your account</h1>
+  {{ messages(flow=flow) }}
+  {{ form(flow=flow, groups=["default", "code"]) }}
+  <p class="secondary"><a href="{{ login_url }}">Back to sign in</a></p>
+</main>
+{% endblock page %}

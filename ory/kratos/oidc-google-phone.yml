@@ -1,0 +1,15 @@
+# oidc-google.yml plus the scope for the phone number: load this one *instead of* it (a later -c file
+# replaces the providers list, it does not merge). Keep the scope in step with `scope:` of
+# `profile_apis.google` in hooks' config.yaml.
+selfservice:
+  methods:
+    oidc:
+      config:
+        providers:
+          - id: google
+            provider: google
+            label: Google
+            client_id: "@GOOGLE_CLIENT_ID@"
+            client_secret: "@GOOGLE_CLIENT_SECRET@"
+            mapper_url: file:///etc/kratos/oidc/google.jsonnet
+            scope: [email, profile, https://www.googleapis.com/auth/contacts.readonly]
