@@ -17,6 +17,6 @@ axum = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-schemars = { workspace = true }
-aide = { workspace = true, features = ["axum"] }
 common = { path = ".." }
+tokio = { workspace = true, features = ["macros", "rt"] }
+trybuild = { workspace = true }

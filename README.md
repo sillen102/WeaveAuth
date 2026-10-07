@@ -1,585 +1,484 @@
 # WeaveAuth
 
-OAuth2/PKCE authorization server with a real Backend-for-Frontend (BFF).
+Sign-in for a web app with a real Backend-for-Frontend (BFF): password, Google (or any OIDC
+provider) and passkeys, recovery and email verification, on top of **Ory Kratos** (identities) and
+**Ory Hydra** (OIDC and JWT access tokens). The browser ends up with one HttpOnly session cookie on
+the BFF's origin; the tokens stay on the server, which proxies API calls with a Bearer JWT.
 
-A Cargo workspace with three Rust binaries: an Axum backend (unexposed to the internet),
-a BFF that owns the OAuth client role and session cookies, and an optional static login
-page.
+WeaveAuth is the part around Ory: a Cargo workspace with three Rust services (`bff`, `login`,
+`hooks`) and the Ory configuration (`ory/`). Kratos and Hydra run as their own containers from the
+official images.
 
 ## Architecture
 
-Cargo workspace (`backend/` + `bff/` + `login/`), three binaries:
+```
+                         ┌──────────────── login host (Caddy / ingress) ───────────────┐
+ browser ───────────────►│  /                          → login  :8081                  │
+                         │  /self-service/*, /.well-known/ory/*                        │
+                         │                             → login :8081 → Kratos public   │
+                         │  /oauth2/auth, /oauth2/sessions/logout → Hydra public :4444 │
+                         └──────────────────────────────────────────────────────────────┘
+ browser ───────────────► bff host: everything          → bff    :8080 (public listener)
 
-- **`weaveauth`** (Axum, backend) — `:1983`. API + OAuth2/PKCE authorization server
-  logic. **Not exposed publicly** — only `bff` and `login` are internet-facing.
-- **`weaveauth-bff`** (Axum, BFF) — `:8080`. The real OAuth client: verifies user
-  credentials and drives the entire authorization-code + PKCE exchange with backend
-  server-to-server on a single `/login` request — the browser never sees backend at
-  all, only bff's one 303 back to the caller with a `Set-Cookie`. Owns the session
-  store.
-  Also acts as a reverse proxy for any other route: requests matching a
-  configured `path_prefix` are forwarded to `upstream_url` with the session cookie
-  swapped for an `Authorization: Bearer <access_token>` header (see Configuration
-  below).
-- **`weaveauth-login`** (axum + Tera, server-rendered UI) — `:8081`. Optional, thin,
-  replaceable: `/` serves a small shell (`index.html`, compiled into the binary) that
-  loads `login.html` by default and switches between it and `register.html` via HTMx,
-  keeping the URL's query string (`redirect_uri`, etc.) intact across the swap.
-  `login.html`/`register.html` are Tera templates rendered per-request from
-  `templates/pages/` — no build step, so a deployer can drop in reskinned versions of
-  those files without touching the shell that wires them together. Per
-  `login/AGENTS.md`, these templates must stay plain HTML/CSS with **no `<script>` or
-  client-side logic at all** — every dynamic value (`redirect_uri`, the form's
-  `action`, OIDC links, error messages, the OIDC password-confirm view) is computed
-  server-side and injected via the Tera context; only the compiled-in shell is allowed
-  its own JS.
+ internal only:  bff :8082 (/backchannel-logout, /internal/revoke)   hooks :1983
+                 Kratos admin :4434   Hydra admin :4445   Hydra token/JWKS :4444   Postgres
+```
 
-Login (authorization-code + PKCE) flow — the browser only ever talks to `login` and
-`bff`; backend is never in the browser's network tab:
+- **`weaveauth-bff`** (Axum) — public `:8080`, internal `:8082`. The OAuth/OIDC client of Hydra: it
+  starts the login (PKCE, `state`, `nonce`), redeems the code, verifies the id_token, keeps the
+  tokens in its session store and gives the browser only `wa_session`. It also reverse-proxies the
+  routes in its `config.yaml` with `Authorization: Bearer <access token>` (refreshing the token
+  when due), runs logout, and receives Hydra's back-channel logout and hooks' revocations on its
+  internal listener. **The redirect allowlist lives here.**
+- **`weaveauth-login`** (Axum + Tera) — `:8081`. The server-rendered UI for Kratos' flows (login,
+  registration, recovery, verification, settings, error) and for Hydra's login, consent and logout
+  challenges. It is the **only** way anything public reaches Kratos (`/self-service/*`,
+  `/.well-known/ory/*`): it applies per-client rate limits and a per-identifier throttle on password
+  submissions. Pages are templates in `templates/pages/`, and provider logo images in `templates/providers/`, that a deployer can replace; per
+  `login/AGENTS.md` they are plain HTML and CSS, scripts come only from the compiled-in layout and
+  from Kratos' own script nodes. Templates call `form`, `messages`, `continuing` (a social sign-up
+  missing traits) and `recovering` (settings right after a recovery); see `login/AGENTS.md`.
+- **`weaveauth-hooks`** (Axum) — `:1983`, **internal only**. The web hooks Kratos and Hydra call:
+  the claims for every token, the registration handoff (with provider profile APIs), and the purge
+  after a recovery or password change. Every route but `/health` needs
+  `Authorization: Bearer <WA_HOOKS_API_KEY>`.
+- **Kratos and Hydra** — configured under `ory/` (see [ory/README.md](ory/README.md)); Postgres
+  behind both. Local-prod runs them with the services behind TLS ([local-prod/](local-prod/README.md)).
+- **`weaveauth-launcher`** — the container entrypoint: runs hooks, bff and login together.
 
-1. Browser hits `login`'s shell (`/`), which loads `login.html`: a real
-   username/password form (server-rendered with its `action` already set to
-   `{WA_BFF_URL}/login`) plus a link to `register.html` (same pattern, posts to
-   `{WA_BFF_URL}/register`).
-2. Submitting the login form does a **plain cross-origin form POST straight to bff**
-   (not a `fetch`) — this is what lets bff's `Set-Cookie` response end up scoped to
-   bff's own origin, and needs no CORS since it's a real browser navigation, not a
-   script-read response.
-3. `bff` first calls backend's `POST /oauth/login` with the submitted
-   identifier/password. Backend hashes-and-compares (Argon2) against `UserStorage` and,
-   on success, returns a short-lived, single-use `login_session` token. Wrong
-   credentials → bff 303s the browser back to the login page with `?error=1` (the page
-   shows an inline message) — `/oauth/authorize` is never even called.
-4. `bff` generates a `code_verifier`, derives `code_challenge` (S256), and — entirely
-   server-to-server via its own HTTP client — `GET`s the backend's `/oauth/authorize`
-   with the caller's `redirect_uri` and the `login_session` from step 3.
-5. Backend's `/oauth/authorize` first consumes `login_session` (`401` if missing,
-   unknown, expired, or already used — this is what makes "authenticate before
-   authorize" a real, server-enforced ordering per RFC 6749 §4.1.1, rather than
-   something every caller has to get right on its own). It then checks `redirect_uri`
-   against `WA_REDIRECT_URI_ALLOWLIST`/`config.yaml` — the **single source of truth**
-   for that allowlist — and refuses to issue a code for anything not on it (`400`). On
-   success, backend stores the challenge keyed by a single-use, TTL'd auth code and
-   responds (to bff, not the browser) with a 303 whose `Location` carries the `code`.
-   bff reads `code` straight out of that header — it never actually navigates there.
-6. Still within the same request, `bff` POSTs `code` + `code_verifier` to the backend
-   `POST /oauth/token` (server-to-server), verifies success, mints a session, stores it
-   in its session store, and *only now* replies to the browser: one 303 straight to the
-   original `redirect_uri` with a `Set-Cookie: wa_session=...; HttpOnly` header — no
-   token in the URL, and no browser-visible hop through backend at any point.
+Never expose hooks, bff's internal listener, or the Kratos and Hydra admin APIs. Hydra's only
+public endpoints are `/oauth2/auth` and `/oauth2/sessions/logout`; its token endpoint and JWKS are
+reached on the internal URL.
 
-Registration follows the same shape: `register.html` posts email/password straight to
-bff's `POST /register`, which forwards to backend's `POST /register` (Argon2-hashes the
-password, saves the user with `email_verified: false`), then immediately drives the same
-login flow as step 3 onward above using those same credentials — one form submission
-ends with a session cookie set and the browser on `redirect_uri`, no separate "now sign
-in" step. Registration failure (e.g. a taken email) 303s back to `next?error=1` instead.
+### Flows
 
-Because `/oauth/login` and `/oauth/authorize` are separate, independently callable
-endpoints, the `login_session` requirement on `/oauth/authorize` is what prevents a
-future direct caller (e.g. an SPA built straight against backend, bypassing bff) from
-skipping authentication by calling things in the wrong order — the ordering is enforced
-by backend's own state, not by convention.
+Each flow has a sequence diagram and the details in [docs/flows/](docs/flows/):
 
-Every bff and backend route that takes request input rejects malformed input (a missing field, a wrong
-content type, a repeated query key) with the same JSON error body as any other failure, with
-`reason: "InvalidRequest"` and status `400`, `415` or `422` -- never a plain-text message.
+| Flow | Doc |
+|---|---|
+| Login: password, Google/OIDC (and linking), passkey | [login.md](docs/flows/login.md) |
+| Registration and email verification (both verified-first modes) | [registration.md](docs/flows/registration.md) |
+| Recovery | [recovery.md](docs/flows/recovery.md) |
+| Logout and back-channel logout | [logout.md](docs/flows/logout.md) |
+| Token claims, refresh and the proxy | [tokens.md](docs/flows/tokens.md) |
+
+In short, a login is: the app sends the browser to bff's `GET /login?redirect_uri=...` → Hydra →
+`login`'s pages → Kratos checks the credential → Hydra → bff's `/callback`, which redeems the code and
+answers one `303` to `redirect_uri` with `Set-Cookie: wa_session`. No token is ever in a URL or
+readable by the browser.
 
 ### Third-party login (OIDC) and account linking
 
-`GET /oauth/oidc/login?provider={provider}` / `GET /oauth/oidc/callback?provider={provider}` (backend) let
-a user sign in via Google/LinkedIn/Apple etc. instead of a password; bff proxies both
-(see its own `/oidc/{provider}/*` routes below) since backend isn't internet-exposed.
-An account can have several provider identities linked to it — Google today, LinkedIn
-tomorrow, same account — and backend records each linked `(provider, subject)`. Each `User`
-has an `email_verified` flag: `false` for a plain password registration until the user
-enters the emailed 9-digit code or links a provider identity, `true` for an account an OIDC
-login created.
+A provider (Google today) is a Kratos OIDC provider; its client id and secret live in Kratos'
+config. Kratos' Jsonnet mapper copies the id_token's claims into identity traits and marks the
+address verified **only** when the id_token says `email_verified: true`.
 
-A provider's verified email proves mailbox access, not that its user owns the account with
-that email: the account may have been pre-registered by an attacker with a password of
-their choosing. So the linking decision (`UserStorage::resolve_oidc_login`) never links a
-new identity on email match alone:
+A provider's verified email proves mailbox access, not that its user owns the account with that
+email (an attacker may have pre-registered it with a password). So an email match never links an
+identity on its own (`account_linking_mode: confirm_with_existing_credential`): the user first
+signs in with the existing account's own credential, then the provider is linked. Imported accounts
+are never set to auto-link either.
 
-- Identity already linked → signed in.
-- New email → a new account is created with this identity linked.
-- Matching account exists, identity not linked → backend returns
-  `link_confirmation_required` (with `has_password` and `linked_providers`) instead of a
-  session. The user confirms with the account's *current* password
-  (`POST /oauth/oidc/confirm-link`), or by signing in through one of `linked_providers`,
-  which bff sends back to `/oauth/oidc/callback` with the `pending_link_token`. Only then
-  is the identity linked (and the account marked `email_verified: true`). The real owner
-  of a squatted address, or of a password-less account who lost access to every linked
-  provider, resets the password by email first ([docs/flows/password-reset.md](docs/flows/password-reset.md)).
+## Routes
 
-The email itself is only trusted as proof when it comes with independent confirmation —
-`resolve_oidc_login` takes a `VerifiedEmail`, a type that can only be constructed by
-naming what verified it (e.g. `claims.email_verified() == Some(true)` from a signature-
-checked OIDC id_token). This is enforced by the type system, not just a doc comment, so a
-future caller can't accidentally create an account for an address the provider never
-confirmed.
+bff, public listener (`WA_BFF_PORT`, default `8080`). The first four routes share one per-client
+rate-limit bucket (`tower_governor`; `WA_RATE_LIMIT_MAX_ATTEMPTS`), the proxy has its own
+(`rate_limit_proxy_max_attempts`, YAML only: 600 a minute in `prod`, 6000 in `dev`; `0` stops bff
+from starting). A client is its IPv4 address or IPv6 /64. Behind a reverse proxy set
+`WA_TRUSTED_PROXIES`, or every client shares the proxy's bucket. The `prod` default (10 a minute
+per client) is shared by everyone behind one NAT, and a login plus a logout costs 4 tokens: size
+`WA_RATE_LIMIT_MAX_ATTEMPTS` for the busiest address next to `WA_TRUSTED_PROXIES`. `/health` is exempt:
 
-### bff routes
+| Method | Path | Returns |
+|--------|------|---------|
+| GET | `/login?redirect_uri=` | Starts a login. `redirect_uri` (absent or empty: `WA_DEFAULT_REDIRECT_URI`) must be an exact entry of `WA_REDIRECT_URI_ALLOWLIST` (`400` otherwise, or when neither is given). Keeps the PKCE verifier, `state`, `nonce` and the `redirect_uri` in the `wa_login` cookie (10 minutes; `__Host-wa_login` under https) and `303`s to Hydra's `/oauth2/auth` |
+| GET | `/callback` | Where Hydra sends the browser back. Checks `state` against the `wa_login` cookie, redeems `code` (PKCE, `client_secret_basic`, Hydra's internal URL), verifies the id_token, stores the session, ends the session the browser already had (dropped, its refresh token revoked), `303` → the `redirect_uri` with `wa_session` set (`HttpOnly`, `SameSite=Lax`, `Max-Age` = the session's lifetime, fixed at login, see [tokens.md](docs/flows/tokens.md); `__Host-wa_session` under https). A user holds at most 20 sessions: a login beyond that ends the oldest, its refresh token revoked. A login cookie or session cookie sent twice counts as absent. `400` for no login in progress, a state mismatch, an `error` from Hydra, a missing code, a redirect no longer on the allowlist or a rejected code; `502` if Hydra is unreachable or its response is invalid |
+| POST | `/logout[?redirect_uri=]` | Needs a trusted `Origin` (`403`). Drops the session, revokes its refresh token, clears `wa_session` and `303`s to Hydra's logout with the id_token as hint. `redirect_uri` is optional and rides along as `state` when it is on the allowlist; any other is dropped, since a logout must not fail on it (`/logged-out` then falls back to `WA_DEFAULT_REDIRECT_URI`) |
+| GET | `/logged-out?state=` | Where Hydra sends the browser after the logout: `303` → `state` when it is on the allowlist, else `WA_DEFAULT_REDIRECT_URI`, else `400` |
+| GET | `/health` | `ok` |
+| * | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session or the refresh token is rejected, `502` if Hydra is unreachable or fails during a refresh, `404` if no route matches or the path has a segment of only dots, raw or encoded once or twice (a `;` path parameter is ignored when comparing, so `..;` counts) or an encoded `/` or `\`, `403` for a state-changing method from an untrusted `Origin`, `429` if the proxy bucket is exhausted. Every `OPTIONS` is answered by bff itself, before the session check and the rate limit, and never proxied. Only a trusted `Origin` gets `Access-Control-Allow-Origin` |
 
-Three independent per-client rate-limit buckets (`tower_governor`) sit in front: one shared by
-`/login`, `/register`, `/oidc/*`, `/verify-email*` and `/password-reset/*`, and one for `/docs`
-and `/openapi.json`, both sized by `WA_RATE_LIMIT_MAX_ATTEMPTS`, plus one shared by every proxied
-route, sized by `rate_limit_proxy_max_attempts` in `config.yaml` (YAML-only; `6000` for `dev`,
-else `600`, per 60 seconds, since every API call a frontend makes draws from it; `0` stops bff
-from starting) — hammering one can't burn another's budget. A client is its IPv4 address or
-its IPv6 /64. Behind a reverse proxy, set `WA_TRUSTED_PROXIES`, or every client shares the proxy's
-bucket. `/health` is exempt (a cheap liveness check infra commonly polls, shouldn't get caught in
-any bucket):
+bff, internal listener (`WA_BFF_INTERNAL_PORT`, default `8082`; never route it publicly, no rate limit):
 
-| Method | Path                         | Returns                                                                                                                                                                                                                                                                                                                                                                                                                              |
-|--------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/docs`, `/docs/scalar.js`, `/openapi.json` | OpenAPI schema and Scalar UI for the documented routes. Only mounted when `WA_DOCS_ENABLED` is true (`404` otherwise); rate-limited in its own bucket, separate from the auth and proxy buckets                                                                                                                                                                                       |
-| GET    | `/health`                    | `ok`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| POST   | `/login`                     | Form `{email, password, redirect_uri, next}`. Verifies credentials, drives the PKCE exchange, sets session cookie, 303 → `redirect_uri`; wrong credentials → 303 → `next?error=1`; an unverified email when backend requires verification → no session cookie, a restricted `wa_verify_session` cookie and 303 → login's `verify-email.html` (when verification is optional the user is logged in and gets that cookie too); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted; `422` if a required field is missing                                                                                                               |
-| POST   | `/register`                  | Form `{email, password, redirect_uri, next}`. Forwards to backend then immediately logs the new user in the same way `/login` does, 303 → `redirect_uri` with session cookie set; if backend requires a verified email, no session cookie but a restricted `wa_verify_session` cookie and 303 → login's `verify-email.html`; registration failure → 303 → `next?error=1` (e.g. taken email); `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted                                                                                      |
-| GET    | `/oidc/{provider}/login`     | Fetches the provider's consent-screen URL from backend server-to-server and relays the redirect; stashes `redirect_uri`/`next` in short-lived `/oidc`-scoped cookies; clears a leftover pending-link cookie unless `confirm_link=true` (the login page's "Continue with" links); `404` for an unknown provider                                                                                                                                                                                                                                  |
-| GET    | `/oidc/providers`            | Relays backend's `/oauth/oidc/providers`: the configured OIDC providers, for a login page (login's own or an external one) to offer: `{providers: [{key, display_name}]}`, ordered by key; `key` is what goes in `/oidc/{key}/login`. `502` if backend can't be reached. Shares the auth rate-limit bucket |
-| GET    | `/oidc/{provider}/callback`  | Where the provider redirects back to (registered as this URL in the provider's console, not backend's). Forwards `code`+`state` to backend; on success finishes the login like `/login` would; if backend reports `link_confirmation_required`, 303 → `next?email=...&provider=<key>&has_password=true|false[&linked_providers=a,b]` instead, with `pending_link_token` in a short-lived cookie (`__Host-wa_oidc_pending_link_token` over HTTPS, so sibling subdomains can't plant it; `wa_oidc_pending_link_token` on plain-http dev), never in the URL (the login page's own prompt, not an error); a pending-link cookie still present (the flow was started with `confirm_link=true`) is forwarded to backend and cleared, so this sign-in confirms that pending link (`next?error=link_failed` if it isn't through a provider linked to that account); failure → 303 → `next?error=1` (`next?error=consent_required` if backend refused because a required permission was declined); `400` if the flow cookies are missing/expired |
-| POST   | `/oidc/confirm-link`         | Form `{password, redirect_uri, next}`; `pending_link_token` is read from the pending-link cookie, not the form. Forwards to backend's `/oauth/oidc/confirm-link`; on success finishes the login like `/login` does, 303 → `redirect_uri` with session cookie set; wrong password or a dead/expired token → 303 → `next?error=link_failed` (the token is single-use on backend regardless of outcome, so there's nothing to retry); `400` if `redirect_uri` isn't allowlisted; `403` if `Origin`/`Referer` isn't in `trusted_origins` |
-| POST   | `/verify-email`              | Form `{code, redirect_uri, next}`. Needs the `wa_verify_session` cookie `/login` set (it is only sent to this path). Sends the 9-digit code to backend's `/oauth/email-verification/confirm`; on success finishes the login with the session backend released, sets `wa_session` and 303 → `redirect_uri`; wrong/expired code → 303 → `next?status=invalid`; a code deleted by 5 wrong attempts → `next?status=code_used_up`; locked out after 10 wrong guesses (even the right code is refused) → `next?status=locked&retry_after=<secs>`, or `next?status=locked_until_reset` after 5 lockouts, both clearing `wa_verify_session`; missing/unknown verification session → 303 → `next?status=session_expired`; `400` if `next` isn't a same-origin path or trusted origin or `redirect_uri` isn't allowlisted; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted |
-| POST   | `/password-reset/request`    | Form `{email}`. Forwards to backend's `/oauth/password-reset/request` and always 303 → login's `forgot-password.html?status=sent`; `502` if backend is unreachable; `403` if `Origin`/`Referer` isn't in `trusted_origins`; `429` if the auth bucket is exhausted |
-| POST   | `/password-reset/confirm`    | Form `{token, new_password}`. Forwards to backend's `/oauth/password-reset/confirm`; on success drops every bff session of the reset user (signing them out on all devices at once) and 303 → login's `login.html?status=password_reset` (not signed in), `reset-password.html?status=weak_password` (no token in the URL; the page kept it in `sessionStorage`), or `forgot-password.html?status=invalid_token` (also for a token that isn't 1–128 base64url characters, which never reaches backend); fixed destinations, no `next`; same `403`/`429`/`502` as above |
-| POST   | `/verify-email/resend`       | Form `{next}`, same cookie. Asks backend for a new code; 303 → `next?status=sent&expires_in=<secs>`, `next?status=cooling_down&retry_after=<secs>` (nothing sent: inside the resend cooldown), `next?status=locked&retry_after=<secs>` (nothing sent: locked out after wrong guesses; also clears `wa_verify_session`), `next?status=locked_until_reset` (locked out five times; also clears it) or `next?status=session_expired` (also for an already verified account); same `400`/`403`/`429` as above |
-| *      | *(configured `path_prefix`)* | Proxied to the matching route's `upstream_url` (prefix stripped), cookie swapped for `Authorization: Bearer`; `401` if no/unknown session or the refresh token is rejected, `502` if backend is unreachable or fails (5xx / bad body) during a token refresh, `404` if no route matches, `429` if the proxy bucket is exhausted; every `OPTIONS` is answered by bff before the session check and the rate limit (never proxied, `200` even for an unmatched path); only a trusted `Origin` gets `Access-Control-Allow-Origin`                                                                                                                                                                              |
+| Method | Path | Returns |
+|--------|------|---------|
+| POST | `/backchannel-logout` | Form `{logout_token}` from Hydra. Verifies the token (Hydra's JWKS, `iss`, `aud`, `iat`, `events`, no `nonce`), refuses a replayed `jti`, ends the sessions it names (by `sid`, `sub`, or both) and revokes their refresh tokens. `200`; `400` for an invalid or replayed token; `503` if Hydra's keys can't be fetched |
+| POST | `/internal/revoke` | `{sub}`, `Authorization: Bearer <WA_BFF_INTERNAL_API_KEY>`. Ends every session of that user. `204`; `401` without the key |
 
-login routes:
+login (`WA_LOGIN_PORT`, default `8081`). Every page route has the general rate-limit bucket:
 
-Any page opened without a `redirect_uri` falls back to `WA_DEFAULT_REDIRECT_URI` (`WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` first on the pages it covers), then login's own origin (`reset-password.html` doesn't use one).
+| Method | Path | Returns |
+|--------|------|---------|
+| GET | `/login`, `/registration` | With `?flow=ID`, the Kratos flow rendered server-side. With a Hydra `login_challenge`, `303` → Kratos' browser flow with it. With neither, `303` → bff's `/login?redirect_uri=` (the query's, else `WA_DEFAULT_REDIRECT_URI`); with neither of those, `400` |
+| GET | `/recovery`, `/verification`, `/settings` | The same, starting their own flows (no challenge needed) |
+| GET | `/error?id=` | Kratos' error, rendered. Hydra's `error`/`error_description` text is never shown |
+| GET | `/logout?logout_challenge=` | Ends the Kratos session and accepts Hydra's logout, only for a logout the application started (`400` page otherwise) |
+| GET | `/consent?consent_challenge=` | Accepts for `WA_BFF_CLIENT_ID` and scopes within `openid offline_access`, granting the requested audience; rejects anything else. No screen |
+| GET, POST | `/self-service/*` | Forwarded to Kratos' public API (cookies passed both ways; `GET` and `POST` only, paths with `..`, `%` or `//` refused, native `/api` flows `404`, `POST /self-service/login` in another case or with a trailing `/` `404`). `POST` has a smaller per-client bucket; `POST /self-service/login` with a password is also throttled per identifier (5 free attempts, then one per 30 s, then one per 5 min; a delay, not a lockout) |
+| GET | `/.well-known/ory/*` | Forwarded to Kratos' public API |
+| GET | `/health` | `ok`; touches nothing upstream |
+| GET | `/ui.js`, `/static/*` | The compiled-in script that binds Kratos' passkey triggers; the stylesheet |
+| GET | `/providers/*` | Provider logos from `templates/providers/` (a deployer can replace them), cacheable for a day |
 
-| Method | Path             | Returns                                                                                                                                                 |
-|--------|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/`              | Login shell (`login/src/index.html`, compiled into the binary) — loads `login.html` via HTMx                                                            |
-| GET    | `/index.html`    | Same shell, for anyone linking there directly                                                                                                           |
-| GET    | `/login.html`    | Login page, server-rendered from `templates/pages/login.html` — also renders the OIDC link-confirm prompt when `?email=...` is present: names the sign-in being linked (`provider`), a password form unless `has_password=false`, and a "Continue with" link per `linked_providers` key, carrying `confirm_link=true`. Names come from bff's `/oidc/providers` (fetched server-side via `WA_BFF_INTERNAL_URL`/`WA_BFF_URL`, only for this view, and cached for 5 minutes, 30 seconds after a failure), not the URL; keys it doesn't list are dropped. If that lookup fails, keys are shown as themselves, limited to `[A-Za-z0-9_-]`. With `has_password=false` and no `linked_providers` it says the sign-in can't be linked there instead. Links to `forgot-password.html` under the sign-in form and the link-confirm password form; `?status=password_reset` confirms a completed reset, removes the reset token from `sessionStorage` and, without a `redirect_uri`, falls back to `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` |
-| GET    | `/register.html` | Registration page, server-rendered from `templates/pages/register.html`                                                                                 |
-| GET    | `/verify-email.html` | Email verification page, server-rendered from `templates/pages/verify-email.html` — a form for the 9-digit code and one to request a new code; `?status=invalid\|code_used_up\|sent\|cooling_down\|locked\|locked_until_reset\|session_expired` shows the outcome, with `&retry_after=<secs>` (`cooling_down`, `locked`) or `&expires_in=<secs>` (`sent`); `?redirect_uri=` is where the user was headed |
-| GET    | `/forgot-password.html` | Asks for an email and posts it to bff's `/password-reset/request`, from `templates/pages/forgot-password.html`; `?status=sent\|invalid_token` shows the outcome; `invalid_token` also removes a stored reset token from `sessionStorage`. Without a `redirect_uri` it falls back to `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` |
-| GET    | `/reset-password.html` | Where the reset email links to, with the token in the `#token=` fragment; from `templates/pages/reset-password.html`. `reset-password.js` moves the token into the form and the tab's `sessionStorage` (so a reload or a rejected password keeps it) and out of the address bar, and only then shows the form (otherwise it points back to the email); served with `Referrer-Policy: strict-origin` (`no-referrer` would make the form's POST carry `Origin: null`, which bff refuses) and `Cache-Control: no-store`. Posts to bff's `/password-reset/confirm`; `?status=weak_password` shows that outcome |
-| GET    | `/static/*`, `/*` | Static assets (`login/static/`) — stylesheet, vendored `htmx.min.js`, `countdown.js` (the verify page's cooldown countdown), `reset-password.js`. Served under `/static/` and, as the fallback, at the root (the pages load `/style.css`, `/countdown.js` and `/reset-password.js`) |
+hooks (`WA_HOOKS_PORT`, default `1983`; internal only). Everything but `/health` needs
+`Authorization: Bearer <WA_HOOKS_API_KEY>` (`401`) and has a request timeout:
 
-Backend routes:
-
-| Method | Path                                | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-|--------|-------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`                           | `ok`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| POST   | `/oauth/login`                      | Verifies email/password (Argon2) against `UserStorage`; `{ login_session }` for a verified account, `401` otherwise. An unverified account also gets a `verification_session` (and its `verification_session_ttl_secs`): `{ login_session, verification_session }` when verification is optional, `{ verification_session }` only when `require_verified_email` is set (which also sends the code)                                                                                                                                                                                                                                                                                                    |
-| POST   | `/register`                         | Hashes the password (Argon2) and saves a new user (`email_verified: false`), then sends the verification email if an `email_handler` is configured; `201`, `400` `WeakPassword` if the password is under 8 characters or over 1024 bytes, or `409` if the email is taken                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| GET    | `/oauth/authorize`                  | Consumes `login_session` (`401` if invalid/expired/reused), then 303 → `redirect_uri?code=...&state=...` if `redirect_uri` is allowlisted, else `400`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| POST   | `/oauth/token`                      | Verifies `code_verifier` against the stored (single-use, TTL'd) challenge; `{ access_token, refresh_token, token_type, expires_at }`, JWT carries `iss`/`email`/`email_verified`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| GET    | `/.well-known/jwks.json`            | `{ keys }`: the public key access tokens are signed with, plus, while present, the staged next key and the previous one (until its tokens have expired; see `WA_JWT_KEY_ROTATION_INTERVAL_SECS`). The next key is published before it signs, except right after a backend restart, when a fresh key signs at once and tokens signed before the restart no longer verify. Sends `Cache-Control: max-age`; cache no longer than that, and re-fetch when a token has an unknown `kid`, at most once per minute                                                                                                                                                                                           |
-| GET    | `/.well-known/openid-configuration` | OpenID discovery document: `issuer` (`WA_BACKEND_URL`, which access tokens carry as `iss`), `jwks_uri`, the token endpoint and what it supports, for verifiers that configure themselves from an issuer URL. No `authorization_endpoint`: `/oauth/authorize` isn't a standard one, so generic OAuth/OIDC clients can't use this issuer                                                                                                                                                                                                                                                                                                                                                                     |
-| GET    | `/oauth/oidc/login`                 | Not for the browser directly -- bff proxies this. Query: `provider`. Redirects to the provider's consent screen; `404` for an unknown `provider`; `400` if the query is missing or malformed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| GET    | `/oauth/oidc/providers`             | The configured OIDC providers: `{providers: [{key, display_name}]}`, ordered by key; `display_name` is the provider's config `display_name`, default its key capitalized. bff relays it as `/oidc/providers`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| GET    | `/oauth/oidc/callback`              | Not for the provider directly -- bff forwards `provider`+`code`+`state` here server-to-server. Resolves the OIDC identity to a user (see `UserStorage::resolve_oidc_login`); `{status: "authenticated", login_session}` on success, or `{status: "link_confirmation_required", pending_link_token, email, has_password, linked_providers}` if an account with this email exists that the identity isn't linked to. With `pending_link_token` set, the sign-in instead confirms that pending link: it must be through an identity already linked to the pending link's account (`409` otherwise, or when the token is unknown or expired; nothing created); `400` if the query is missing or malformed |
-| POST   | `/oauth/email-verification/request` | `{verification_session}` (what `/oauth/login` returned for an unverified account; `401` otherwise). Sends a fresh 9-digit code in the background: `202 {status: "sent", expires_in_secs}`. Nothing is sent inside the resend cooldown (`202 {status: "cooling_down", retry_after_secs}`), a lockout (`202 {status: "locked", retry_after_secs}`) or five lockouts (`202 {status: "locked_until_reset"}`). `401` too for an already verified account; `503` when no email handler is configured                                                                                                                                                                                                        |
-| POST   | `/oauth/email-verification/confirm` | `{verification_session, code}`. Marks the email verified, ends the verification session and returns `200 { status: "verified", login_session }` (the one the login withheld); `400` if the code is wrong or expired, or with reason `CodeUsedUp` if 5 wrong attempts deleted it (the session stays usable); `423` `{ status: "locked", retry_after_secs }` or `{ status: "locked_until_reset" }` while locked out, even for the right code; `401` for an unknown/expired session                                                                                                                                                                                                                      |
-| POST   | `/oauth/oidc/confirm-link`          | `{pending_link_token, password}`. Verifies the password against the account named in the pending link; on success marks it `email_verified` and links the identity, `{ login_session }`; `401` on wrong password, `400` if the token is invalid/expired                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| POST   | `/oauth/password-reset/request`     | `{email}`. Always `202`, whether or not the address matches an account or a mail went out (no enumeration). For a matching account, mails a single-use reset link to the account's own address through `email_handler`, at most once a minute; earlier links stay valid until one is redeemed, which spends them all. The token is never in the response or logged (see [docs/flows/password-reset.md](docs/flows/password-reset.md))                                                                                                                                                                                                                                                                                                                                                                                           |
-| POST   | `/oauth/password-reset/confirm`     | `{token, new_password}`. Sets the new password, marks the email verified, and ends everything issued before: every login session, auth code, refresh token and email-verification session of the account is refused by its credential stamp (auth codes only refused; the rest also deleted); its email-verification code state (cooldown, failure count, lockout) is cleared, so someone who squatted the address keeps nothing across the reset. `200 {user_id}`; `400` `WeakPassword` if the password is under 8 characters or over 1024 bytes (the token stays usable); `400` if the token is unknown, expired or already used                                                                                                                                                                                                                                                                |
+| Method | Path | Called by | Returns |
+|--------|------|-----------|---------|
+| GET | `/health` | infra | `ok` |
+| POST | `/hydra/token-hook` | Hydra, on every token grant (code and refresh) | `{session: {access_token, id_token}}` claims: `email`, `email_verified` from Kratos plus what `login_claims_handler` returns. `403` for an unknown or inactive identity, an identity without an email, an unverified email (`require_verified_email`), or a webhook that returns a reserved claim name; `502` if Kratos or the webhook fails: no token is issued |
+| POST | `/kratos/after-registration` | Kratos, after an identity is created | Hands `{user_id, email, email_verified, fields}` to `registration_handler` (after the provider's `profile_apis` for a social sign-up). On failure a `4xx`/`502` and the identity is deleted |
+| POST | `/kratos/after-recovery` | Kratos, once a recovery code is accepted | Replaces the password with a random one, deletes the passkey/webauthn/totp/lookup credentials and every linked social login, revokes Kratos, Hydra and bff sessions. `502` if a step failed (Kratos retries) |
+| POST | `/kratos/after-password-change` | Kratos, after the settings flow changes a password | The same revocations except the current Kratos session, without the purge |
 
 ## Prerequisites
 
-- Rust (stable) — `cargo` on PATH.
+- Rust (stable) — `cargo` on PATH; [mise](https://mise.jdx.dev) for the tasks below.
+- Docker, for the Ory stack, the Docker image and `mise run test-docker`.
 
 ## Development
 
-Each crate has its own `mise.toml` with a `dev` task (plain `cargo run`), run with the
-crate's own directory as the working directory — this matters because each crate's
-`config.yaml` is looked up as a bare relative path (see Configuration below), so it
-only resolves when run from inside that crate's directory.
+From the repo root:
 
 ```bash
-mise run services   # backend + bff + login together, from the repo root
+mise run all         # Ory + Postgres in Docker (dev/), hooks + bff + login + test apps on the host
+mise run services    # hooks + bff + login on the host only (Ory not started)
+mise run dev-ory-up  # just the Docker part of `all`; dev-ory-down stops it and drops its data
+mise run ory-up      # the whole stack in containers, behind TLS (local-prod/)
+mise run ory-down    # stop it and drop its data (docker compose down -v)
+mise run rotate-keys # rotate Hydra's token signing keys in that stack
+mise run test        # cargo test --workspace
+mise run test-docker # the system tests: real Kratos, Hydra and Postgres (testcontainers)
 ```
 
-or individually, one per terminal:
-
-```bash
-cd backend && mise run dev   # or: cd backend && cargo run
-cd bff && mise run dev       # or: cd bff && cargo run
-cd login && mise run dev     # or: cd login && cargo run
-```
-
-Running `cargo run -p <crate>` from the repo root also works, but the crate's
-`config.yaml` won't be found (wrong cwd) — it'll silently fall back to hardcoded
-defaults instead, which is easy to mistake for a config bug. Set `WA_CONFIG_FILE` to
-an absolute path if you need to run that way.
-
-Open http://localhost:8081 for the optional standalone login page.
+- **`all`** starts Postgres, Kratos, Hydra and Mailpit from `dev/docker-compose.yml` (configs
+  rendered from `ory/` by `dev/render.sh`, plain http on `localhost`, fixed dev-only secrets, the
+  breached-password check off, and the demo user-service's `first_name`, `last_name` and
+  `phone_number` allowed as top-level token claims; local-prod keeps them under `ext`) and runs the
+  services on the host: login `http://localhost:8081`, bff `:8080`, Hydra `:4444`, mail UI
+  `http://localhost:8025`. Kratos and Hydra reach hooks and bff through `host.docker.internal`.
+  Ctrl-C stops the host services; `mise run dev-ory-down` stops the containers.
+- **Google sign-in in `all`**: Docker Compose reads `dev/.env` (next to `dev/docker-compose.yml`,
+  git-ignored) and passes `KRATOS_CONFIG_EXTRA`, `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to
+  Kratos. Set `KRATOS_CONFIG_EXTRA=/etc/kratos/oidc-google.yml` (or `oidc-google-phone.yml`, see
+  *profile_apis* under
+  [hooks: the deployer's webhooks](#hooks-the-deployers-webhooks))
+  and both Google values, run `mise run dev-ory-down` if Kratos is already up, and register
+  `http://localhost:8081/self-service/methods/oidc/callback/google` at Google.
+- **`ory-up`** is the production-like alternative, behind TLS. It starts Postgres, Kratos, Hydra, a
+  Mailpit mail sink and the shipped image (hooks, bff, login) behind a Caddy TLS proxy at
+  `https://login.localhost:8443` and `https://bff.localhost:8443`. Run `local-prod/gen-certs.sh`
+  and `local-prod/gen-secrets.sh` once first, and trust `local-prod/certs/ca.crt`; see
+  [local-prod/README.md](local-prod/README.md). Verification and recovery codes arrive in Mailpit at
+  http://127.0.0.1:8025.
+- **`services`** runs the three services on the host with each crate's `dev` task (`cargo run`),
+  with dev credentials and the `dev` profile. It does **not** start Ory: Kratos and Hydra must be
+  reachable at the defaults (`localhost:4433`/`4434` for Kratos, `4444`/`4445` for Hydra), and the
+  URLs in `ory/` are `local-prod`'s, so a host-based setup needs its own Kratos and Hydra config.
+  `ory-up` does not publish those ports to the host.
+- Each service also runs on its own, one per terminal: `cd hooks && mise run dev` (likewise `bff`,
+  `login`). Run from inside the crate: `hooks` and `bff` look for `config.yaml` as a bare relative
+  path, so `cargo run -p <crate>` from the repo root doesn't find it and the default `prod` profile refuses to start. Set
+  `WA_CONFIG_FILE` to an absolute path if you need to run that way.
+- **Test doubles** (`testing/`, outside the workspace): `mise run test-apps` starts
+  `downstream-service` (`$PORT`, default `10001`: any path, 401 without `Authorization`, otherwise a
+  page showing the bearer token it received) and `user-service` (`$PORT`, default `10002`, 401
+  without `Authorization`: the webhook target of hooks, `POST /users` stores a new account's
+  `fields` (kept in `users.json`) and `POST /users/claims` answers them as token claims, `404` for
+  an unknown user so the login fails; no bff route points at it).
+  bff's `config.yaml` proxies `/downstream` to the first.
 
 ## Configuration
 
-Each of `backend` and `bff` reads an optional YAML file first (bare `config.yaml`,
-relative to the process's working directory — override the path with
-`WA_CONFIG_FILE`; a missing file is not an error, defaults apply, but one that exists and
-can't be read — wrong permissions, say — stops the service from starting), then lets the
-`WA_*` env vars below override individual scalar fields on top of it. `login` is
-env-only (nothing structured to configure). A route list (`routes:` on bff) only
-exists in the YAML file — there's no sane env-var shape for it.
+`hooks` and `bff` read an optional YAML file first (bare `config.yaml`, relative to the process's
+working directory — override the path with `WA_CONFIG_FILE`; a missing file is not an error,
+defaults apply, but one that exists and can't be read stops the service from starting), then let
+the `WA_*` env vars below override individual scalar fields. `login` is env-only. Only the variables
+below are read, and a YAML key can set anything they can. A `.env` file in the working directory or
+any parent directory is loaded first by `hooks` and `bff`; a malformed one stops them.
 
-bff's `config.yaml` `routes` list controls its reverse-proxy behavior. It currently
-points at the two standalone test doubles in `testing/` (see below):
+| Variable | App | Default | Description |
+|---|---|---|---|
+| `WA_CONFIG_FILE` | hooks, bff | `config.yaml` (relative to cwd) | Path to the optional YAML config |
+| `WA_PROFILE` | hooks, bff, login | `prod` | `dev` or `prod`; anything else stops the service. `prod` refuses to start unless the browser-facing URLs are https (bff: `WA_BFF_URL`, `WA_HYDRA_PUBLIC_URL`; login: `WA_BFF_URL`, `WA_LOGIN_PUBLIC_URL`, a bare origin, and `WA_DEFAULT_REDIRECT_URI` when set; an http one turns the `Secure` cookie flag off) and the addresses with a localhost default are set (bff: `WA_HYDRA_PUBLIC_URL`, `WA_HYDRA_INTERNAL_URL`; hooks: `WA_KRATOS_ADMIN_URL`, `WA_HYDRA_ADMIN_URL`, `WA_BFF_INTERNAL_URL`; login: `WA_KRATOS_PUBLIC_URL`, `WA_HYDRA_ADMIN_URL`). The profile also picks the defaults of `WA_RATE_LIMIT_MAX_ATTEMPTS` and `rate_limit_proxy_max_attempts`. A value set explicitly always wins |
+| `WA_HOOKS_PORT` | hooks | `1983` | hooks listen port |
+| `WA_HOOKS_API_KEY` | hooks | *(required to serve)* | The key Kratos and Hydra present on every hook call (`Authorization: Bearer`). Empty refuses to serve; `prod` needs 16 or more characters. Ory's configs carry it as `@WA_HOOKS_API_KEY@`, substituted at start, so use hex or base64url |
+| `WA_KRATOS_ADMIN_URL` | hooks | `http://localhost:4434` | Kratos' admin API (identities, sessions, credentials) |
+| `WA_REQUIRE_VERIFIED_EMAIL` | hooks | `true` | `false` lets the token hook serve an unverified address; set it with `KRATOS_SESSION_ON_REGISTRATION=1` |
+| `WA_HYDRA_ADMIN_URL` | hooks, login | `http://localhost:4445` | Hydra's admin API: hooks revokes consent and login sessions; login accepts consent and logout challenges. Never browser-facing |
+| `WA_BFF_INTERNAL_URL` | hooks | `http://localhost:8082` | bff's internal listener, where hooks calls `/internal/revoke` |
+| `WA_BFF_INTERNAL_API_KEY` | hooks, bff | *(required)* | Presented by hooks to, and checked (constant time) by, bff's `/internal/revoke`. Required under every profile; at least 16 characters under `prod`, which also refuses the one committed in `bff/config.yaml` |
+| `WA_BFF_PORT` | bff | `8080` | bff public listen port |
+| `WA_BFF_INTERNAL_PORT` | bff | `8082` | bff internal listen port; must differ from `WA_BFF_PORT` |
+| `WA_BFF_URL` | bff, login | `http://localhost:8080` | bff's public base URL. Hydra sends the browser back to `{WA_BFF_URL}/callback` (register it as the client's redirect URI); login's fallback goes to `{WA_BFF_URL}/login`; https under `prod`. Its scheme decides whether bff's cookies are `Secure` |
+| `WA_HYDRA_PUBLIC_URL` | bff | `http://localhost:4444` | Hydra's issuer as the browser and the tokens' `iss` see it (the login host, `https://login.example.com`): bff sends the browser to `{…}/oauth2/auth` and `/oauth2/sessions/logout`, and checks `iss` against it. A trailing `/` is dropped |
+| `WA_HYDRA_INTERNAL_URL` | bff | `http://localhost:4444` | Where bff reaches Hydra server-side: the token and revocation endpoints and the JWKS. Plain http inside the network is fine. Set explicitly, no discovery: the issuer is public |
+| `WA_BFF_CLIENT_ID` | bff, login | `bff` | The Hydra OAuth2 client bff is; login's `/consent` auto-accepts only for it |
+| `WA_BFF_CLIENT_SECRET` | bff | *(required)* | That client's secret (`client_secret_basic`); keep it out of `config.yaml`. `prod` refuses the one committed in `bff/config.yaml` |
+| `WA_HYDRA_AUDIENCE` | bff | `weaveauth` | The `audience` bff asks for, so access tokens carry it as `aud` (Hydra only puts a requested audience there, and the client's `audience` list must allow it). Empty: none |
+| `WA_HYDRA_REFRESH_TOKEN_TTL_SECS` | bff | `2592000` (30 days) | How long Hydra's refresh tokens live: set it to Hydra's `ttl.refresh_token` (`720h` in `ory/hydra/hydra.yml`). A session ends that long after the last refresh that rotated its refresh token (and never later than 30 days after its login, whatever that is set to). 1 to 315360000 |
+| `WA_REDIRECT_URI_ALLOWLIST` | bff | *(empty; required under `prod`)* | Comma-separated allowlist of `redirect_uri` values for `/login` and `/logout` (and `/logged-out`'s `state`): exact string match, so mind the trailing slash. Each an absolute http(s) URL (https under `prod`) without user info or a fragment |
+| `WA_DEFAULT_REDIRECT_URI` | bff, login | *(unset)* | bff: where `/login` goes when it names no `redirect_uri`, and where `/logged-out` goes when the logout named no allowlisted destination. login: where a page opened without a challenge or a flow goes, through bff's `/login`, so it must be on `WA_REDIRECT_URI_ALLOWLIST`. login also sends the browser here after a password is changed in settings (Kratos returns to login's `/login`, unless the flow carried a `return_to`, which wins); unset, that ends on an error page, so set it whenever settings are used. Empty counts as unset; https under `prod` |
+| `WA_TRUSTED_ORIGINS` | bff | *(unset; bff's own origin is always trusted)* | Comma-separated origins allowed to `POST /logout` and to send state-changing proxied requests (checked against `Origin`, falling back to `Referer`), and to read proxied responses cross-origin with credentials (CORS) — so an XSS on any of them reads API data, not just writes it. Each a bare origin as the browser sends it (lowercase, no path, no default port, no `*`; a trailing `/` is dropped), https under `prod` |
+| `WA_KRATOS_SESSION_COOKIE` | login | `ory_kratos_session` | Name of Kratos' session cookie; must equal `session.cookie.name` in Kratos' config. A login answer that doesn't set it isn't a success for the per-identifier throttle |
+| `WA_SESSION_COOKIE_NAME` | bff | `wa_session` | Name of the HttpOnly session cookie, a cookie-name token (letters, digits, `-`, `_`, `.` and a few other symbols). Under https the browser sees it as `__Host-<name>` (and the login cookie as `__Host-wa_login`), which stops a sibling subdomain from planting one |
+| `WA_RATE_LIMIT_MAX_ATTEMPTS` | bff, login | `100` for `dev`, else `10` | Burst size, replenished over 60 seconds, of bff's auth bucket (`/login`, `/callback`, `/logout`, `/logged-out`) and of login's submission bucket (`POST` through the Kratos proxy). `0` stops the service; above `60000` it refills like `60000` |
+| `WA_TRUSTED_PROXIES` | bff, login | *(unset)* | Comma-separated addresses or CIDR ranges (a `trusted_proxies:` list in `config.yaml` works for bff) of the reverse proxies in front of the service (e.g. `10.0.0.0/8, 172.30.0.2`), as it sees them connect. A request from one is rate-limited on the client address in its `X-Forwarded-For` (the rightmost entry that isn't itself a trusted proxy). From anyone else the header is ignored. Unset behind a proxy, every client shares the proxy's budget. Under `prod`, an entry wider than IPv4 `/8` or IPv6 `/32` stops the service from starting |
+| `WA_LOGIN_PORT` | login | `8081` | login listen port |
+| `WA_LOGIN_PUBLIC_URL` | login | `http://localhost:8081` | login's own browser-facing origin (Kratos and Hydra are on the same host behind the proxy); a trailing `/` is dropped; a bare origin, https under `prod` |
+| `WA_KRATOS_PUBLIC_URL` | login | `http://localhost:4433` | Kratos' public API, server to server: where login fetches flows and what its `/self-service/*` proxy forwards to |
+
+YAML-only settings:
+
+- **bff** `routes` (below) and `rate_limit_proxy_max_attempts`.
+- **hooks** `registration_handler`, `login_claims_handler`
+  (`{url, timeout_secs, bearer_token?}`, 10 seconds default, above 0 and at most `request_timeout_secs / 2`; https unless the host is loopback, no
+  redirects; `bearer_token`, when set, is sent as `Authorization: Bearer`),
+  `profile_apis`, `request_timeout_secs` (30) and `upstream_timeout_secs` (10, each call to Kratos,
+  Hydra or bff; `upstream_timeout_secs * 2` must stay below `request_timeout_secs`). Unknown keys in a webhook or `profile_apis` entry are refused.
+
+Lifetimes nobody tunes per deployment are constants in code.
+
+### Proxy routes
+
+bff's `config.yaml` `routes` list controls its reverse-proxy behaviour. It currently points at the
+test double in `testing/`:
 
 ```yaml
 routes:
-  - path_prefix: /api/downstream
+  - path_prefix: /downstream
     upstream_url: http://localhost:10001
-  - path_prefix: /api/downstream2
-    upstream_url: http://localhost:10002
 ```
 
-Any request whose path starts with `path_prefix` (longest prefix wins if more than one
-matches) is forwarded to `upstream_url` with that prefix stripped and
-`Authorization: Bearer <access_token>` set from the session looked up via the request's
-`wa_session` cookie. Next to it, bff forwards only `Content-Type` (`REQUEST_HEADERS` in
-`bff/src/server/api/proxy.rs`): every other client header is dropped, `Cookie`, `Accept`,
-`Upgrade` and any `X-Forwarded-*`/`Forwarded` included, and bff adds no forwarding headers of
-its own (hyper still sets `Host` to the upstream's, and `Content-Length` or chunked framing for a
-body). WebSocket isn't proxied: a handshake reaches the upstream as a plain `GET`. A header an
-upstream needs gets added to `REQUEST_HEADERS`; adding `Upgrade` also means extending the
-`Origin` check below to WebSocket handshakes.
+Any request whose path is `path_prefix` or under it (whole segments: `/api` does not match `/apix`; longest
+prefix wins) is forwarded to `upstream_url` with that prefix stripped, once, and `Authorization: Bearer <access_token>` set from the
+session named by the request's `wa_session` cookie. Next to it bff forwards only `Content-Type`, `Accept`,
+`Accept-Language` and the conditional headers `If-Match`, `If-None-Match`, `If-Modified-Since` and
+`If-Unmodified-Since` (`REQUEST_HEADERS` in `bff/src/server/api/proxy.rs`): every other client header is dropped,
+`Cookie`, `Upgrade` and any `X-Forwarded-*`/`Forwarded` included, and bff adds no forwarding headers
+of its own. WebSocket isn't proxied. A header an upstream needs gets added to `REQUEST_HEADERS`;
+adding `Upgrade` also means extending the `Origin` check to WebSocket handshakes. A path with a `.` or `..`
+segment (`;` path parameters ignored, so `..;` counts), or an encoded `/` or `\`, is `404` before anything is forwarded. An upstream has 30 seconds to start
+answering (`504`) and a request body may be 10 MiB (`502` past it). A route with `path_prefix: "/"` serves
+everything no other route or bff endpoint takes. Routes are checked at startup (a prefix that starts with `/`
+without a trailing `/`, `{}*?#%` or `.`/`..` segments; one route per prefix, none on bff's own `/login`, `/callback`, `/logout`, `/logged-out` or `/health`; an http(s) `upstream_url` with no
+user info, query or fragment), and under `prod` an `upstream_url` must be https or loopback, since the
+session's bearer token goes to it.
 
-The browser attaches the session cookie to any same-site request, and an upstream treats the
-bearer token bff adds as CSRF-safe. So a proxied request that can change state, any method but
-`GET`/`HEAD`/`OPTIONS` (bff answers `OPTIONS` itself), must come from a `WA_TRUSTED_ORIGINS`
-origin or bff's own (`Origin`, falling back to `Referer`), or gets `403`.
+The browser attaches the session cookie to any same-site request, and an upstream treats the bearer
+token bff adds as CSRF-safe. So a proxied request that can change state, any method but
+`GET`/`HEAD`/`OPTIONS`, must come from a `WA_TRUSTED_ORIGINS` origin or bff's own, or gets `403`.
+This assumes an upstream changes nothing on `GET`/`HEAD`: `SameSite=Lax` still sends the cookie on
+a cross-site top-level `GET` navigation, so an upstream must never change state on `GET`. Active
+content (pages with scripts) served through a route runs on bff's origin, which is always trusted: an
+XSS there can call every other route and `POST /logout`, so apps with active content belong on their
+own origin.
 
-Proxied routes answer CORS (`tower-http`'s `CorsLayer`) for those same origins: a trusted
-`Origin` gets `Access-Control-Allow-Origin` (exact match, never `*`) and
-`Access-Control-Allow-Credentials: true`, on every proxy response, errors included (`401`,
-`403`, `404`, `429`, `502`). The browser sends a preflight before a `PUT`/`DELETE`/`PATCH`, a
-JSON body or a custom header; every `OPTIONS` is answered by bff itself, before the session
-check and the rate limit, so it needs no cookie and never reaches an upstream (a preflight is
-cacheable for 10 minutes). It allows the requested method, but only the headers bff forwards
-(`REQUEST_HEADERS`), so a request naming any other header fails in the browser instead of
-losing it silently. `Content-Disposition` is the one response header exposed beyond the
-browser's safelisted ones. bff's own form routes stay same-origin.
+Proxied routes answer CORS (`tower-http`'s `CorsLayer`) for those same origins: a trusted `Origin`
+gets `Access-Control-Allow-Origin` (exact match, never `*`) and `Access-Control-Allow-Credentials:
+true`, on every proxy response, errors included. Every `OPTIONS` is answered by bff before the
+session check and the rate limit (a preflight is cacheable for 10 minutes); only the headers bff
+forwards are allowed, so a request naming any other fails in the browser. The session cookie is
+`SameSite=Lax`, so CORS only helps a frontend that is cross-origin but same-site as bff
+(`app.example.com` → `bff.example.com`). A `WA_TRUSTED_ORIGINS` entry on another *site* than
+`WA_BFF_URL` gets no cookie with its requests (always `401`), and its `POST /logout` ends Hydra's
+session but not bff's: keep trusted origins same-site as bff.
 
-The session cookie is `SameSite=Lax`, so CORS only helps a frontend that is cross-origin but
-same-site as bff (`app.example.com` → `bff.example.com`). A frontend on another site never
-sends the cookie on `fetch`, and every request gets `401`, whatever `WA_TRUSTED_ORIGINS` says.
+Upstream responses keep only `Content-Type`, `Content-Encoding`, `Content-Disposition`, `Content-Security-Policy`,
+`Cache-Control`, `Location`, `Vary`, `ETag`, `Last-Modified`, `WWW-Authenticate` and `Retry-After`
+(`RESPONSE_HEADERS`). bff always sets `X-Content-Type-Options: nosniff`, a `Content-Security-Policy` of
+`sandbox; frame-ancestors 'none'` when the upstream sent none (proxied pages run on bff's origin, so an
+upstream that serves a page sends its own CSP), and `Cache-Control: no-store` when the upstream sent none; a `Cache-Control` naming none of `public`,
+`s-maxage`, a bare `private` or `no-store` gets `private` added. Everything else, `Set-Cookie`,
+`Clear-Site-Data`, `Service-Worker-Allowed`, `Strict-Transport-Security` and the rest,
+is dropped, because proxied content shares bff's origin and those headers would act on bff itself.
+A `Location` passes through unchanged, so an upstream must send relative or public ones, never its
+internal hostname.
+A route with `path_prefix: "/"` gets a root-scoped service worker without any header: it trusts
+that upstream with everything bff serves.
 
-The `Origin` check assumes an upstream changes nothing on `GET`/`HEAD`: `SameSite=Lax` still
-sends the cookie on a cross-site top-level `GET` navigation, so an upstream must not change
-state on those methods, nor honour a `_method` query override on them.
+No session → `401`. If the access token has expired bff refreshes it first (see
+[tokens.md](docs/flows/tokens.md)); a refresh Hydra refuses by its OAuth `error` (`invalid_grant`, `token_inactive`, `access_denied`) ends the session → `401`; `invalid_client`/`unauthorized_client` (bff's own credentials) → `502`, logged, session kept; any other failure or an unreachable Hydra → `502`, session kept. No matching route → `404`. bff's sessions are in memory: a restart ends them all.
 
-Upstream responses keep only `Content-Type`, `Content-Disposition`, `Content-Security-Policy` and
-`Cache-Control` (`RESPONSE_HEADERS`): the headers that only shape that one response, which an
-upstream needs to keep its content (an uploaded file, say) from rendering or running on bff's
-origin, or from being cached for another user. bff then always sets `X-Content-Type-Options:
-nosniff`, and `Cache-Control: no-store` when the upstream sent none. A cache in front of bff sees
-the cookie, not the `Authorization` the upstream answered, so a `Cache-Control` naming none of
-`public`, `s-maxage`, a bare `private` or `no-store` gets `private` added: shared caches keep it
-out, as RFC 9111 §3.5 would for an `Authorization` request. Stricter than the RFC,
-`must-revalidate` doesn't count (upstreams send it on per-user data, and bff drops the `ETag`
-a revalidation would use). A field-qualified `private="…"` doesn't either, since it only keeps
-the named fields out. Everything else is dropped, so `Location`, `ETag` and the like don't reach
-the browser, and a `HEAD` response loses the upstream's `Content-Length` (hyper frames it from
-the empty body).
+### hooks: the deployer's webhooks
 
-Proxied content shares bff's origin, and most other response headers would act on bff itself,
-beyond the upstream's `path_prefix`: `Set-Cookie` and `Clear-Site-Data` would hit bff's own
-cookie (`wa_session`), `Service-Worker-Allowed` would let a service worker see bff's own routes
-(`/login`'s form POST, with the password, included), and `Strict-Transport-Security`/`Alt-Svc`
-would change how the browser reaches bff's host. A route with `path_prefix: "/"` gets a
-root-scoped service worker without any header: it trusts that upstream with everything bff
-serves.
-
-No session → `401`. If the access token has expired, bff refreshes it first: a rejected refresh
-token → `401`; backend unreachable or failing during the refresh → `502`. No matching route →
-`404`.
-
-The `redirect_uri` a caller's login form submits to bff's `/login` is not separately
-allowlisted by bff — it's forwarded as-is to backend's `/oauth/authorize`, and
-backend's `WA_REDIRECT_URI_ALLOWLIST` / `config.yaml` is the only place it's checked
-(see the login flow above). `backend/config.yaml`'s allowlist therefore needs to list
-every real destination callers of `/login` are allowed to land on, e.g. `login`'s own
-page:
+hooks' `config.yaml` (default `config.yaml`, or `WA_CONFIG_FILE`) names the deployer's services. Both
+are plain JSON `POST`s to a URL (https unless loopback):
 
 ```yaml
-redirect_uri_allowlist:
-  - http://localhost:8081/
-```
-
-backend's `extra_data_handler` is YAML-only too. It decides what happens to fields a
-register request carries beyond `email`/`password`: `kind: webhook` POSTs them to a URL,
-`kind: plugin` runs an executable the deployer mounts and calls it over gRPC. A plugin
-is an ordinary binary, so it uses ordinary libraries and keeps its own connection pools
-— and it is **not sandboxed**: each plugin runs as its own user (`uid`/`gid`, defaults
-1001, 1002 and 1003), but mounting one is still equivalent to shipping application code.
-See **[docs/plugins.md](docs/plugins.md)**.
-
-```yaml
-extra_data_handler:
-  kind: plugin
-  command: /plugins/register
-  env:
-    LOG_LEVEL: info
-```
-
-Credentials are better passed as `WA_PLUGIN_REGISTRATION_ENV_<NAME>` in backend's own
-environment — forwarded to that plugin as `<NAME>`, so they stay in your secret store
-rather than in `config.yaml`. The plugin inherits nothing else, and every call carries a token
-generated at startup that its SDK checks.
-
-backend's `login_claims_handler` is the same shape, wired into a different flow: it's
-called on every token mint (both `authorization_code` and `refresh_token` grants) and its
-output is merged into the issued JWT as extra claims. Same two kinds — `kind: webhook`
-POSTs `{user_id, email}` and expects a JSON object of claims back, `kind: plugin` calls the
-plugin's one generic rpc with `hook: "login_claims"` and expects a `google.protobuf.Struct`
-back (so claim values can nest, e.g. `roles: {"admin": ["user-1", "user-2"]}`). An error from
-either kind fails the token request — no token is ever issued without the claims it's
-configured to carry. A claim name the handler returns that collides with a reserved one
-(`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `email`, `email_verified`) also fails the
-request, so a plugin/webhook can't spoof identity or registered claims.
-
-backend's `email_handler` delivers the verification email sent when a user registers (and
-on login when verification is required and on a resend request). It contains a short-lived
-9-digit code and the address of login's `/verify-email.html`, where the user types it in; the
-login that triggered it handed out a restricted verification session for exactly that. The
-same handler delivers password reset links (login's `/reset-password.html#token=...`).
-Exactly one of three kinds; the link in the mail points at `login_public_url` (`WA_LOGIN_PUBLIC_URL`):
-
-- `kind: smtp` renders the templates in `templates/emails/`
-  (`verify-email.subject.txt`, `verify-email.txt`, `verify-email.html`, Tera syntax with
-  `email`, `code`, `verify_page_url`, `expires_at`; `password-reset.subject.txt`,
-  `password-reset.txt`, `password-reset.html` with `email`, `reset_url`, `expires_at`) and
-  sends them through `host`/`port`.
-  `tls` is `starttls` (default), `implicit` or `none` (`none` is refused for anything but a loopback host); `username`/`password` are optional
-  (password better as `WA_EMAIL_SMTP_PASSWORD`). To use your own wording, replace those files
-  in the image's `/app/templates/emails` (the login pages are in `/app/templates/pages`). Templates are read at startup, and a missing one stops backend
-  from booting. Locally: `docker compose -f testing/mailpit/docker-compose.yml up -d`, then
-  read the mail at http://localhost:7025.
-- `kind: webhook` POSTs `{kind: "email_verification", user_id, email, code, verify_page_url, expires_at}`
-  or `{kind: "password_reset", user_id, email, reset_url, expires_at}` (`expires_at` is RFC 3339, UTC) to a URL (https
-  unless loopback) so a downstream service can send the email itself.
-- `kind: plugin` calls a plugin with `hook: "email_verification"` or `hook: "password_reset"`
-  (see [docs/plugins.md](docs/plugins.md); `WA_PLUGIN_EMAIL_ENV_<NAME>`, default user `wa-email` 1003).
-
-The mail is sent in the background and a failed delivery is only logged, so it never delays
-or fails the registration; the user can request a new code (at most one per minute). `require_verified_email: true`
-(`WA_REQUIRE_VERIFIED_EMAIL`) makes `/oauth/login` withhold the login session from accounts
-whose email isn't verified: they get only the verification session until they enter the code. See [docs/flows/verify-email.md](docs/flows/verify-email.md).
-
-```yaml
-login_public_url: https://login.example.com
-email_handler:
-  kind: smtp
-  host: smtp.example.com
-  port: 587
-  username: apikey
-  from: WeaveAuth <no-reply@example.com>
-```
-
-```yaml
+# {user_id, email, email_verified, fields} for every new identity; an error fails the registration.
+registration_handler:
+  url: http://localhost:10002/users
+# {user_id, email, email_verified, client_id, scopes} on every token mint; the returned JSON object becomes claims in the access token.
 login_claims_handler:
-  kind: plugin
-  command: /plugins/login-claims
-  env:
-    LOG_LEVEL: info
+  url: http://localhost:10002/users/claims
 ```
 
-Credentials for it are passed the same way, as `WA_PLUGIN_LOGIN_CLAIMS_ENV_<NAME>`.
+- `registration_handler` gets the identity id (the future `sub`), the email, whether Kratos has
+  verified it (`email_verified`; a new identity's address is unverified until its code is entered,
+  unless a provider vouched for it), and `fields`: every
+  trait but `email` (add traits to `ory/kratos/identity.schema.json`), plus fields from
+  `profile_apis`. A refusal (4xx) or failure aborts the registration and hooks deletes the identity. The webhook can be called again for an identity whose first attempt timed out or was cancelled (the deployer may already hold a record, and a retry can overlap the first attempt), so the endpoint must be idempotent per `user_id`.
+- `login_claims_handler` is called on every token mint, refresh included, with `email_verified`
+  next to the email (a user can change their email in settings, and the new address is unverified:
+  derive nothing from it unless it is `true`). An error fails the token
+  request; no token is issued without the claims it is configured to carry. A claim named like a
+  reserved one (`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `email`, `email_verified`, `scp`,
+  `scope`, `client_id`, `azp`, `cnf`, `act`, `may_act`, `typ`, `token_use`, `ext`, `sid`, `nonce`,
+  `auth_time`, `acr`, `amr`, `at_hash`, `c_hash`, `rat`) also fails it. An identity that is not
+  `active` gets no token, refresh included. Hydra only makes a returned claim a top-level JWT claim if it is in
+  `oauth2.allowed_top_level_claims` in `ory/hydra/hydra.yml` (`roles`, `email`, `email_verified`
+  there; `dev/render.sh` also adds `first_name`, `last_name` and `phone_number` for `mise run all`);
+  other names end up under `ext`. Keep that list in step with the webhook.
 
-An OIDC provider entry can set `display_name`, how login pages name it ("Continue with
-LinkedIn"). Unset, it's the entry's key with its first letter capitalized (`linkedin` →
-"Linkedin"), so only set it when that reads wrong. Backend serves the list at
-`/oauth/oidc/providers`, bff relays it as `/oidc/providers` (for external login pages too),
-and login fetches it from there to name providers on its link-confirm prompt.
-
-An OIDC provider entry can also set `scopes: [...]`, what its consent screen asks for besides
-`openid` (always sent). Default `[email, profile]`; setting it replaces the list, so keep
-`email`. A scope only changes what the provider puts in the id_token — claims it doesn't
-return there (e.g. Google's phone number) aren't reachable by adding a scope.
-
-It can also set `extra_claims: {<field>: <id_token claim>}` (e.g.
-`last_name: family_name`; claim names vary by provider, so nothing is mapped by default).
-On a user's first login through that provider the mapped claims are handed to
-`extra_data_handler` like a register request's extra fields; a handler failure fails the login
-(`502`) and no user is created.
-
-```yaml
-oidc_providers:
-  google:
-    client_id: set-in-.env
-    client_secret: set-in-.env
-    issuer: https://accounts.google.com
-    # redirect_uri defaults to {WA_BFF_URL}/oidc/google/callback; set it only if
-    # the provider's registered callback differs
-    scopes:                   # the default
-      - email
-      - profile
-    extra_claims:
-      first_name: given_name    # Google's id_token claim names (`profile` scope)
-      last_name: family_name
-extra_data_handler:
-  kind: webhook
-  url: http://localhost:10001/hooks/register
-```
-
-Setting `extra_claims` (or `profile_apis` below) without both an `extra_data_handler` and a
-`login_claims_handler` makes backend refuse to start (the fields are pointless unless they
-also come back as token claims).
-
-Some claims never appear in the id_token. Google's phone number is one: it can only be read
-from the People API. A provider's `profile_apis` is a list of extra GET calls made with the
-user's access token on their first login, each mapping `field name -> JSON pointer` (RFC 6901)
-into the response. Their fields are merged with the `extra_claims` ones and go to
-`extra_data_handler` in the same call. `url` must be `https://` (loopback excepted), since it
+Some profile data never appears in the id_token. Google's phone number is one: it can only be read
+from the People API. A provider's `profile_apis` entry (keyed by Kratos' provider id) is a list of
+extra `GET` calls made with the access token Kratos stored for the identity, right after a social
+sign-up; each maps `field name -> JSON pointer` (RFC 6901) into the response, and the fields go to
+`registration_handler` next to the traits. `url` must be `https://` (loopback excepted), since it
 carries the access token.
 
 ```yaml
-oidc_providers:
+profile_apis:
   google:
-    scopes:
-      - email
-      - profile
-      - https://www.googleapis.com/auth/contacts.readonly
-    profile_apis:
-      - url: https://people.googleapis.com/v1/people/me?personFields=phoneNumbers
-        required: false   # the default
-        scope: https://www.googleapis.com/auth/contacts.readonly
-        claims:
-          phone_number: /phoneNumbers/0/canonicalForm
+    - url: https://people.googleapis.com/v1/people/me?personFields=phoneNumbers
+      required: false   # the default
+      scope: https://www.googleapis.com/auth/contacts.readonly
+      claims:
+        phone_number: /phoneNumbers/0/canonicalForm
 ```
 
-`scope` is the permission the call needs. Google's consent screen lets users untick individual
-permissions and continue, so before calling, backend checks the scopes the token response says
-were granted (a response without a `scope` field counts as granting what was asked). If the
-user declined it, an optional entry is skipped without calling anything, and a `required` entry
-refuses the login with `403`; bff then sends the browser back to the login page with
-`?error=consent_required`, which says a permission is needed and to try again. Leave `scope`
-out and the call is always made.
+`required` decides what a failed call does. A failure is a transport error, a non-2xx response or
+a body that isn't JSON. With `required: false` (the default) it is logged as a warning and that
+call's fields are left out. With `required: true` the registration fails and no identity is kept.
+A pointer that finds nothing is not a failed call: the field is simply left out, except for a
+`required` entry, which treats it as a failure. `scope` is meant to skip the call when the user
+unticked that permission, but hooks cannot see which scopes a user granted at the provider (Kratos
+passes no tokens or scopes to its hooks), so the call is always made; a declined permission only
+shows up as a failed call. The scope itself must also be in the provider's `scope` list in Kratos'
+config, or the access token won't have it.
 
-`required` decides what a failed call does. A failure is a transport error, a non-2xx
-response or a body that isn't JSON. With `required: false` (the default) it is logged as a
-warning and that call's fields are left out; the login carries on. With `required: true` the
-login fails (`502`) and no user is created. A pointer that finds nothing (a Google account
-with no saved phone number) is not a failed call: the field is simply left out, without a log
-line, while the call's other fields still count. Only a `required: true` entry treats a
-missing value as a failure.
+About the Google example. `people/me` reads the phone number from the user's own contact card,
+which takes `https://www.googleapis.com/auth/contacts.readonly`, read access to *all* of the user's
+contacts. The narrower `user.phonenumbers.read` only sees numbers on the Google Account profile,
+which most accounts don't have: `people/me` answers 200 with no `phoneNumbers`. The scope must be
+asked for at sign-in, so load `ory/kratos/oidc-google-phone.yml` instead of `oidc-google.yml` (the
+base file asks for email and profile only, and every deployer who never configures
+`profile_apis.google` keeps it that way); the `scope:` here and in that file have to stay in step.
+It is a sensitive Google scope: until your Google Cloud app passes OAuth verification, only its test
+users can grant it.
 
-About the Google example. The phone number saved under the account's Personal info is not
-returned by `people/me` (not even with `user.phonenumbers.read`); Google returns phone numbers
-from the user's own **contact card** ("Me" in Google Contacts), which needs the
-`contacts.readonly` scope. Two consequences: that scope lets the app read *all* of the user's
-contacts, and the number is whatever the user typed on their contact card, so it is not
-verified, don't treat it as proof of ownership. `contacts.readonly` is a sensitive Google
-scope: until your Google Cloud app passes OAuth verification, only its test users can grant it,
-and it must be declared under the project's "Data Access" scopes. Users without a phone on that
-card get no `phone_number` and log in normally (`required: false`).
+Fields from `profile_apis` do not pass through the identity schema, so the `phone_number` pattern
+(`^\+[1-9][0-9]{6,14}$`) is not applied to them. The number is whatever the user typed at Google, so
+it is unverified and not necessarily in that format; validate it in `registration_handler`.
 
-### Test doubles (`testing/`)
+### Ory
 
-Two standalone Rust binaries (own `Cargo.toml` with an empty `[workspace]` table each,
-so they're excluded from the root workspace — not real services, just fixtures for
-exercising bff's proxy):
+Kratos and Hydra are configured entirely under `ory/` (pinned to `oryd/kratos:v26.2.0` and
+`oryd/hydra:v26.2.0`); [ory/README.md](ory/README.md) explains every setting, which URLs to change
+for a deployment, and the behaviour checks the design rests on. Secrets (`DSN`, `SECRETS_*`) are
+env vars on the Ory containers, never in the files.
 
-- **`testing/downstream-service`** — any path, any method: 401 without an
-  `Authorization` header, otherwise serves a small HTML demo page showing it back.
-  `cargo run` in that directory, `$PORT` default `10001`.
-- **`testing/user-service`** — `POST /users`: 401 without `Authorization`, otherwise
-  saves the JSON body in memory under a generated `id` and returns it (`201`). `cargo
-  run` in that directory, `$PORT` default `10002`.
+**Google sign-in.** Create an OAuth client (Web application) at Google and register the redirect
+URI
 
-Only the variables below are read, and a YAML key can set anything they can. The short lifetimes (auth codes, login sessions, verification codes, reset tokens) are fixed in code. A `.env` file in the working directory or any parent directory is loaded first. A missing one is fine; a malformed one stops backend and bff from starting. An invalid `WA_LOGIN_PORT` (or other invalid login setting) likewise stops login.
+```
+https://<login host>/self-service/methods/oidc/callback/<provider>
+```
 
-| Variable                                                 | App                 | Default                                                     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-|----------------------------------------------------------|---------------------|-------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `WA_CONFIG_FILE`                                         | backend, bff        | `config.yaml` (relative to cwd)                             | Path to the optional YAML config overlay                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `WA_PROFILE`                                             | backend, bff, login | `prod`                                                      | `dev` or `prod`; anything else stops the service from starting. Under `prod`, all three refuse to start unless `WA_BFF_URL` and `WA_LOGIN_PUBLIC_URL` (and login's `WA_DEFAULT_REDIRECT_URI` and `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`, when set) are https URLs (an http one turns the `Secure` cookie flag off and puts http links in emails), `WA_LOGIN_PUBLIC_URL` being a bare origin (no path, query or fragment: it's compared with browsers' `Origin` header); backend also needs `WA_BACKEND_URL` set (http is fine there: it's internal). The profile picks the defaults of `WA_DOCS_ENABLED`, `WA_RATE_LIMIT_MAX_ATTEMPTS` and `WA_REQUIRE_VERIFIED_EMAIL`: `dev` turns the docs on, loosens the rate limit and doesn't require verified email; `prod` is the strict one. A value set explicitly always wins                                                                                                                                                      |
-| `WA_PORT`                                                | backend             | `1983`                                                      | Backend listen port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `WA_LOGIN_PORT`                                          | login               | `8081`                                                      | Login page listen port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `WA_BFF_PORT`                                            | bff                 | `8080`                                                      | bff listen port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `WA_BACKEND_URL`                                         | backend, bff        | `http://localhost:1983`                                     | Backend's address as bff reaches it, and, for backend, its `issuer`: the `iss` claim on access tokens and the base URL of `/.well-known/openid-configuration`, so it must be an address verifiers can reach (an internal URL; backend is never public). An http(s) URL without user info, path, query or fragment (backend serves discovery and its endpoints at its own root). Backend stores it normalized (scheme and host lowercased, default port and trailing `/` dropped), and that normalized form is what `iss` carries. Backend, when unset under `dev`: `http://localhost:{WA_PORT}` (`prod` refuses to start without it)                                                                                                                                                                                                                                                                                                      |
-| `WA_BFF_URL`                                             | bff, login, backend | `http://localhost:8080`                                     | Public base URL of the bff. login links and redirects the browser to it, and also calls its `/oidc/providers` server-side unless `WA_BFF_INTERNAL_URL` is set. backend builds each OIDC provider's default `redirect_uri` from it: `{WA_BFF_URL}/oidc/<provider>/callback`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `WA_BFF_INTERNAL_URL`                                    | login               | `WA_BFF_URL`                                                | Where login itself reaches bff server-side (its `/oidc/providers`), for when the public `WA_BFF_URL` doesn't resolve from login's network (e.g. `localhost` in a separate container). Empty counts as unset. `weaveauth-launcher` sets it to `http://127.0.0.1:{WA_BFF_PORT}` (the bff beside login) unless it's set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `WA_LOGIN_PUBLIC_URL`                                    | login, bff, backend | `http://localhost:8081`                                     | Login page's own public origin; a trailing `/` is dropped. login uses it as the last `redirect_uri` fallback (after `WA_DEFAULT_REDIRECT_URI`) and to build `own_url`/`next` — pinned in config rather than trusted from `Host`/`X-Forwarded-Proto`. backend also puts it in the verification email (the page where the code is entered). bff defaults `WA_TRUSTED_ORIGINS` from it, and backend defaults `WA_REDIRECT_URI_ALLOWLIST` from it (with a trailing `/` appended) — both only when that var isn't set explicitly (a `login_public_url` in `config.yaml` counts too). When all three run in the same container (`weaveauth-launcher`), the launcher points login's `WA_BFF_INTERNAL_URL` at the bff beside it (`http://127.0.0.1:{WA_BFF_PORT}`) unless that's set; under `prod` the container still needs `WA_BFF_URL` and `WA_BACKEND_URL` too (see `WA_PROFILE`). Not bff's or backend's own URL. |
-| `WA_REDIRECT_URI_ALLOWLIST`                              | backend             | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/`     | Comma-separated allowlist of valid `redirect_uri` values — checked once, at `/oauth/authorize`, for whatever bff forwards from `/login`. Exact string match, hence the trailing slash — matches login's own default `redirect_uri` while `WA_DEFAULT_REDIRECT_URI` and `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` are unset. The derived default doesn't include them; set this explicitly when using them: sign-in from the pages that fall back to them ends in a `400` from `/oauth/authorize` otherwise, and nothing complains at startup                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `WA_DEFAULT_REDIRECT_URI`                                | login               | `{WA_LOGIN_PUBLIC_URL}/`, else `http://localhost:8081/`     | Where the user goes after a login page opened without a `redirect_uri` (a bare visit to `login.html` or `register.html`, say), and the fallback for the pages `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI` covers. Must be on `WA_REDIRECT_URI_ALLOWLIST`. Empty counts as unset; a value that isn't an absolute http(s) URL (https under `prod`) stops login from starting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `WA_EMAIL_LINK_DEFAULT_REDIRECT_URI`                     | login               | `WA_DEFAULT_REDIRECT_URI`                                   | Overrides `WA_DEFAULT_REDIRECT_URI` for the pages reached from an email link, which carry no `redirect_uri`: the verification page after the correct code, the login page after a password reset (`login.html?status=password_reset`), and `forgot-password.html`. Must be on `WA_REDIRECT_URI_ALLOWLIST`. Empty counts as unset; a value that isn't an absolute http(s) URL (https under `prod`) stops login from starting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `WA_TRUSTED_ORIGINS`                                     | bff                 | `WA_LOGIN_PUBLIC_URL`, else `http://localhost:8081`         | Comma-separated origins allowed to POST to every bff form route (`/login`, `/register`, `/oidc/confirm-link`, `/verify-email*`, `/password-reset/*`), and (with bff's own origin) to send state-changing proxied requests: any method but `GET`/`HEAD`/`OPTIONS` (checked against `Origin`, falling back to `Referer`; bff answers `OPTIONS` itself) — anything else gets `403`, which is what stops a hostile site from auto-submitting a login/register form ("login CSRF") or riding the session cookie into an upstream (CSRF). List every frontend origin that calls the proxy. One list grants three rights: an origin added for the proxy can also POST the form routes, the login page's origin can also write through the proxy, and every origin in it can read every proxied response with the user's session (CORS with credentials) — so an XSS on any of them, the login page included, reads API data, not just writes it. Each must be a bare origin as the browser sends it (lowercase, no path, no default port, no `*`; a trailing `/` is dropped) and https under `prod`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `WA_SESSION_COOKIE_NAME`                                 | bff                 | `wa_session`                                                | Name of the HttpOnly session cookie set after login                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `WA_ACCESS_TOKEN_TTL_SECS`                               | backend             | `900`                                                       | How long an access token stays valid. 1 to 315360000 (10 years), and at most `WA_JWT_KEY_ROTATION_INTERVAL_SECS` minus 90000 (25 hours; see that row) when that is set                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `WA_REFRESH_TOKEN_TTL_SECS`                              | backend             | `2592000` (30 days)                                         | How long a refresh token stays redeemable. 1 to 315360000 (10 years)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `WA_JWT_KEY_ROTATION_INTERVAL_SECS`                      | backend             | 30 days, or longer if `WA_ACCESS_TOKEN_TTL_SECS` needs it   | How long a JWT signing key stays active before the next one takes over. The next key is published 24 hours before it signs, and the replaced key stays in `/.well-known/jwks.json` for `WA_ACCESS_TOKEN_TTL_SECS` plus 1 hour (margin for verifier `exp` leeway and clock skew). Those 25 hours plus `WA_ACCESS_TOKEN_TTL_SECS` must fit inside this value, or backend refuses to start; that keeps at most two keys published. Left unset, it is the longer of 30 days and that sum, so a long access token TTL never fails this check. 1 to 315360000. Keys are in memory, so a restart starts a fresh key and rotation clock, and access tokens signed before it stop verifying                                                                                                                                                                                                                                                        |
-| `WA_RATE_LIMIT_MAX_ATTEMPTS`                             | bff                 | `100` for `dev`, else `10`                                  | Burst size, replenished over a 60 second window, of bff's auth (`/login`, `/register`, `/oidc/*`, `/verify-email*`, `/password-reset/*`, all sharing one) and docs per-client rate-limit buckets (`tower_governor`; see the bff routes above). The proxied routes' bucket has its own size, `rate_limit_proxy_max_attempts`. `0` stops bff from starting; above `60000` a bucket refills like `60000` (one attempt per millisecond at most) |
-| `WA_TRUSTED_PROXIES`                                     | bff                 | *(unset)*                                                   | Comma-separated addresses or CIDR ranges (a `trusted_proxies:` list in `config.yaml` works too) of the reverse proxies in front of bff (e.g. `10.0.0.0/8, 172.30.0.2`), as bff sees them connect, not their public addresses. A request from one of them is rate-limited on the client address in its `X-Forwarded-For` (the rightmost entry that isn't itself a trusted proxy, or the leftmost if every entry is one; an `ip:port` entry counts as its address). Only `X-Forwarded-For` is read, not RFC 7239 `Forwarded`. An entry that is no address at all stops the walk, and the proxy's own address is used, logged once. From anyone else the header is ignored and the peer address counts. Unset behind a proxy, every client shares the proxy's budget. Under `prod`, an entry wider than IPv4 `/8` or IPv6 `/32` stops bff from starting (a guard against typos like `0.0.0.0/1`, not a check that the range is private): clients in such a range could claim any address and dodge the limit |
-| `WA_DOCS_ENABLED`                                        | bff                 | `true` for `dev`, else `false`                              | Serve the OpenAPI schema (`/openapi.json`) and Scalar UI (`/docs`). Off for `prod` — bff is internet-facing and these are unauthenticated descriptions of the auth surface, so a deployment opts in                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `WA_OIDC_<KEY>_CLIENT_ID`, `WA_OIDC_<KEY>_CLIENT_SECRET` | backend             | *(unset)*                                                   | Override the `client_id`/`client_secret` of the `oidc_providers` entry named `<key>` (upper-cased), so the secret can stay out of `config.yaml`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `WA_EMAIL_SMTP_PASSWORD`                                 | backend             | *(unset)*                                                   | Password for an `email_handler` of `kind: smtp`; wins over `password` in `config.yaml`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `WA_REQUIRE_VERIFIED_EMAIL`                              | backend             | `true` for `prod` when `email_handler` is set, else `false` | Withhold the login session from accounts whose email isn't verified; they get a restricted verification session and the code-entry page                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `WA_SETUID_HELPER`                                       | backend             | *(unset; the image sets it)*                                | `weaveauth-plugin-exec`, the binary plugins are started through. It alone holds `CAP_SETUID`/`CAP_SETGID` and switches to each plugin's `uid`/`gid`, refusing 0. Unset, backend switches users itself, which needs `CAP_SETUID`/`CAP_SETGID` (or root), unless `uid`/`gid` are its own (local runs)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `WA_PLUGIN_<PLUGIN>_ENV_<NAME>`                          | backend             | *(unset)*                                                   | `<PLUGIN>` is `REGISTRATION`, `LOGIN_CLAIMS` or `EMAIL`. Forwarded to that plugin as `<NAME>`, prefix stripped — how a plugin gets its own credentials (`WA_PLUGIN_REGISTRATION_ENV_DATABASE_URL` reaches the registration plugin as `DATABASE_URL`) without them sitting in `config.yaml`. `<PLUGIN>` scopes them, so a later surface doesn't inherit this one's secrets; the extra-data plugin is `REGISTRATION`, the login-claims plugin is `LOGIN_CLAIMS`. The plugin inherits nothing else                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+(`.../callback/google` for the shipped `ory/kratos/oidc-google.yml`; the provider's `id` is the
+last path segment). It is on the **login** host, not bff's: Kratos' `base_redirect_uri` is the
+login host and login forwards the path to Kratos. Load the provider as a second Kratos config file
+and give it the client id and secret (local-prod: `KRATOS_CONFIG_EXTRA=/etc/kratos/oidc-google.yml`,
+or `oidc-google-phone.yml` when `profile_apis.google` reads the phone number, see *profile_apis* in
+the hooks section above; `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` in `local-prod/.env`).
+Kratos needs egress to Google and its public CAs. Any other OIDC provider works with
+`ory/kratos/oidc/generic.jsonnet` as its mapper.
+
+**Verified-email-first.** By default nobody is signed in until their address is verified: the
+registration flow ends in a verification code, and a login with an unverified address starts a
+verification instead of finishing (password, passkey and provider logins alike). A provider that
+asserts `email_verified: true` skips the code. To sign users in right after registration instead,
+load the overlay as a second Kratos config file:
+
+```
+kratos serve -c kratos.yml -c session-on-registration.yml
+```
+
+(local-prod: `KRATOS_SESSION_ON_REGISTRATION=1` in `.env`.) The verification mail is still sent but
+not required (also set `WA_REQUIRE_VERIFIED_EMAIL=false`, or the token hook refuses the unverified address), so the `email_verified` claim in the tokens is what a service checks. Details and
+the two Kratos traps in [registration.md](docs/flows/registration.md#verified-email-first).
+
+**Key rotation.** Hydra signs JWT access tokens and id tokens with keys it creates on first start.
+To rotate (no restart needed), create a new key; new tokens use it at once and the old one stays in
+the JWKS so tokens in flight keep verifying:
+
+```bash
+mise run rotate-keys   # hydra create jwks hydra.jwt.access-token / hydra.openid.id-token, in local-prod
+```
+
+Once the old key is older than the access token TTL plus the longest JWKS cache of any consumer
+(downstream services verifying the JWTs, and bff for id tokens, which refetches on an unknown
+`kid` and every hour), remove it with `hydra delete jwk <set> <old kid>`. Run this as a scheduled job. The system
+secrets rotate by prepending a new value to `secrets.system`/`secrets.cookie` (Hydra) and
+`secrets.cookie`/`secrets.cipher` (Kratos), keeping the old one second until everything it signed
+or encrypted has expired. The full runbook is in [ory/README.md](ory/README.md#key-rotation).
+
+**Resetting state.** `mise run ory-down` (`docker compose down -v`) drops the Postgres volume:
+every identity, session and Hydra client goes, and a fresh `ory-up` starts empty. The secrets in
+`local-prod/.env` belong to that data, so regenerate both together (delete `.env` and rerun
+`gen-secrets.sh`).
 
 ## Testing
 
 ```bash
-cargo test
+cargo test            # or: mise run test
+mise run test-docker  # needs Docker
 ```
 
-Runs the full workspace test suite (backend, bff, login — `testing/downstream-service`
-and `testing/user-service` are excluded, being standalone fixtures, not workspace
-members):
+`cargo test` runs the workspace suite (`testing/*` are standalone fixtures, not members):
 
-- `backend`: unit tests inline per module (`model/*`, `storage/in_memory.rs` —
-  including `InMemoryLoginSessionStorage`'s single-use/expiry behavior, `config.rs` —
-  env/YAML precedence via a small `EnvGuard` + shared `Mutex` since `Config::load()`
-  touches process env) plus `backend/tests/api_test.rs` (black-box, via
-  `weaveauth::server::app`) covering `/health`, `/register` + `/oauth/login` +
-  `/oauth/authorize` + `/oauth/token`'s full authenticate-then-authorize round trip,
-  and allowlist/PKCE/single-use/TTL behavior.
-- `bff`: unit tests inline (`config.rs`, `storage/in_memory.rs`, `cookie.rs`,
-  `rate_limit.rs`, `server/mod.rs`'s expiry sweep and `proxy.rs`'s `refresh_session`) plus `bff/tests/pkce_flow.rs` (the full
-  server-to-server login exchange including credential verification, its failure
-  modes, and that backend is never browser-visible), `bff/tests/register.rs`
-  (registration forwarding + its `next`/`?error=1` redirect), and `bff/tests/proxy.rs`
-  (bearer-swap, prefix matching, query/body forwarding, auth failures).
-- `login`: unit tests inline (`Config::load()`) plus `login/tests/redirect_test.rs`
-  (the embedded shell, that `login.html`/`register.html` render with `bff_url` baked in
-  and no `<script>` tags, the OIDC password-confirm view, error-message rendering, and
-  that static assets like `htmx.min.js` still serve correctly).
+- `hooks`: unit tests inline plus `hooks/tests/` — the real router driven in-process against stub
+  Kratos, Hydra, bff and webhook servers: the token hook (claims, reserved names, failing closed),
+  after-registration (profile APIs, rollback), recovery's purge and revocations, and the API key on
+  every route.
+- `bff`: unit tests inline plus `bff/tests/` against a stub Hydra — login and callback (state,
+  allowlist, PKCE), logout and `/logged-out`, back-channel logout (forged, replayed and malformed
+  tokens), internal revoke, refresh (single-flight, rotation, failures), and the proxy.
+- `login`: unit tests inline plus `login/tests/` — pages and the CSRF field, script nonces and
+  escaping, a deployer template that keeps the scripts, the Kratos proxy and its per-client and
+  per-identifier limits, and the Hydra consent and logout chains.
+
+`mise run test-docker` runs `weaveauth-system-tests` with the `docker` feature: real Kratos, Hydra
+and Postgres containers driven end to end.
+
+`ory/checks/run_checks.py` re-runs the behaviour checks the Ory configuration rests on against a
+compose stack with a stub in place of the WeaveAuth image (see `ory/README.md`).
 
 ## Docker
 
 Single multi-stage `Dockerfile` at repo root. The `rust:1.98-slim-trixie` builder compiles
-the three services plus `weaveauth-launcher` and `weaveauth-plugin-exec`. The `gcr.io/distroless/cc-debian13`
-runtime (no shell) copies them plus `/app/login/static`, `/app/templates` (`pages/` for the login pages, `emails/` for the emails) and an empty `/app/backend` (backend finds its templates at `/app/backend/../templates`), and
-runs `weaveauth-launcher`, which starts all three and exits when any one of them does.
-Everything runs as `weaveauth` (1000) with no capabilities. The exception is
-`weaveauth-plugin-exec` (`WA_SETUID_HELPER`), which has `CAP_SETUID`/`CAP_SETGID` as file
-capabilities, so plugins can run as their own users (`wa-registration` 1001,
-`wa-login-claims` 1002, `wa-email` 1003). A deployment without plugins needs no capabilities. With
-plugins, `capabilities.drop: [ALL]` (the Kubernetes restricted Pod Security Standard),
-`--cap-drop SETUID`/`SETGID` or `no-new-privileges` stop them from starting, and backend
-then refuses to boot; see [docs/plugins.md](docs/plugins.md#deploying). The launcher
-doesn't forward `SIGTERM`, so use `docker run --init` for a prompt `docker stop`.
+`weaveauth-hooks`, `weaveauth-bff`, `weaveauth-login` and `weaveauth-launcher`. The
+`gcr.io/distroless/cc-debian13` runtime (no shell) copies them plus `/app/login/static` and
+`/app/templates` (`pages/` for the login pages, `providers/` for the sign-in button logos), and runs `weaveauth-launcher`, which starts all
+three and exits when any one of them does. Everything runs as `weaveauth` (1000) with no
+capabilities. The image contains no Ory: Kratos and Hydra run as their own containers. The launcher
+handles no signals and the services have no graceful shutdown: without `docker run --init`, `docker stop`
+waits out its grace period and then `SIGKILL`s; with it the stop is prompt, but in-flight requests are cut.
 
-The image runs the `prod` profile, which won't start on localhost defaults: give it
-`WA_BFF_URL` and `WA_LOGIN_PUBLIC_URL` (https) and `WA_BACKEND_URL`. To try it locally,
-use `dev` instead. Backend's port isn't published: bff and login reach it inside the container,
-and backend must never be exposed. Backend listens on every interface, so in Kubernetes give the
-pod a NetworkPolicy, on a network plugin that enforces it (pods can otherwise reach each other on
-any port): allow 8080/8081 from the ingress controller only, and 1983 only from the services you
-trust to call backend directly, such as ones fetching `/.well-known/jwks.json` to verify access
-tokens. Set `WA_BACKEND_URL` to the in-cluster Service address, so it works as the issuer those
-services discover from. Set `WA_TRUSTED_PROXIES` to the ingress controller's pod addresses (or
-their range), or every client shares one rate-limit bucket. A range is only safe while that
-NetworkPolicy lets nothing but the ingress reach 8080: any pod in it could otherwise send its own
-`X-Forwarded-For` and pick its own rate-limit key.
+The image runs the `prod` profile, which won't start on localhost defaults; see the configuration
+table for what it needs (https URLs for bff and login, Hydra's and Kratos' addresses, the API keys,
+the client secret and the redirect allowlist). Only 8080 (bff) and 8081 (login) are for the proxy;
+hooks (1983) and bff's internal listener (8082) listen on every interface of the container and must
+stay on an internal network. In Kubernetes give the pod a NetworkPolicy, on a network plugin that
+enforces it (pods can otherwise reach each other on any port): allow 8080 and 8081 from the ingress
+controller only, 1983 only from Kratos and Hydra, and 8082 only from Hydra and hooks' own container.
+Set `WA_TRUSTED_PROXIES` to the ingress controller's pod addresses (or their range), or every client
+shares one rate-limit bucket; a range is only safe while that NetworkPolicy lets nothing but the
+ingress reach 8080 and 8081, since any pod in it could otherwise send its own `X-Forwarded-For`.
 
-```bash
-docker build -t weaveauth .
-docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 -e WA_PROFILE=dev weaveauth
-```
-
-To run it the way production should, under `prod` behind a TLS proxy on a private network,
-see [local-prod/](local-prod/README.md).
+To run it the way production should, under `prod` behind a TLS proxy on a private network, with
+Ory and Postgres, see [local-prod/](local-prod/README.md) (`mise run ory-up`).
 
 ## License
 

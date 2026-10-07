@@ -1,4 +1,4 @@
-//! Config loading shared by backend, bff and login: one precedence rule
+//! Config loading shared by hooks, bff and login: one precedence rule
 //! (built-in defaults, then the YAML file, then the listed `WA_*` env vars)
 //! and one place that decides which env vars exist.
 

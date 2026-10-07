@@ -1,0 +1,9 @@
+# Check-only: three providers on the fake IdP (verified email, unverified email, email of an existing password user).
+selfservice:
+  methods:
+    oidc:
+      config:
+        providers:
+          - {id: fake, provider: generic, label: Fake, client_id: kratos, client_secret: s, issuer_url: "http://fakeidp:8080/verified", mapper_url: "file:///etc/kratos/oidc/generic.jsonnet", scope: [openid, email, profile]}
+          - {id: fakeu, provider: generic, label: FakeU, client_id: kratos, client_secret: s, issuer_url: "http://fakeidp:8080/unverified", mapper_url: "file:///etc/kratos/oidc/generic.jsonnet", scope: [openid, email, profile]}
+          - {id: fakelink, provider: generic, label: FakeLink, client_id: kratos, client_secret: s, issuer_url: "http://fakeidp:8080/link", mapper_url: "file:///etc/kratos/oidc/generic.jsonnet", scope: [openid, email, profile]}

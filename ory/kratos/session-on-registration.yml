@@ -1,0 +1,25 @@
+# Overlay: sign the user in right after registration, without verifying the email first.
+# Loaded as a second config file (-c kratos.yml -c session-on-registration.yml; local-prod: set
+# KRATOS_SESSION_ON_REGISTRATION=1). Arrays replace, they don't merge, so the web hook is repeated;
+# keep it identical to kratos.yml.
+selfservice:
+  flows:
+    registration:
+      after:
+        password: &after-registration
+          hooks:
+            - hook: web_hook
+              config:
+                id: after-registration
+                url: http://weaveauth:1983/kratos/after-registration
+                method: POST
+                body: file:///etc/kratos/hooks/after-registration.jsonnet
+                auth:
+                  type: api_key
+                  config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
+            - hook: session
+        passkey: *after-registration
+        oidc: *after-registration
+    login:
+      after:
+        hooks: []

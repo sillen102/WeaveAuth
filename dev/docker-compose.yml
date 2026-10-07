@@ -1,0 +1,113 @@
+# Postgres, Kratos and Hydra for `mise run all`; hooks, bff and login run on the host (see README.md "Run on the host").
+# Dev-only secrets, fixed so the host services' defaults match. Never reuse them. Configs come from render.sh.
+#
+#   browser ── login :8081 ──> kratos :4433        browser ── hydra :4444 (/oauth2/auth)
+#   kratos, hydra ──> host.docker.internal:1983 (hooks), :8082 (bff back-channel logout)
+#   hooks, login, bff ──> 127.0.0.1: kratos 4433/4434, hydra 4444/4445
+name: weaveauth-dev
+
+x-extra-hosts: &extra-hosts
+  - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_PASSWORD: dev-postgres
+      KRATOS_DB_PASSWORD: dev-kratos
+      HYDRA_DB_PASSWORD: dev-hydra
+    volumes:
+      - ../local-prod/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+
+  kratos-migrate:
+    image: oryd/kratos:v26.2.0
+    command: migrate sql -e --yes
+    environment:
+      DSN: postgres://kratos:dev-kratos@postgres:5432/kratos?sslmode=disable
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    command: migrate sql up -e --yes
+    environment:
+      DSN: postgres://hydra:dev-hydra@postgres:5432/hydra?sslmode=disable
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  kratos:
+    image: oryd/kratos:v26.2.0
+    entrypoint: ["/bin/sh", "/etc/kratos/start.sh"]
+    environment:
+      DSN: postgres://kratos:dev-kratos@postgres:5432/kratos?sslmode=disable
+      SECRETS_COOKIE: dev-kratos-cookie-secret-00000000
+      SECRETS_CIPHER: dev-kratos-cipher-secret-000000a
+      WA_HOOKS_API_KEY: dev-hooks-key
+      KRATOS_CONFIG_EXTRA: ${KRATOS_CONFIG_EXTRA:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+    extra_hosts: *extra-hosts
+    volumes:
+      - ../ory/kratos:/etc/kratos:ro
+      - ./.gen/kratos.yml:/etc/kratos/kratos.yml:ro
+    ports:
+      - "127.0.0.1:4433:4433"
+      - "127.0.0.1:4434:4434"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4433/health/ready"]
+      interval: 3s
+      retries: 30
+    depends_on:
+      kratos-migrate: {condition: service_completed_successfully}
+      mail: {condition: service_started}
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    entrypoint: ["/bin/sh", "/etc/hydra/start.sh"]
+    command: ["all"]
+    environment:
+      DSN: postgres://hydra:dev-hydra@postgres:5432/hydra?sslmode=disable
+      HYDRA_DEV: "1"
+      SECRETS_SYSTEM: dev-hydra-system-secret-000000000
+      SECRETS_COOKIE: dev-hydra-cookie-secret-000000000
+      WA_HOOKS_API_KEY: dev-hooks-key
+    extra_hosts: *extra-hosts
+    volumes:
+      - ../ory/hydra:/etc/hydra:ro
+      - ./.gen/hydra.yml:/etc/hydra/hydra.yml:ro
+    ports:
+      - "127.0.0.1:4444:4444"
+      - "127.0.0.1:4445:4445"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4444/health/ready"]
+      interval: 3s
+      retries: 30
+    depends_on:
+      hydra-migrate: {condition: service_completed_successfully}
+
+  hydra-init:
+    image: oryd/hydra:v26.2.0
+    entrypoint: ["/bin/sh", "/etc/hydra/init-bff-client.sh"]
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+      BFF_CLIENT_SECRET: dev-bff-client-secret
+      BFF_URL: http://localhost:8080
+      BFF_INTERNAL_URL: http://host.docker.internal:8082
+      POST_LOGOUT_URI: http://localhost:8080/logged-out
+    volumes:
+      - ../ory/hydra:/etc/hydra:ro
+    depends_on:
+      hydra: {condition: service_healthy}
+
+  mail:
+    image: axllent/mailpit:v1.31
+    ports:
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  pgdata: {}

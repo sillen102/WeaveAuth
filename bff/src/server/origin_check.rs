@@ -1,44 +1,45 @@
+use crate::config::Config;
 use axum::http::HeaderMap;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum OriginError {
     #[error("request has neither an Origin nor a usable Referer header")]
     Missing,
+    #[error("the Origin header is not text")]
+    Unreadable,
     #[error("request came from untrusted origin {0:?}")]
     Untrusted(String),
 }
 
 /// Rejects a request unless it names one of `trusted_origins` as its origin.
 ///
-/// `/login` and `/register` are plain cross-origin form POSTs by design (that's
-/// what keeps the response's `Set-Cookie` scoped to bff's own origin without
-/// needing CORS) -- but that same shape means any site can auto-submit one.
-/// Without this check, a hostile page could POST the attacker's own valid
-/// credentials to `/login` and hand the victim's browser a session logged in
-/// as the attacker ("login CSRF"), or spam `/register`.
+/// The browser attaches the session cookie to any same-site request, and any
+/// site can auto-submit a form: without this check a hostile page could make
+/// the victim's browser `POST /logout` or send state-changing proxied requests.
 ///
 /// Checks the `Origin` header first (sent by browsers on every cross-origin
 /// POST, and on same-origin POSTs in most modern browsers too), falling back
 /// to the origin component of `Referer` if `Origin` is absent. Rejects if
 /// neither header is present -- a legitimate browser POST always sends at
-/// least one.
+/// least one. A present `Origin` is the only one consulted, readable or not.
 pub(crate) fn require_trusted_origin(
     headers: &HeaderMap,
     trusted_origins: &[String],
 ) -> Result<(), OriginError> {
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| {
-            headers
-                .get(axum::http::header::REFERER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|r| url::Url::parse(r).ok())
-                .map(|u| u.origin().ascii_serialization())
-        })
-        .ok_or(OriginError::Missing)?;
+    let origin = match headers.get(axum::http::header::ORIGIN) {
+        Some(origin) => origin
+            .to_str()
+            .map_err(|_| OriginError::Unreadable)?
+            .to_string(),
+        None => headers
+            .get(axum::http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|r| url::Url::parse(r).ok())
+            .map(|u| u.origin().ascii_serialization())
+            .ok_or(OriginError::Missing)?,
+    };
 
     if trusted_origins.iter().any(|t| t == &origin) {
         Ok(())
@@ -47,29 +48,25 @@ pub(crate) fn require_trusted_origin(
     }
 }
 
-/// Whether `target` is safe to put in a `Location` header: either a
-/// same-origin-relative path (so no `Location` scheme/host takes over the
-/// navigation), or an absolute URL whose origin is in `trusted_origins`.
-///
-/// Guards against open redirects where `target` comes from attacker-controlled
-/// input (e.g. a `next` query param on a plain GET link) rather than a
-/// same-origin POST guarded by `require_trusted_origin`.
-pub(crate) fn is_safe_redirect_target(target: &str, trusted_origins: &[String]) -> bool {
-    if target.starts_with('/') && !target.starts_with("//") && !target.starts_with("/\\") {
-        return true;
-    }
-    url::Url::parse(target)
-        .map(|u| {
-            trusted_origins
-                .iter()
-                .any(|t| t == &u.origin().ascii_serialization())
-        })
-        .unwrap_or(false)
+/// The origins trusted to `POST /logout` and to use the proxy from a browser (see
+/// [`require_trusted_origin`] and `proxy_cors`): `trusted_origins` plus bff's own, for a
+/// frontend served through bff.
+pub(crate) fn trusted_origins(config: &Config) -> anyhow::Result<Arc<[String]>> {
+    let bff_origin = url::Url::parse(&config.bff_url)?
+        .origin()
+        .ascii_serialization();
+    Ok(config
+        .trusted_origins
+        .iter()
+        .cloned()
+        .chain([bff_origin])
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OriginError, is_safe_redirect_target, require_trusted_origin};
+    use super::{OriginError, require_trusted_origin, trusted_origins};
+    use crate::config::Config;
     use axum::http::{HeaderMap, HeaderValue};
 
     fn trusted() -> Vec<String> {
@@ -137,23 +134,35 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_relative_path_as_redirect_target() {
-        assert!(is_safe_redirect_target("/dashboard?x=1", &trusted()));
+    fn an_origin_that_is_not_text_is_refused_even_with_a_trusted_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_bytes(b"http://login.test\xff").unwrap(),
+        );
+        headers.insert("referer", HeaderValue::from_static("http://login.test/"));
+
+        assert_eq!(
+            require_trusted_origin(&headers, &trusted()),
+            Err(OriginError::Unreadable)
+        );
     }
 
     #[test]
-    fn rejects_a_protocol_relative_url_as_redirect_target() {
-        // "//evil.test" has no scheme but browsers resolve it host-first.
-        assert!(!is_safe_redirect_target("//evil.test", &trusted()));
-    }
+    fn trusted_origins_gain_bffs_own() {
+        let config = Config {
+            bff_url: "https://bff.test".into(),
+            trusted_origins: vec!["https://app.test".into(), "http://localhost:3000".into()],
+            ..Config::default()
+        };
 
-    #[test]
-    fn accepts_an_absolute_url_on_a_trusted_origin() {
-        assert!(is_safe_redirect_target("http://login.test/foo", &trusted()));
-    }
-
-    #[test]
-    fn rejects_an_absolute_url_on_an_untrusted_origin() {
-        assert!(!is_safe_redirect_target("https://evil.tld", &trusted()));
+        assert_eq!(
+            trusted_origins(&config).unwrap().to_vec(),
+            [
+                "https://app.test",
+                "http://localhost:3000",
+                "https://bff.test"
+            ]
+        );
     }
 }

@@ -1,0 +1,39 @@
+# Check-only override: swaps the weaveauth image for ory/checks/stub.py and adds a
+# fake OIDC provider. Use from local-prod/:
+#   docker compose -f docker-compose.yml -f ../ory/checks/docker-compose.checks.yml up -d
+# Host-side logs: ory/checks/logs/requests.jsonl
+services:
+  weaveauth:
+    image: python:3.13-alpine
+    build: !reset null
+    read_only: false
+    init: true
+    command: ["python3", "/stub/stub.py"]
+    volumes:
+      - ../ory/checks:/stub:ro
+      - ../ory/checks/logs:/logs
+  fakeidp:
+    image: ghcr.io/navikt/mock-oauth2-server:6.0.4
+    environment:
+      JSON_CONFIG_PATH: /config/fakeidp.json
+    volumes:
+      - ../ory/checks/fakeidp.json:/config/fakeidp.json:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks: [internal, checks-pub]
+  # Admin APIs published to loopback so the checks can inspect state; never do this outside a check.
+  hydra-admin:
+    ports:
+      - "127.0.0.1:34445:4445"
+    # A published port needs a non-internal network on the container.
+    networks: [internal, checks-pub]
+  kratos:
+    ports:
+      - "127.0.0.1:34434:4434"
+    environment:
+      KRATOS_CONFIG_EXTRA: /etc/kratos-extra/kratos-fakeidp.yml
+    volumes:
+      - ../ory/checks/kratos-fakeidp.yml:/etc/kratos-extra/kratos-fakeidp.yml:ro
+
+networks:
+  checks-pub: {}

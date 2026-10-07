@@ -2,28 +2,16 @@
 // header it received (401 if none was sent). Used to verify the bff's
 // cookie -> Bearer token proxy swap actually reaches a downstream service.
 //
-// Also backend's webhook target for both plugin hooks (see backend/config.yaml):
-// POST /hooks/register stores first/last name + phone number per user_id,
-// POST /hooks/login-claims returns them as token claims. In-memory only.
-// POST /hooks/email-verification prints the verification link.
-//
 // Run: cargo run
 // Port: $PORT, default 10001.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-use axum::extract::Request;
-use axum::http::{header, StatusCode};
-use axum::response::Html;
-use axum::routing::{any, post};
-use axum::Json;
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use axum::extract::Request;
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse};
+use axum::routing::any;
 use base64::Engine;
-use serde_json::{json, Map, Value};
-
-static PROFILES: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 #[tokio::main]
 async fn main() {
@@ -32,51 +20,12 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(10001);
 
-    let app = Router::new()
-        .route("/hooks/register", post(register_hook))
-        .route("/hooks/login-claims", post(login_claims_hook))
-        .route("/hooks/email-verification", post(email_verification_hook))
-        .fallback(any(handler));
+    let app = Router::new().fallback(any(handler));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
     println!("downstream-service listening on :{port}");
     axum::serve(listener, app).await.unwrap();
-}
-
-/// Email verification webhook: body is `{user_id, email, code, verify_page_url,
-/// expires_at}`. A real service would email the code; this prints it.
-async fn email_verification_hook(Json(body): Json<Value>) -> StatusCode {
-    println!("verification code for {}: {}", body["email"], body["code"]);
-    StatusCode::NO_CONTENT
-}
-
-/// Registration webhook: body is `{user_id, email, fields}`.
-async fn register_hook(Json(body): Json<Value>) -> StatusCode {
-    let (Some(user_id), Some(fields)) = (body["user_id"].as_str(), body["fields"].as_object()) else {
-        return StatusCode::BAD_REQUEST;
-    };
-    let field = |name: &str| fields.get(name).and_then(Value::as_str).unwrap_or_default();
-    let profile = json!({
-        "first_name": field("first_name"),
-        "last_name": field("last_name"),
-        "phone_number": field("phone_number"),
-    });
-    PROFILES
-        .lock()
-        .unwrap()
-        .get_or_insert_default()
-        .insert(user_id.to_string(), profile);
-    StatusCode::OK
-}
-
-/// Login-claims webhook: body is `{user_id, email}`; users without a stored
-/// profile (e.g. registered before a restart, or via OIDC) get no extra claims.
-async fn login_claims_hook(Json(body): Json<Value>) -> Json<Value> {
-    let profile = body["user_id"].as_str().and_then(|id| {
-        PROFILES.lock().unwrap().as_ref()?.get(id).cloned()
-    });
-    Json(profile.unwrap_or_else(|| Value::Object(Map::new())))
 }
 
 /// Decodes one base64url JWT segment (header or payload) and pretty-prints it
@@ -91,7 +40,10 @@ fn decode_segment(segment: &str) -> String {
     }
 }
 
-async fn handler(req: Request) -> Result<Html<String>, StatusCode> {
+/// Sent so bff does not add its default `sandbox` policy, which blocks the logout form.
+const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
+async fn handler(req: Request) -> Result<impl IntoResponse, StatusCode> {
     let authorization = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -110,8 +62,10 @@ async fn handler(req: Request) -> Result<Html<String>, StatusCode> {
         _ => "<p><em>Not a JWT (expected header.payload.signature)</em></p>".to_string(),
     };
 
-    Ok(Html(format!(
-        r#"<!doctype html>
+    Ok((
+        [(header::CONTENT_SECURITY_POLICY, PAGE_CSP)],
+        Html(format!(
+            r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -127,7 +81,9 @@ async fn handler(req: Request) -> Result<Html<String>, StatusCode> {
   <p>You reached this page through the bff's proxy. It received:</p>
   <p><code>Authorization: {authorization}</code></p>
   {decoded}
+  <form method="post" action="/logout?redirect_uri=http%3A%2F%2Flocalhost%3A8081%2Flogin"><button>Log out</button></form>
 </body>
 </html>"#
-    )))
+        )),
+    ))
 }

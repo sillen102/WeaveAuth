@@ -1,4 +1,0 @@
-# The probe plugin as the registration plugin, for plugin_privsep_flow.rs.
-extra_data_handler:
-  kind: plugin
-  command: /usr/local/bin/probe-plugin

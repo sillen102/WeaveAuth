@@ -1,0 +1,12 @@
+{
+  "interactiveLogin": false,
+  "httpServer": "NettyWrapper",
+  "tokenCallbacks": [
+    {"issuerId": "verified", "tokenExpiry": 300, "requestMappings": [
+      {"requestParam": "grant_type", "match": "*", "claims": {"sub": "idp-sub-verified", "email": "idp-user@example.test", "email_verified": true, "given_name": "Idp", "family_name": "User", "phone_number": "+46700000003", "name": "IdP User"}}]},
+    {"issuerId": "unverified", "tokenExpiry": 300, "requestMappings": [
+      {"requestParam": "grant_type", "match": "*", "claims": {"sub": "idp-sub-unverified", "email": "idp-unverified@example.test", "email_verified": false, "given_name": "Idp", "family_name": "User", "phone_number": "+46700000003", "name": "IdP Unverified"}}]},
+    {"issuerId": "link", "tokenExpiry": 300, "requestMappings": [
+      {"requestParam": "grant_type", "match": "*", "claims": {"sub": "idp-sub-link", "email": "pw-user@example.test", "email_verified": true, "given_name": "Idp", "family_name": "User", "phone_number": "+46700000003", "name": "Linked User"}}]}
+  ]
+}

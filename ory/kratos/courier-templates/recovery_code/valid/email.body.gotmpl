@@ -1,0 +1,9 @@
+<!doctype html>
+<html>
+  <body>
+    <p>Hi,</p>
+    <p>Someone asked to reset the password for {{ .To }}. Your recovery code is:</p>
+    <p style="font-size: 1.5em; letter-spacing: 0.2em;"><strong>{{ .RecoveryCode }}</strong></p>
+    <p>Enter it on the page that is waiting for it. The code works once and is valid for {{ .ExpiresInMinutes }} minutes. If you did not ask for this, you can ignore this email; your password stays as it is.</p>
+  </body>
+</html>

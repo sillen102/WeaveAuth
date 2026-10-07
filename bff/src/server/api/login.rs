@@ -1,301 +1,214 @@
 pub(crate) use controller::start_login;
 
 mod controller {
-    use axum::body::Body;
     use axum::extract::State;
-    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::http::{StatusCode, header};
     use axum::response::{IntoResponse, Response};
-    use common::extract::ApiForm;
+    use common::extract::ApiQuery;
     use common_macros::ErrorResponses;
     use serde::Deserialize;
     use thiserror::Error;
 
     use crate::server::AppState;
-    use crate::server::origin_check::{is_safe_redirect_target, require_trusted_origin};
-    use crate::server::verification::{
-        redirect_to_verification, with_optional_verification_cookie,
-    };
+    use crate::server::cookie::build_cookie;
+    use crate::server::login_cookie::LOGIN_COOKIE_MAX_AGE_SECS;
 
-    use super::service::{self, LoginOutcome, LoginServiceError};
+    use super::service::{self, LoginServiceError};
 
     #[derive(Deserialize)]
-    pub(crate) struct LoginRequest {
-        pub(super) email: String,
-        pub(super) password: String,
-        pub(super) redirect_uri: String,
-        /// Where to bounce the browser back to on wrong credentials -- the login
-        /// page's own URL, supplied by its form, not user-typed input.
-        pub(super) next: String,
+    pub(crate) struct LoginQuery {
+        /// Where the browser goes once logged in; must be on the allowlist. `None` or
+        /// empty: the configured default.
+        pub(super) redirect_uri: Option<String>,
     }
 
     #[derive(Debug, Error, ErrorResponses, Eq, PartialEq)]
-    #[error_response_no_openapi]
     pub(crate) enum LoginError {
-        #[error("request did not come from a trusted origin")]
-        #[error_response(
-            StatusCode::FORBIDDEN,
-            details = "request did not come from a trusted origin"
-        )]
-        UntrustedOrigin,
         #[error("redirect_uri is not allowed")]
         #[error_response(StatusCode::BAD_REQUEST, details = "redirect_uri is not allowed")]
         InvalidRedirectUri,
-        #[error("next is not a same-origin path or a trusted origin")]
-        #[error_response(
-            StatusCode::BAD_REQUEST,
-            details = "next is not a same-origin path or a trusted origin"
-        )]
-        InvalidNext,
-        #[error("token exchange failed")]
-        #[error_response(StatusCode::BAD_REQUEST, details = "token exchange failed")]
-        TokenExchangeFailed,
-        #[error("backend returned an unexpected response")]
-        #[error_response(
-            StatusCode::BAD_GATEWAY,
-            details = "backend returned an unexpected response"
-        )]
-        BackendUnavailable,
     }
 
     impl From<LoginServiceError> for LoginError {
         fn from(err: LoginServiceError) -> Self {
-            if !matches!(err, LoginServiceError::InvalidRedirectUri) {
-                tracing::warn!(%err, "login failed");
-            }
             match err {
-                LoginServiceError::InvalidRedirectUri => LoginError::InvalidRedirectUri,
-                LoginServiceError::TokenExchangeFailed(_) => LoginError::TokenExchangeFailed,
-                LoginServiceError::BackendUnavailable(_) => LoginError::BackendUnavailable,
+                LoginServiceError::InvalidRedirectUri => {
+                    // Not logged with the value: it is whatever the caller sent.
+                    tracing::info!("login refused: redirect_uri is not on the allowlist");
+                    LoginError::InvalidRedirectUri
+                }
             }
         }
     }
 
-    /// A plain form POST, not a fetch -- so a friendly bounce back to the
-    /// login page (rather than a bare 401 body) is what the browser shows on
-    /// wrong credentials, and the browser only ever talks to bff and never
-    /// sees backend (it POSTs its login form straight to bff's absolute URL,
-    /// so the session cookie ends up scoped to bff's origin, not the login
-    /// page's).
+    /// Starts a login: checks the allowlist, keeps the PKCE verifier, `state` and `nonce` in a
+    /// short-lived cookie and sends the browser to Hydra. The `redirect_uri` comes back to
+    /// `/callback` in that cookie, where it is checked again.
     pub(crate) async fn start_login(
-        State(mut state): State<AppState>,
-        headers: HeaderMap,
-        ApiForm(req): ApiForm<LoginRequest>,
+        State(state): State<AppState>,
+        ApiQuery(query): ApiQuery<LoginQuery>,
     ) -> Result<Response, LoginError> {
-        require_trusted_origin(&headers, &state.config.trusted_origins).map_err(|error| {
-            tracing::warn!(%error, "request rejected");
-            LoginError::UntrustedOrigin
-        })?;
-        if !is_safe_redirect_target(&req.next, &state.config.trusted_origins) {
-            return Err(LoginError::InvalidNext);
-        }
-
-        match service::login(&mut state, &req.email, &req.password, &req.redirect_uri).await? {
-            LoginOutcome::Rejected => {
-                let sep = if req.next.contains('?') { '&' } else { '?' };
-                Ok((
-                    StatusCode::SEE_OTHER,
-                    [(header::LOCATION, format!("{}{sep}error=1", req.next))],
-                )
-                    .into_response())
-            }
-            // Backend withheld the login session until the email is verified.
-            LoginOutcome::VerificationRequired { verification } => Ok(redirect_to_verification(
-                &state.config,
-                &req.next,
-                &req.redirect_uri,
-                &verification,
-            )),
-            // Verification is optional here: logged in, and the code page
-            // stays reachable for a while.
-            LoginOutcome::Authenticated {
-                cookie,
-                verification,
-            } => Ok(with_optional_verification_cookie(
-                (
-                    StatusCode::SEE_OTHER,
-                    [
-                        (header::LOCATION, req.redirect_uri),
-                        (header::SET_COOKIE, cookie),
-                    ],
-                    Body::empty(),
-                )
-                    .into_response(),
-                &state.config,
-                verification.as_ref(),
-            )),
-        }
+        let started = service::start(&state, query.redirect_uri)?;
+        let cookie = build_cookie(
+            &state.config.login_cookie(),
+            &started.cookie_value,
+            "/",
+            LOGIN_COOKIE_MAX_AGE_SECS,
+            state.config.secure_cookies(),
+        );
+        Ok((
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, started.authorize_url),
+                (header::SET_COOKIE, cookie),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+        )
+            .into_response())
     }
 }
 
 mod service {
-    use axum::http::StatusCode;
-    use serde::Serialize;
     use thiserror::Error;
 
     use crate::server::AppState;
-    use crate::server::api::complete_login::{CompleteLoginServiceError, complete_login};
-    use crate::server::verification::{BackendLoginResponse, VerificationSession};
+    use crate::server::login_cookie::PendingLogin;
 
     #[derive(Debug, Error, Eq, PartialEq)]
     pub(crate) enum LoginServiceError {
         #[error("redirect_uri is not allowed")]
         InvalidRedirectUri,
-        #[error("token exchange failed: {0}")]
-        TokenExchangeFailed(String),
-        #[error("backend returned an unexpected response: {0}")]
-        BackendUnavailable(String),
     }
 
-    impl From<CompleteLoginServiceError> for LoginServiceError {
-        fn from(err: CompleteLoginServiceError) -> Self {
-            match err {
-                CompleteLoginServiceError::InvalidRedirectUri => {
-                    LoginServiceError::InvalidRedirectUri
-                }
-                CompleteLoginServiceError::TokenExchangeFailed(cause) => {
-                    LoginServiceError::TokenExchangeFailed(cause)
-                }
-                CompleteLoginServiceError::BackendUnavailable(cause) => {
-                    LoginServiceError::BackendUnavailable(cause)
-                }
-            }
-        }
+    pub(crate) struct StartedLogin {
+        /// Where to send the browser.
+        pub(crate) authorize_url: String,
+        /// The value of the login cookie `/callback` needs.
+        pub(crate) cookie_value: String,
     }
 
-    #[derive(Serialize)]
-    struct VerifyLoginRequest<'a> {
-        email: &'a str,
-        password: &'a str,
-    }
-
-    pub(crate) enum LoginOutcome {
-        Authenticated {
-            /// `Set-Cookie` header value for the new session.
-            cookie: String,
-            /// Set when the account's email isn't verified but verification
-            /// is optional.
-            verification: Option<VerificationSession>,
-        },
-        /// Right credentials, but backend requires a verified email first and
-        /// handed out only this restricted session.
-        VerificationRequired { verification: VerificationSession },
-        /// Wrong credentials.
-        Rejected,
-    }
-
-    /// Verifies the submitted credentials against backend's `/oauth/login`, then
-    /// drives the whole authorization-code + PKCE exchange server-to-server in
-    /// one request.
-    ///
-    /// Per RFC 6749 4.1.1, authenticating the resource owner happens before a
-    /// code is issued: `/oauth/login`'s response carries a single-use
-    /// `login_session` that `/oauth/authorize` requires, so backend itself
-    /// enforces this order for any caller -- not just bff.
-    ///
-    /// The `redirect_uri` a caller passes here (the final browser destination) is
-    /// sent as-is to backend's `/oauth/authorize`, which allowlist-checks it and
-    /// refuses to issue a code for anything not listed. bff never navigates the
-    /// browser there itself during this hop (redirects aren't followed), so
-    /// there's no open-redirect exposure in sending the real value through.
-    pub(crate) async fn login(
-        state: &mut AppState,
-        email: &str,
-        password: &str,
-        redirect_uri: &str,
-    ) -> Result<LoginOutcome, LoginServiceError> {
-        let verify_resp = state
-            .http_client
-            .post(format!("{}/oauth/login", state.config.backend_url))
-            .json(&VerifyLoginRequest { email, password })
-            .send()
-            .await
-            .map_err(|error| {
-                LoginServiceError::BackendUnavailable(format!(
-                    "login request failed: {}",
-                    common::error::cause_chain(&error.without_url())
-                ))
-            })?;
-        if verify_resp.status() == StatusCode::UNAUTHORIZED {
-            return Ok(LoginOutcome::Rejected);
+    /// Per RFC 6749 10.15 the final destination is only ever one the deployer listed: it is
+    /// compared as an exact string, so no URL parsing can read another host into it.
+    pub(crate) fn start(
+        state: &AppState,
+        redirect_uri: Option<String>,
+    ) -> Result<StartedLogin, LoginServiceError> {
+        let redirect_uri = redirect_uri
+            .filter(|r| !r.is_empty())
+            .or_else(|| state.config.default_redirect_uri.clone())
+            .ok_or(LoginServiceError::InvalidRedirectUri)?;
+        if !state.config.allows_redirect_uri(&redirect_uri) {
+            return Err(LoginServiceError::InvalidRedirectUri);
         }
-        if !verify_resp.status().is_success() {
-            return Err(LoginServiceError::BackendUnavailable(format!(
-                "login returned {}",
-                verify_resp.status()
-            )));
-        }
-        let sessions = verify_resp
-            .json::<BackendLoginResponse>()
-            .await
-            .map_err(|error| {
-                LoginServiceError::BackendUnavailable(format!(
-                    "login response unreadable: {}",
-                    common::error::cause_chain(&error.without_url())
-                ))
-            })?;
-
-        let verification = sessions
-            .verification()
-            .map_err(|cause| LoginServiceError::BackendUnavailable(cause.to_string()))?;
-        match (sessions.login_session, verification) {
-            (Some(login_session), verification) => {
-                let cookie = complete_login(state, &login_session, redirect_uri).await?;
-                Ok(LoginOutcome::Authenticated {
-                    cookie,
-                    verification,
-                })
-            }
-            (None, Some(verification)) => Ok(LoginOutcome::VerificationRequired { verification }),
-            (None, None) => Err(LoginServiceError::BackendUnavailable(
-                "login response carries no session".to_string(),
-            )),
-        }
+        let pending = PendingLogin::new(redirect_uri);
+        Ok(StartedLogin {
+            authorize_url: state.hydra.authorize_url(
+                &pending.state,
+                &pending.nonce,
+                &pending.code_challenge(),
+            ),
+            cookie_value: pending.to_cookie_value(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::controller::*;
-    use axum::extract::State;
-    use axum::http::{HeaderMap, HeaderValue};
-    use common::extract::ApiForm;
-
     use crate::config::Config;
     use crate::server::AppState;
+    use axum::extract::State;
+    use common::extract::ApiQuery;
 
-    fn state_with_trusted_origins(trusted_origins: Vec<String>) -> AppState {
+    fn state() -> AppState {
         AppState::new(Config {
-            port: 8080,
-            bff_url: "http://bff.test".into(),
-            backend_url: "http://unused.test".into(),
-            session_cookie_name: "wa_session".into(),
-            routes: vec![],
-            trusted_origins,
-            rate_limit_max_attempts: 1000,
-            rate_limit_proxy_max_attempts: 1000,
-            trusted_proxies: vec![],
-            docs_enabled: false,
-            login_public_url: "http://login.test".into(),
+            redirect_uri_allowlist: vec!["https://app.test/".into()],
+            ..Config::default()
         })
-        .expect("valid app state")
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn rejects_an_untrusted_origin_before_contacting_backend() {
-        // backend_url above is unreachable -- a FORBIDDEN result (rather than a
-        // BAD_GATEWAY from trying to reach it) proves the origin check runs first.
-        let state = state_with_trusted_origins(vec!["http://login.test".to_string()]);
-        let mut headers = HeaderMap::new();
-        headers.insert("origin", HeaderValue::from_static("http://evil.test"));
-        let req = LoginRequest {
-            email: "alice".to_string(),
-            password: "hunter2".to_string(),
-            redirect_uri: "http://admin.test/".to_string(),
-            next: "http://login.test/".to_string(),
-        };
+    async fn a_redirect_uri_off_the_allowlist_is_the_invalid_redirect_uri_error() {
+        let result = start_login(
+            State(state()),
+            ApiQuery(serde_json::from_str(r#"{"redirect_uri":"https://evil.test/"}"#).unwrap()),
+        )
+        .await;
 
-        let result = start_login(State(state), headers, ApiForm(req)).await;
+        assert_eq!(result.err(), Some(LoginError::InvalidRedirectUri));
+    }
 
-        assert_eq!(result.err(), Some(LoginError::UntrustedOrigin));
+    #[tokio::test]
+    async fn an_allowlisted_redirect_uri_is_redirected_to_hydra() {
+        let response = start_login(
+            State(state()),
+            ApiQuery(serde_json::from_str(r#"{"redirect_uri":"https://app.test/"}"#).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn without_a_redirect_uri_the_default_is_used() {
+        let state = AppState::new(Config {
+            redirect_uri_allowlist: vec!["https://app.test/".into()],
+            default_redirect_uri: Some("https://app.test/".into()),
+            ..Config::default()
+        })
+        .unwrap();
+
+        let response = start_login(State(state), ApiQuery(serde_json::from_str("{}").unwrap()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    fn state_with_default() -> AppState {
+        AppState::new(Config {
+            redirect_uri_allowlist: vec![
+                "https://app.test/".into(),
+                "https://app.test/other".into(),
+            ],
+            default_redirect_uri: Some("https://app.test/".into()),
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_explicit_redirect_uri_wins_over_the_default() {
+        let started =
+            super::service::start(&state_with_default(), Some("https://app.test/other".into()))
+                .unwrap();
+
+        let pending =
+            crate::server::login_cookie::PendingLogin::from_cookie_value(&started.cookie_value)
+                .unwrap();
+        assert_eq!(pending.redirect_uri, "https://app.test/other");
+    }
+
+    #[test]
+    fn an_empty_redirect_uri_falls_back_to_the_default() {
+        let started = super::service::start(&state_with_default(), Some(String::new())).unwrap();
+
+        let pending =
+            crate::server::login_cookie::PendingLogin::from_cookie_value(&started.cookie_value)
+                .unwrap();
+        assert_eq!(pending.redirect_uri, "https://app.test/");
+    }
+
+    #[tokio::test]
+    async fn without_a_redirect_uri_and_no_default_it_is_refused() {
+        let result = start_login(
+            State(state()),
+            ApiQuery(serde_json::from_str("{}").unwrap()),
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(LoginError::InvalidRedirectUri));
     }
 }

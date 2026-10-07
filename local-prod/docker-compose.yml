@@ -1,15 +1,28 @@
-# The shipped image, as one container under the prod profile, behind TLS.
-# Run ./gen-certs.sh once first. See README.md.
+# The shipped image plus Ory Kratos/Hydra and Postgres, behind TLS.
+# Run ./gen-certs.sh and ./gen-secrets.sh once first. See README.md.
 #
-#   host 127.0.0.1:8443 ── caddy ──(edge)── weaveauth (bff 8080, login 8081, backend 1983)
-#                                               └──(internal)── mail (SMTP, STARTTLS required)
+#   host 127.0.0.1:8443 ── caddy ──(edge)── weaveauth (bff 8080, login 8081)
+#                                      └──── hydra (public 4444, only /oauth2/auth + logout routed)
+#   internal: weaveauth (hooks 1983, bff internal 8082), kratos, hydra, hydra-admin (4445), postgres, mail
+#   egress:   kratos only (sign-in with Google)
 #   host 127.0.0.1:8025 ──(mail-ui)── mail (web UI)
 name: weaveauth-local-prod
+
+x-kratos-env: &kratos-env
+  DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?run ./gen-secrets.sh}@postgres:5432/kratos?sslmode=disable
+
+x-hydra-env: &hydra-env
+  DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?run ./gen-secrets.sh}@postgres:5432/hydra?sslmode=disable
 
 services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    # The image's caddy binary carries file capabilities (cap_net_bind_service), so exec fails unless the
+    # bounding set still has it, though 8443 needs no privilege.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
     ports:
       - "127.0.0.1:8443:8443"
     volumes:
@@ -18,9 +31,9 @@ services:
     networks:
       public:
       edge:
-        # Pinned: bff trusts X-Forwarded-For from this address only.
+        # Pinned: bff and login trust X-Forwarded-For from this address only.
         ipv4_address: 172.30.0.2
-    depends_on: [weaveauth]
+    depends_on: [weaveauth, hydra]
 
   weaveauth:
     image: weaveauth
@@ -29,25 +42,176 @@ services:
     init: true
     restart: unless-stopped
     read_only: true
-    # ponytail: no plugins here; mounting one needs SETUID/SETGID back (docs/plugins.md#deploying).
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     environment:
       WA_PROFILE: prod
       WA_BFF_URL: https://bff.localhost:8443
       WA_LOGIN_PUBLIC_URL: https://login.localhost:8443
-      # Also the issuer (`iss`): services on `internal` discover the signing keys from it.
-      WA_BACKEND_URL: http://weaveauth:1983
-      WA_CONFIG_FILE: /etc/weaveauth/config.yaml
+      WA_DEFAULT_REDIRECT_URI: https://login.localhost:8443/settings
       WA_TRUSTED_PROXIES: 172.30.0.2
-      # Only the local CA: the container's sole outbound TLS peer is `mail`.
-      SSL_CERT_FILE: /etc/weaveauth/ca.crt
+      # hooks (internal only; Kratos and Hydra call it with WA_HOOKS_API_KEY)
+      WA_HOOKS_PORT: "1983"
+      WA_HOOKS_API_KEY: ${WA_HOOKS_API_KEY:?run ./gen-secrets.sh}
+      WA_KRATOS_ADMIN_URL: http://kratos:4434
+      WA_HYDRA_ADMIN_URL: http://hydra-admin:4445
+      # Same container: hooks reaches bff's internal listener on loopback.
+      WA_BFF_INTERNAL_URL: http://127.0.0.1:8082
+      WA_BFF_INTERNAL_PORT: "8082"
+      WA_BFF_INTERNAL_API_KEY: ${WA_BFF_INTERNAL_API_KEY:?run ./gen-secrets.sh}
+      # hooks refuses unverified addresses unless this is false; set it with KRATOS_SESSION_ON_REGISTRATION.
+      WA_REQUIRE_VERIFIED_EMAIL: ${WA_REQUIRE_VERIFIED_EMAIL:-true}
+      # login
+      WA_KRATOS_PUBLIC_URL: http://kratos:4433
+      # bff as Hydra's OIDC client: browser-facing issuer on the login host, token/JWKS server to server.
+      WA_HYDRA_PUBLIC_URL: https://login.localhost:8443
+      WA_HYDRA_INTERNAL_URL: http://hydra:4444
+      WA_BFF_CLIENT_ID: bff
+      WA_BFF_CLIENT_SECRET: ${WA_BFF_CLIENT_SECRET:?run ./gen-secrets.sh}
+      WA_REDIRECT_URI_ALLOWLIST: https://login.localhost:8443/settings
+      WA_CONFIG_FILE: /etc/weaveauth/config.yaml
     volumes:
       - ./config.yaml:/etc/weaveauth/config.yaml:ro
-      - ./certs/ca.crt:/etc/weaveauth/ca.crt:ro
-    # All three ports answer on both networks: caddy and mail can reach backend (1983) too.
     networks: [edge, internal]
-    depends_on: [mail]
+    depends_on:
+      kratos: {condition: service_healthy}
+      hydra: {condition: service_healthy}
+      hydra-init: {condition: service_completed_successfully}
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./gen-secrets.sh}
+      KRATOS_DB_PASSWORD: ${KRATOS_DB_PASSWORD}
+      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD}
+    volumes:
+      - ./postgres/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+    networks: [internal]
+
+  kratos-migrate:
+    image: oryd/kratos:v26.2.0
+    command: migrate sql -e --yes
+    environment: *kratos-env
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    command: migrate sql up -e --yes
+    environment: *hydra-env
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  kratos:
+    image: oryd/kratos:v26.2.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/kratos/start.sh"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      <<: *kratos-env
+      SECRETS_COOKIE: ${KRATOS_SECRET_COOKIE:?run ./gen-secrets.sh}
+      SECRETS_CIPHER: ${KRATOS_SECRET_CIPHER:?run ./gen-secrets.sh}
+      WA_HOOKS_API_KEY: ${WA_HOOKS_API_KEY}
+      KRATOS_SESSION_ON_REGISTRATION: ${KRATOS_SESSION_ON_REGISTRATION:-}
+      KRATOS_CONFIG_EXTRA: ${KRATOS_CONFIG_EXTRA:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # Go reads these directories next to the system roots: the courier trusts the local CA for
+      # STARTTLS to `mail`, and the Google sign-in keeps the public roots.
+      SSL_CERT_DIR: /etc/ssl/certs:/usr/local/share/local-ca
+    volumes:
+      - ../ory/kratos:/etc/kratos:ro
+      - ./certs/ca.crt:/usr/local/share/local-ca/ca.crt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4433/health/ready"]
+      interval: 3s
+      retries: 30
+    # internal reaches Postgres, hooks and mail; egress is the only way out (Google).
+    networks: [internal, egress]
+    depends_on:
+      kratos-migrate: {condition: service_completed_successfully}
+      mail: {condition: service_started}
+
+  # Hydra's public and admin APIs run as two processes on the same database: the one caddy can reach has
+  # no admin API, and `hydra-admin` is on `internal` only.
+  hydra:
+    image: oryd/hydra:v26.2.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/hydra/start.sh"]
+    command: ["public"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment: &hydra-serve-env
+      <<: *hydra-env
+      SECRETS_SYSTEM: ${HYDRA_SECRET_SYSTEM:?run ./gen-secrets.sh}
+      SECRETS_COOKIE: ${HYDRA_SECRET_COOKIE:?run ./gen-secrets.sh}
+      WA_HOOKS_API_KEY: ${WA_HOOKS_API_KEY}
+    volumes:
+      - ../ory/hydra:/etc/hydra:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4444/health/ready"]
+      interval: 3s
+      retries: 30
+    # edge: caddy routes /oauth2/auth and logout here. internal: Postgres, hooks, and bff's token and JWKS calls.
+    networks: [edge, internal]
+    depends_on:
+      hydra-migrate: {condition: service_completed_successfully}
+
+  hydra-admin:
+    image: oryd/hydra:v26.2.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/hydra/start.sh"]
+    command: ["admin"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment: *hydra-serve-env
+    volumes:
+      - ../ory/hydra:/etc/hydra:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4445/health/ready"]
+      interval: 3s
+      retries: 30
+    networks: [internal]
+    depends_on:
+      hydra-migrate: {condition: service_completed_successfully}
+
+  hydra-init:
+    image: oryd/hydra:v26.2.0
+    entrypoint: ["/bin/sh", "/etc/hydra/init-bff-client.sh"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      HYDRA_ADMIN_URL: http://hydra-admin:4445
+      BFF_CLIENT_SECRET: ${WA_BFF_CLIENT_SECRET}
+      BFF_URL: https://bff.localhost:8443
+      BFF_INTERNAL_URL: http://weaveauth:8082
+      POST_LOGOUT_URI: https://bff.localhost:8443/logged-out
+    volumes:
+      - ../ory/hydra:/etc/hydra:ro
+    networks: [internal]
+    depends_on:
+      hydra-admin: {condition: service_healthy}
 
   mail:
     image: axllent/mailpit:v1.31
@@ -62,6 +226,9 @@ services:
       - "127.0.0.1:8025:8025"
     networks: [internal, mail-ui]
 
+volumes:
+  pgdata: {}
+
 networks:
   public: {}
   # internal: true = no route out and no published ports.
@@ -74,5 +241,7 @@ networks:
           ip_range: 172.30.0.128/25
   internal:
     internal: true
+  # Only Kratos joins: it needs to reach Google for sign-in, and nothing else here needs the internet.
+  egress: {}
   # Only so the mail UI can be published to the host; nothing else joins it.
   mail-ui: {}

@@ -1,5 +1,22 @@
 profile: dev
-# Requests whose path starts with `path_prefix` are proxied to `upstream_url`
+# Dev-only credentials, which `prod` refuses: bff's Hydra client secret (a local Hydra needs a
+# client created with it) and the key hooks presents to /internal/revoke. A deployment sets
+# WA_BFF_CLIENT_SECRET and WA_BFF_INTERNAL_API_KEY.
+bff_client_secret: dev-bff-client-secret
+internal_api_key: dev-bff-internal-api-key
+# Where /login and /logout may send the browser, as exact strings.
+redirect_uri_allowlist:
+  - http://localhost:8081/
+  - http://localhost:8081/login
+  - http://localhost:8080/downstream
+# Where /login and /logged-out go when the request names no redirect_uri. Must be on the allowlist.
+default_redirect_uri: http://localhost:8080/downstream
+# Origins allowed to POST /logout and to call the proxied routes from a browser. They must be
+# same-site as bff_url: the SameSite=Lax session cookie is not sent from another site.
+trusted_origins:
+  - http://localhost:8081
+# Requests whose path starts with `path_prefix` as a whole path segment (`/downstreamx` does not
+# match `/downstream`) are proxied to `upstream_url`
 # (prefix stripped), with the session's access token swapped in as
 # `Authorization: Bearer <token>`, replacing the session cookie.
 routes:

@@ -1,5 +1,8 @@
 monorepo_root = true
 
+[settings]
+jobs = 8
+
 [tools]
 rust = { version = "1.98", components = "llvm-tools-preview" }
 "cargo:cargo-mutants" = "latest"
@@ -8,31 +11,25 @@ rust = { version = "1.98", components = "llvm-tools-preview" }
 
 [monorepo]
 config_roots = [
-    "backend",
+    "hooks",
     "bff",
     "common",
     "common/macros",
     "login",
-    "plugin-sdk/go",
-    "plugin-sdk/rust",
     "testing/downstream-service",
     "testing/user-service",
 ]
 
 [tasks.build]
 depends = [
-    { task = "//backend:build" },
+    { task = "//hooks:build" },
     { task = "//bff:build" },
     { task = "//common:build" },
     { task = "//login:build" },
-    { task = "//plugin-sdk/go:build" },
-    { task = "//plugin-sdk/rust:build" },
 ]
+run = "cargo build -p weaveauth-launcher -p weaveauth-system-tests"
 
 [tasks.test]
-depends = [
-    { task = "//plugin-sdk/go:test" },
-]
 run = "cargo test --workspace"
 
 [tasks.system-tests]
@@ -40,27 +37,46 @@ description = "Run cross-service system tests (excludes the Docker-gated ones, s
 run = "cargo test -p weaveauth-system-tests"
 
 [tasks.format]
-description = "Format Rust code with rustfmt and Go code with gofmt"
-run = [
-    "cargo fmt --all",
-    "cd plugin-sdk/go && gofmt -w .",
-]
+description = "Format Rust code with rustfmt"
+run = "cargo fmt --all"
 
 [tasks.lint]
 description = "Run linters for all services and common code"
 depends = [
-    { task = "//backend:lint" },
+    { task = "//hooks:lint" },
     { task = "//bff:lint" },
     { task = "//common:lint" },
     { task = "//login:lint" },
-    { task = "//plugin-sdk/go:lint" },
-    { task = "//plugin-sdk/rust:lint" },
+]
+run = "cargo clippy -p weaveauth-launcher -p weaveauth-system-tests --all-targets -- -D warnings"
+
+[tasks.ory-up]
+description = "Start Postgres, Ory Kratos and Hydra, and the shipped image, behind TLS (see local-prod/README.md; run local-prod/gen-certs.sh and gen-secrets.sh once)"
+run = "docker compose -f local-prod/docker-compose.yml up -d --build"
+
+[tasks.ory-down]
+description = "Stop the local-prod stack and drop its data"
+run = "docker compose -f local-prod/docker-compose.yml down -v"
+
+[tasks.rotate-keys]
+description = "Rotate Hydra's JWT access token and id token signing keys in the local-prod stack (see ory/README.md for removing the old keys)"
+run = [
+    "docker compose -f local-prod/docker-compose.yml exec -e ORY_SDK_URL=http://127.0.0.1:4445 hydra-admin hydra create jwks hydra.jwt.access-token --alg RS256 --use sig",
+    "docker compose -f local-prod/docker-compose.yml exec -e ORY_SDK_URL=http://127.0.0.1:4445 hydra-admin hydra create jwks hydra.openid.id-token --alg RS256 --use sig",
 ]
 
+[tasks.dev-ory-up]
+description = "Start Postgres, Kratos, Hydra and Mailpit in Docker for the host-run services (see dev/docker-compose.yml)"
+run = ["sh dev/render.sh", "docker compose -f dev/docker-compose.yml up -d"]
+
+[tasks.dev-ory-down]
+description = "Stop the dev Ory stack and drop its data"
+run = "docker compose -f dev/docker-compose.yml down -v"
+
 [tasks.services]
-description = "Run all services"
+description = "Run hooks, bff and login on the host (Ory is not started; see dev-ory-up, or all)"
 depends = [
-    { task = "//backend:dev" },
+    { task = "//hooks:dev" },
     { task = "//bff:dev" },
     { task = "//login:dev" },
 ]
@@ -73,22 +89,19 @@ depends = [
 ]
 
 [tasks.all]
-description = "Run all applications, including testing apps"
+description = "Run the whole stack: Postgres, Kratos and Hydra in Docker, plus hooks, bff, login and the testing apps on the host"
 depends = [
+    { task = "dev-ory-up" },
     { task = "services" },
     { task = "test-apps" },
 ]
 
 [tasks.test-docker]
-description = "Run the system tests that need a Docker daemon (real Postgres, the shipped image's plugin privilege separation)"
-run = [
-    "docker build -t weaveauth .",
-    "docker build -f system-tests/docker/Dockerfile.plugin-test -t weaveauth-plugin-test .",
-    "cargo test -p weaveauth-system-tests --features docker",
-]
+description = "Run the system tests that need a Docker daemon (real Kratos, Hydra and Postgres via testcontainers)"
+run = "cargo test -p weaveauth-system-tests --features docker"
 
 [tasks.mutants]
-description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth)"
+description = "Run cargo-mutants for a crate (usage: mise run mutants -- -p weaveauth-hooks)"
 run = "cargo mutants"
 
 [tasks.crap]
@@ -102,13 +115,8 @@ run = [
 description = "Upgrade Cargo workspace dependencies"
 run = "cargo update"
 
-[tasks.upgrade-go]
-description = "Upgrade Go plugin SDK dependencies"
-run = "cd plugin-sdk/go && go get -u ./..."
-
 [tasks.upgrade]
-description = "Upgrade all dependencies (Cargo workspace + Go plugin SDK)"
+description = "Upgrade all dependencies"
 depends = [
     { task = "upgrade-rust" },
-    { task = "upgrade-go" },
 ]

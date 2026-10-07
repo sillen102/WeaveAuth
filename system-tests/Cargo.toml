@@ -5,46 +5,27 @@ edition = "2024"
 publish = false
 
 [features]
-# Tests that need a Docker daemon: they run a real Postgres via
-# testcontainers. Off by default so `cargo test` stays runnable without it.
-docker = ["dep:testcontainers", "dep:tokio-postgres", "dep:deadpool-postgres"]
-
-# The probe plugins the system tests drive. They are bin targets of this
-# package rather than crates of their own, so `cargo test` builds them and
-# the tests find them through `CARGO_BIN_EXE_*` -- no nested cargo
-# invocation contending for the outer build's lock.
-[[bin]]
-name = "probe-plugin"
-path = "tests/fixtures/plugins/probe.rs"
-
-[[bin]]
-name = "pg-probe-plugin"
-path = "tests/fixtures/plugins/pg_probe.rs"
-required-features = ["docker"]
+# Tests that need a Docker daemon: they run the real Ory stack (Kratos, Hydra,
+# Postgres, Mailpit) via testcontainers, with hooks, bff and login in-process.
+# Off by default so `cargo test` stays runnable without it.
+docker = ["dep:testcontainers", "dep:dtor"]
 
 [dependencies]
-weaveauth-plugin-sdk = { path = "../plugin-sdk/rust" }
+weaveauth-bff = { path = "../bff" }
+weaveauth-hooks = { path = "../hooks" }
+weaveauth-login = { path = "../login" }
 tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
-prost-types = { workspace = true }
-testcontainers = { workspace = true, optional = true }
-tokio-postgres = { workspace = true, optional = true }
-deadpool-postgres = { workspace = true, optional = true }
-weaveauth = { path = "../backend" }
-weaveauth-bff = { path = "../bff" }
 axum = { workspace = true }
-reqwest = { workspace = true, features = ["json", "cookies"] }
-wiremock = { workspace = true }
+reqwest = { workspace = true, features = ["form", "json"] }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
-rsa = { workspace = true, features = ["pem"] }
-base64 = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+secrecy = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v4", "serde"] }
 url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
+base64 = { workspace = true }
 rand = { workspace = true }
-tonic = { workspace = true }
-tower = { workspace = true, features = ["util"] }
-hyper-util = { workspace = true, features = ["tokio"] }
+chrono = { workspace = true }
+testcontainers = { workspace = true, features = ["aws-lc-rs"], optional = true }
+dtor = { workspace = true, optional = true }

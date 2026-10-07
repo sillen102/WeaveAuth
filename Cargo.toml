@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "bff", "common", "common/macros", "launcher", "login", "plugin-sdk/rust", "system-tests"]
+members = ["hooks", "bff", "common", "common/macros", "launcher", "login", "system-tests"]
 resolver = "2"
 
 [profile.dev]
@@ -13,22 +13,10 @@ opt-level = 0
 [workspace.dependencies]
 axum = "0.8"
 axum-reverse-proxy = "2.2"
-aide = "0.16.0-alpha.4"
-schemars = "1.2"
-async-trait = "0.1"
-argon2 = "0.6"
-bcrypt = "0.19"
 jsonwebtoken = "11.1"
 openidconnect = { version = "4.0", default-features = false }
-rsa = "0.9"
 tokio = "1"
-tokio-stream = "0.1"
 rustix = "1.1"
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
-prost-types = "0.14"
-hyper-util = "0.1"
 ipnet = "2"
 tower-http = "0.7"
 tower_governor = "0.8"
@@ -39,6 +27,7 @@ figment = "0.10"
 dotenvy = "0.15"
 reqwest = "0.13"
 tracing = "0.1"
+trybuild = "1"
 tracing-subscriber = "0.3"
 anyhow = "1"
 thiserror = "2"
@@ -46,27 +35,15 @@ uuid = "1"
 futures-util = "0.3"
 chrono = "0.4"
 url = "2"
-indoc = "2"
 percent-encoding = "2"
 http = "1.5"
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
-strum = "0.28"
-email_address = "0.2"
-native-tls = "0.2"
 tera = "2"
-lettre = { version = "0.11", default-features = false }
 secrecy = "0.10"
-scalar_api_reference = "0.2"
-
-# Build-time protobuf codegen for the plugin contract
-tonic-prost-build = "0.14"
-protoc-bin-vendored = "3"
 
 # Test utilities
 tower = "0.5"
-wiremock = "0.6"
-testcontainers = "0.28"
-tokio-postgres = "0.7"
-deadpool-postgres = "0.14"
+testcontainers = { version = "0.28", default-features = false }
+dtor = "1"

@@ -1,0 +1,5 @@
+error: a variant that carries data needs `details = "..."`, so its cause stays out of the response
+ --> tests/ui/data_without_details.rs:7:5
+  |
+7 |     #[error_response(axum::http::StatusCode::BAD_GATEWAY)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

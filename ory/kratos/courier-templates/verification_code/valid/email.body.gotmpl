@@ -1,0 +1,9 @@
+<!doctype html>
+<html>
+  <body>
+    <p>Hi,</p>
+    <p>Your verification code for {{ .To }} is:</p>
+    <p style="font-size: 1.5em; letter-spacing: 0.2em;"><strong>{{ .VerificationCode }}</strong></p>
+    <p>Enter it on the page that is waiting for it, or <a href="{{ .VerificationURL }}">open this link</a>. The code is valid for {{ .ExpiresInMinutes }} minutes. If you did not create an account, you can ignore this email.</p>
+  </body>
+</html>

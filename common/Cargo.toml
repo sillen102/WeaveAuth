@@ -3,24 +3,20 @@ name = "common"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-auth = []
-
 [dependencies]
 axum = { workspace =  true }
 http = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace =  true }
-aide = { workspace = true, features = ["axum", "axum-json", "axum-query", "axum-form", "scalar"] }
-scalar_api_reference = { workspace =  true }
-schemars = { workspace = true, features = ["chrono04"] }
 chrono = { workspace = true, features = ["serde"] }
-strum = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 figment = { workspace = true, features = ["yaml", "env"] }
 dotenvy = { workspace = true }
 url = { workspace = true }
+tower_governor = { workspace = true }
+governor = { workspace = true }
+ipnet = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }

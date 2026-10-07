@@ -1,0 +1,31 @@
+[package]
+name = "weaveauth-hooks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+common-macros = { path = "../common/macros" }
+
+axum = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+futures-util = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "timeout"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+secrecy = { workspace = true, features = ["serde"] }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["json", "query"] }
+url = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+tower = { workspace = true, features = ["util"] }
