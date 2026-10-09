@@ -6,6 +6,7 @@
 //! as already-safe markup, so the escaping lives in one place and autoescape stays on for
 //! everything else.
 
+use crate::i18n::{Catalog, LabelId, Translator};
 use crate::kratos::{
     AnchorAttributes, Flow, ImgAttributes, InputAttributes, Node, NodeKind, ScriptAttributes,
     UiText,
@@ -16,9 +17,13 @@ use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
+use std::sync::Arc;
 use tera::{Context, Function, Kwargs, State, Tera, TeraResult, Value};
 
 const LAYOUT: &str = include_str!("layout.html");
+
+/// The language of the layout's and the page templates' own words.
+const COPY_LANGUAGE: &str = "en";
 
 /// Kratos' WebAuthn/passkey entry points: the only function names `ui.js` will call.
 const TRIGGERS: [&str; 6] = [
@@ -50,6 +55,7 @@ impl Renderer {
         own_origin: &str,
         kratos_origin: &str,
         providers_dir: &Path,
+        catalog: Arc<Catalog>,
     ) -> anyhow::Result<Self> {
         let mut tera = Tera::new();
         // Registered first: templates are checked against the functions when they load.
@@ -57,9 +63,10 @@ impl Renderer {
             "form",
             FormFunction {
                 urls: RenderRules::new(own_origin, kratos_origin, providers_dir)?,
+                catalog: catalog.clone(),
             },
         );
-        tera.register_function("messages", MessagesFunction);
+        tera.register_function("messages", MessagesFunction { catalog });
         tera.register_function("continuing", ContinuingFunction);
         tera.register_function("recovering", RecoveringFunction);
         // Child templates extend the layout, so it has to exist before they load; it is added
@@ -73,12 +80,28 @@ impl Renderer {
         Ok(Self { tera })
     }
 
-    /// A page with a fresh CSP nonce, as a response with the page's security headers.
+    /// A page with a fresh CSP nonce, as a response with the page's security headers. A page
+    /// whose `ctx` carries a negotiated `lang` varies by `Accept-Language` and `Cookie`; any
+    /// other is in the language of the compiled-in and template copy.
     pub(crate) fn page(&self, status: StatusCode, template: &str, mut ctx: Context) -> Response {
+        let negotiated = ctx.contains_key("lang");
+        if !negotiated {
+            ctx.insert("lang", COPY_LANGUAGE);
+        }
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         ctx.insert("nonce", &nonce);
         match self.render(template, &ctx) {
-            Ok(html) => (status, page_headers(&nonce), axum::response::Html(html)).into_response(),
+            Ok(html) => {
+                let mut response =
+                    (status, page_headers(&nonce), axum::response::Html(html)).into_response();
+                if negotiated {
+                    response.headers_mut().insert(
+                        header::VARY,
+                        HeaderValue::from_static("Accept-Language, Cookie"),
+                    );
+                }
+                response
+            }
             Err(error) => {
                 tracing::error!(%error, template, "could not render a login page");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -187,23 +210,32 @@ fn flow_argument(kwargs: &Kwargs) -> TeraResult<Flow> {
         .map_err(|error| tera::Error::message(format!("not a Kratos flow: {error}")))
 }
 
-struct MessagesFunction;
+/// The page's language, put in the context by `Renderer::page`.
+fn page_language(state: &State) -> TeraResult<String> {
+    state
+        .get::<String>("lang")?
+        .ok_or_else(|| tera::Error::message("no lang in the page context"))
+}
+
+struct MessagesFunction {
+    catalog: Arc<Catalog>,
+}
 
 impl Function<TeraResult<Value>> for MessagesFunction {
-    fn call(&self, kwargs: Kwargs, _: &State) -> TeraResult<Value> {
+    fn call(&self, kwargs: Kwargs, state: &State) -> TeraResult<Value> {
         let flow = flow_argument(&kwargs)?;
-        Ok(Value::safe_string(&messages(&flow.ui.messages)))
+        let language = page_language(state)?;
+        let translator = self.catalog.translator(&language);
+        Ok(Value::safe_string(&messages(
+            &translator,
+            &flow.ui.messages,
+        )))
     }
 
     fn is_safe(&self) -> bool {
         true
     }
 }
-
-/// Kratos' message id (`InfoSelfServiceRegistrationContinue`) for the "Continue" button of a
-/// social sign-up that still needs traits. Re-check it on a Kratos upgrade: the system test
-/// `google_sign_up_missing_a_trait_can_be_completed_on_the_form` fails if it moved.
-const CONTINUE_LABEL_ID: u64 = 1_040_003;
 
 /// Whether the flow is a social sign-up asking for the traits the provider didn't send. Its
 /// traits and its button must be posted as one form (see `missing_only` on `form`).
@@ -214,11 +246,9 @@ impl Function<TeraResult<bool>> for ContinuingFunction {
         let flow = flow_argument(&kwargs)?;
         Ok(flow.ui.nodes.iter().any(|node| {
             node.group == "oidc"
-                && node
-                    .meta
-                    .label
-                    .as_ref()
-                    .is_some_and(|l| l.id == CONTINUE_LABEL_ID)
+                && node.meta.label.as_ref().is_some_and(|l| {
+                    LabelId::from_id(l.id) == LabelId::InfoSelfServiceRegistrationContinue
+                })
         }))
     }
 
@@ -248,6 +278,7 @@ impl Function<TeraResult<bool>> for RecoveringFunction {
 
 struct FormFunction {
     urls: RenderRules,
+    catalog: Arc<Catalog>,
 }
 
 impl Function<TeraResult<Value>> for FormFunction {
@@ -258,7 +289,16 @@ impl Function<TeraResult<Value>> for FormFunction {
             .get::<String>("nonce")?
             .ok_or_else(|| tera::Error::message("no CSP nonce in the page context"))?;
         let missing_only = kwargs.get::<bool>("missing_only")?.unwrap_or(false);
-        let html = form(&flow, groups.as_deref(), missing_only, &self.urls, &nonce)?;
+        let language = page_language(state)?;
+        let translator = self.catalog.translator(&language);
+        let html = form(
+            &flow,
+            groups.as_deref(),
+            missing_only,
+            &self.urls,
+            &translator,
+            &nonce,
+        )?;
         Ok(Value::safe_string(&html))
     }
 
@@ -267,7 +307,7 @@ impl Function<TeraResult<Value>> for FormFunction {
     }
 }
 
-fn messages(messages: &[UiText]) -> String {
+fn messages(translator: &Translator, messages: &[UiText]) -> String {
     if messages.is_empty() {
         return String::new();
     }
@@ -277,27 +317,11 @@ fn messages(messages: &[UiText]) -> String {
             html,
             "<li class=\"message message-{}\">{}</li>",
             message_kind(message),
-            escape(message_text(message))
+            escape(&translator.message(message))
         );
     }
     html.push_str("</ul>");
     html
-}
-
-/// Kratos' message id (`InfoSelfServiceRecoverySuccessful`) shown on settings after a recovery.
-/// Kratos' text offers social sign-in whether or not a provider is configured. Re-check it on a
-/// Kratos upgrade: `recovery_ends_every_old_session_and_purges_credentials_and_oidc_links` fails
-/// if it moved.
-const RECOVERY_SUCCESSFUL_ID: u64 = 1_060_001;
-
-fn message_text(message: &UiText) -> &str {
-    match message.id {
-        RECOVERY_SUCCESSFUL_ID => {
-            "Your account is recovered. Set a new password below within the next few minutes, \
-             or you will have to recover it again."
-        }
-        _ => &message.text,
-    }
 }
 
 fn message_kind(message: &UiText) -> &'static str {
@@ -318,6 +342,7 @@ fn form(
     groups: Option<&[String]>,
     missing_only: bool,
     urls: &RenderRules,
+    translator: &Translator,
     nonce: &str,
 ) -> TeraResult<String> {
     let chosen = |node: &Node| {
@@ -350,7 +375,7 @@ fn form(
         );
         for node in &nodes {
             if !matches!(node.kind, NodeKind::Script(_)) {
-                html.push_str(&render_node(node, urls));
+                html.push_str(&render_node(node, urls, translator));
             }
         }
         html.push_str("</form>");
@@ -386,23 +411,23 @@ fn is_hidden_default(node: &Node) -> bool {
     node.group == "default" && is_hidden_input(node)
 }
 
-fn render_node(node: &Node, urls: &RenderRules) -> String {
+fn render_node(node: &Node, urls: &RenderRules, translator: &Translator) -> String {
     let mut html = match &node.kind {
-        NodeKind::Input(input) => render_input(node, input, urls),
+        NodeKind::Input(input) => render_input(node, input, urls, translator),
         NodeKind::Text(text) => {
             format!(
                 "<p class=\"node-text\"{}>{}</p>",
                 id_attribute(&text.id),
-                escape(&text.text.text)
+                escape(&translator.label(&text.text))
             )
         }
         NodeKind::Img(img) => render_img(img),
-        NodeKind::A(anchor) => render_anchor(anchor, urls),
+        NodeKind::A(anchor) => render_anchor(anchor, urls, translator),
         NodeKind::Div(div) => format!("<div{}></div>", id_attribute(&div.id)),
         NodeKind::Script(_) | NodeKind::Unknown => String::new(),
     };
     if !node.messages.is_empty() && !matches!(node.kind, NodeKind::Input(_)) {
-        html.push_str(&messages(&node.messages));
+        html.push_str(&messages(translator, &node.messages));
     }
     html
 }
@@ -484,7 +509,12 @@ fn provider_logo_files(dir: &Path) -> anyhow::Result<HashMap<String, String>> {
     Ok(logos)
 }
 
-fn render_input(node: &Node, input: &InputAttributes, urls: &RenderRules) -> String {
+fn render_input(
+    node: &Node,
+    input: &InputAttributes,
+    urls: &RenderRules,
+    translator: &Translator,
+) -> String {
     let value = value_text(input.value.as_ref());
     let value_attribute = |value: &Option<String>| match value {
         Some(value) => format!(" value=\"{}\"", escape(value)),
@@ -498,14 +528,14 @@ fn render_input(node: &Node, input: &InputAttributes, urls: &RenderRules) -> Str
             "<input type=\"hidden\" name=\"{name}\"{}{}>{}",
             value_attribute(&value),
             trigger_attributes(input),
-            messages(&node.messages)
+            messages(translator, &node.messages)
         ),
         kind @ ("submit" | "button") => {
             let label = node
                 .meta
                 .label
                 .as_ref()
-                .map(|label| label.text.clone())
+                .map(|label| translator.field_label(&input.name, label))
                 .filter(|text| !text.is_empty())
                 .or_else(|| value.clone())
                 .unwrap_or_else(|| input.name.clone());
@@ -520,7 +550,7 @@ fn render_input(node: &Node, input: &InputAttributes, urls: &RenderRules) -> Str
                 value_attribute(&value),
                 trigger_attributes(input),
                 escape(&label),
-                messages(&node.messages)
+                messages(translator, &node.messages)
             )
         }
         kind => {
@@ -533,11 +563,11 @@ fn render_input(node: &Node, input: &InputAttributes, urls: &RenderRules) -> Str
                 .meta
                 .label
                 .as_ref()
-                .map(|label| label.text.as_str())
+                .map(|label| translator.field_label(&input.name, label))
                 .unwrap_or_default();
             let mut html = format!(
                 "<div class=\"field\"><label for=\"f-{group}-{name}\">{}</label>",
-                escape(label)
+                escape(&label)
             );
             let _ = write!(
                 html,
@@ -559,7 +589,7 @@ fn render_input(node: &Node, input: &InputAttributes, urls: &RenderRules) -> Str
             html.push_str(disabled);
             html.push_str(&trigger_attributes(input));
             html.push('>');
-            html.push_str(&messages(&node.messages));
+            html.push_str(&messages(translator, &node.messages));
             html.push_str("</div>");
             html
         }
@@ -597,8 +627,8 @@ fn render_img(img: &ImgAttributes) -> String {
     html
 }
 
-fn render_anchor(anchor: &AnchorAttributes, urls: &RenderRules) -> String {
-    let title = escape(&anchor.title.text);
+fn render_anchor(anchor: &AnchorAttributes, urls: &RenderRules, translator: &Translator) -> String {
+    let title = escape(&translator.label(&anchor.title));
     if is_web_url(&anchor.href, urls) {
         format!(
             "<a href=\"{}\"{}>{title}</a>",

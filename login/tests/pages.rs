@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use weaveauth_login::{Config, app, app_with_pages, app_with_templates};
+use weaveauth_login::{Config, app, app_with_locales, app_with_pages, app_with_templates};
 
 async fn setup() -> (axum::Router, std::sync::Arc<StubState>) {
     let (url, state) = stub().await;
@@ -439,7 +439,8 @@ async fn messages_text_is_escaped() {
     let (url, state) = stub().await;
     let mut flow = login_flow();
     flow["ui"]["messages"] = json!([
-        {"id": 4000006, "text": "<script>alert(1)</script> & \"quoted\"", "type": "error"}
+        {"id": 4000003, "text": "english", "type": "error",
+         "context": {"min_length": "<script>alert(1)</script> & \"quoted\""}}
     ]);
     state.flow.lock().unwrap().1 = flow;
     let app = app(config(&url)).unwrap();
@@ -535,6 +536,7 @@ async fn node_attributes_labels_and_messages_are_escaped() {
     nodes[1]["attributes"]["name"] = json!("id\" autofocus onfocus=\"alert(2)");
     nodes[1]["meta"]["label"]["text"] = json!("<b>Email</b>");
     nodes[1]["messages"] = json!([{"id": 1, "text": "<i>nope</i>", "type": "error"}]);
+    nodes[2]["meta"]["label"] = json!({"id": 1, "text": "<u>Secret</u>", "type": "info"});
     state.flow.lock().unwrap().1 = flow;
     let app = app(config(&url)).unwrap();
 
@@ -544,8 +546,16 @@ async fn node_attributes_labels_and_messages_are_escaped() {
     assert!(!reply.body.contains("onfocus=\"alert"), "{}", reply.body);
     assert!(!reply.body.contains("<b>Email</b>"), "{}", reply.body);
     assert!(!reply.body.contains("<i>nope</i>"), "{}", reply.body);
+    assert!(!reply.body.contains("nope"), "{}", reply.body);
     assert!(
-        reply.body.contains("&lt;i&gt;nope&lt;/i&gt;"),
+        reply
+            .body
+            .contains("Something went wrong. Please try again."),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("&lt;u&gt;Secret&lt;/u&gt;"),
         "{}",
         reply.body
     );
@@ -1150,4 +1160,218 @@ async fn a_plain_registration_keeps_the_social_button_apart_from_the_traits() {
         "{}",
         reply.body
     );
+}
+
+const TEMPLATES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../templates");
+
+/// The shipped English plus a Swedish file with a few texts, in a directory of its own.
+fn locales_with_swedish() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let shipped = format!("{TEMPLATES}/locales/en.json");
+    std::fs::copy(shipped, dir.path().join("en.json")).unwrap();
+    let swedish = json!({
+        "messages": {"ErrorValidationMinLength": "Minst {min_length} tecken."},
+        "labels": {"InfoSelfServiceLoginWith": "Logga in med {provider}", "InfoSelfServiceLogin": "Logga in"},
+        "fields": {"traits.first_name": "Förnamn", "traits.email": "E-post"}
+    });
+    std::fs::write(dir.path().join("sv.json"), swedish.to_string()).unwrap();
+    dir
+}
+
+async fn swedish_app(flow: serde_json::Value) -> (axum::Router, tempfile::TempDir) {
+    let (url, state) = stub().await;
+    state.flow.lock().unwrap().1 = flow;
+    let locales = locales_with_swedish();
+    let app = app_with_locales(
+        config(&url),
+        &format!("{TEMPLATES}/pages/*.html"),
+        format!("{TEMPLATES}/providers"),
+        locales.path(),
+    )
+    .unwrap();
+    (app, locales)
+}
+
+#[tokio::test]
+async fn a_flow_is_rendered_in_the_language_the_browser_asks_for() {
+    let mut flow = login_flow();
+    flow["ui"]["nodes"][4]["meta"]["label"]["context"] = json!({"provider": "Google"});
+    flow["ui"]["messages"] =
+        json!([{"id": 4000003, "text": "x", "type": "error", "context": {"min_length": 8}}]);
+    let (app, _locales) = swedish_app(flow).await;
+
+    let reply = get_with_headers(
+        &app,
+        "/login?flow=f1",
+        &[("accept-language", "sv-SE, en;q=0.5")],
+    )
+    .await;
+
+    assert!(reply.body.contains("<html lang=\"sv\">"), "{}", reply.body);
+    assert!(reply.body.contains("Minst 8 tecken."), "{}", reply.body);
+    assert!(reply.body.contains("Logga in med Google"), "{}", reply.body);
+    assert!(reply.body.contains(">Logga in</button>"), "{}", reply.body);
+    // A text the Swedish file lacks comes from the default language.
+    assert!(reply.body.contains(">Password</label>"), "{}", reply.body);
+    assert!(reply.header("vary").contains("Accept-Language"));
+    assert!(reply.header("vary").contains("Cookie"));
+}
+
+#[tokio::test]
+async fn the_language_cookie_beats_accept_language_and_an_unknown_one_falls_through() {
+    let (app, _locales) = swedish_app(login_flow()).await;
+    let by_cookie = get_with_headers(
+        &app,
+        "/login?flow=f1",
+        &[
+            ("cookie", "theme=dark; language=sv"),
+            ("accept-language", "en"),
+        ],
+    )
+    .await;
+    // An unknown cookie hands over to Accept-Language (sv), not straight to the default.
+    let fallback = get_with_headers(
+        &app,
+        "/login?flow=f1",
+        &[
+            ("cookie", "language=../../etc/passwd"),
+            ("accept-language", "sv"),
+        ],
+    )
+    .await;
+    let default = get_with_headers(
+        &app,
+        "/login?flow=f1",
+        &[("cookie", "language=fr"), ("accept-language", "de")],
+    )
+    .await;
+
+    for (reply, lang) in [(&by_cookie, "sv"), (&fallback, "sv"), (&default, "en")] {
+        let html = format!("<html lang=\"{lang}\">");
+        assert!(reply.body.contains(&html), "{lang}: {}", reply.body);
+    }
+    assert!(
+        by_cookie.body.contains(">Logga in</button>"),
+        "{}",
+        by_cookie.body
+    );
+    assert!(
+        default.body.contains(">Sign in</button>"),
+        "{}",
+        default.body
+    );
+}
+
+#[tokio::test]
+async fn a_trait_label_is_translated_by_its_field_name() {
+    let mut flow = settings_flow("http://kratos.test/self-service/settings?flow=s1");
+    let nodes = flow["ui"]["nodes"].as_array_mut().unwrap();
+    let first_name = nodes.last_mut().unwrap();
+    first_name["meta"]["label"] = json!({"id": 1070002, "text": "Given name", "type": "info"});
+    let (app, _locales) = swedish_app(flow).await;
+
+    let swedish = get_with_headers(&app, "/settings?flow=f1", &[("cookie", "language=sv")]).await;
+    let english = get(&app, "/settings?flow=f1").await;
+
+    assert!(
+        swedish.body.contains(">Förnamn</label>"),
+        "{}",
+        swedish.body
+    );
+    assert!(
+        english.body.contains(">First name</label>"),
+        "{}",
+        english.body
+    );
+    assert!(!english.body.contains("Given name"), "{}", english.body);
+}
+
+#[tokio::test]
+async fn an_unmapped_message_is_the_generic_text_and_never_what_kratos_said() {
+    let mut flow = login_flow();
+    flow["ui"]["messages"] = json!([{"id": 9999999, "text": "Kratos wording", "type": "error"}]);
+    let (app, _locales) = swedish_app(flow).await;
+
+    let reply = get(&app, "/login?flow=f1").await;
+
+    assert!(!reply.body.contains("Kratos wording"), "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Something went wrong. Please try again."),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn an_unmapped_button_keeps_kratos_text() {
+    let mut flow = login_flow();
+    flow["ui"]["nodes"][3]["meta"]["label"] =
+        json!({"id": 9999999, "text": "Kratos button", "type": "info"});
+    let (app, _locales) = swedish_app(flow).await;
+
+    let reply = get(&app, "/login?flow=f1").await;
+
+    assert!(
+        reply.body.contains(">Kratos button</button>"),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn startup_fails_without_the_default_language() {
+    let (url, _state) = stub().await;
+    let empty = tempfile::tempdir().unwrap();
+
+    let error = app_with_locales(
+        config(&url),
+        &format!("{TEMPLATES}/pages/*.html"),
+        format!("{TEMPLATES}/providers"),
+        empty.path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("en.json"), "{error}");
+}
+
+#[tokio::test]
+async fn the_sign_in_identifier_label_is_translated_through_its_trait() {
+    let (app, _locales) = swedish_app(login_flow()).await;
+
+    let swedish = get_with_headers(&app, "/login?flow=f1", &[("cookie", "language=sv")]).await;
+    let english = get(&app, "/login?flow=f1").await;
+
+    assert!(swedish.body.contains(">E-post</label>"), "{}", swedish.body);
+    assert!(english.body.contains(">Email</label>"), "{}", english.body);
+}
+
+#[tokio::test]
+async fn only_flow_pages_negotiate_so_other_pages_stay_english_and_do_not_vary() {
+    let (url, state) = stub().await;
+    state.flow.lock().unwrap().1 = login_flow();
+    let locales = tempfile::tempdir().unwrap();
+    for tag in ["en", "fr"] {
+        let shipped = format!("{TEMPLATES}/locales/en.json");
+        std::fs::copy(shipped, locales.path().join(format!("{tag}.json"))).unwrap();
+    }
+    let app = app_with_locales(
+        Config {
+            default_locale: "fr".into(),
+            ..config(&url)
+        },
+        &format!("{TEMPLATES}/pages/*.html"),
+        format!("{TEMPLATES}/providers"),
+        locales.path(),
+    )
+    .unwrap();
+
+    let flow = get(&app, "/login?flow=f1").await;
+    let error = get(&app, "/error").await;
+
+    assert!(flow.body.contains("<html lang=\"fr\">"), "{}", flow.body);
+    assert!(flow.headers.get("vary").is_some());
+    assert!(error.body.contains("<html lang=\"en\">"), "{}", error.body);
+    assert!(error.headers.get("vary").is_none());
 }

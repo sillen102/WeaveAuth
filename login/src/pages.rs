@@ -94,6 +94,7 @@ async fn flow_page(
             let mut ctx = Context::new();
             insert_navigation(&mut ctx, &flow);
             ctx.insert("flow", &flow);
+            ctx.insert("lang", state.catalog.negotiate(headers));
             ctx.insert("bff_url", &state.config.bff_url);
             state.renderer.page(StatusCode::OK, kind.template(), ctx)
         }

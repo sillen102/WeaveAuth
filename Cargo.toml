@@ -45,5 +45,6 @@ secrecy = "0.10"
 
 # Test utilities
 tower = "0.5"
+tempfile = "3"
 testcontainers = { version = "0.28", default-features = false }
 dtor = "1"

@@ -26,3 +26,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }

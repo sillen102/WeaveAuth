@@ -228,13 +228,13 @@ pub fn login_flow() -> Value {
             "method": "POST",
             "nodes": [
                 {"type": "input", "group": "default", "attributes": {"name": "csrf_token", "type": "hidden", "value": CSRF, "required": true, "disabled": false, "node_type": "input"}, "messages": [], "meta": {}},
-                {"type": "input", "group": "default", "attributes": {"name": "identifier", "type": "text", "value": "", "required": true, "disabled": false, "autocomplete": "username webauthn", "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1070004, "text": "Email", "type": "info"}}},
+                {"type": "input", "group": "default", "attributes": {"name": "identifier", "type": "text", "value": "", "required": true, "disabled": false, "autocomplete": "username webauthn", "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1070002, "text": "Email", "type": "info", "context": {"title": "Email", "name": "traits.email"}}}},
                 {"type": "input", "group": "password", "attributes": {"name": "password", "type": "password", "required": true, "disabled": false, "autocomplete": "current-password", "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1070001, "text": "Password", "type": "info"}}},
                 {"type": "input", "group": "password", "attributes": {"name": "method", "type": "submit", "value": "password", "disabled": false, "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1010001, "text": "Sign in", "type": "info"}}},
                 {"type": "input", "group": "oidc", "attributes": {"name": "provider", "type": "submit", "value": "google", "disabled": false, "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1010002, "text": "Sign in with Google", "type": "info"}}},
                 {"type": "input", "group": "passkey", "attributes": {"name": "passkey_challenge", "type": "hidden", "value": "{\"publicKey\":{\"challenge\":\"abc\"}}", "disabled": false, "node_type": "input"}, "messages": [], "meta": {}},
                 {"type": "input", "group": "passkey", "attributes": {"name": "passkey_login", "type": "hidden", "value": "", "disabled": false, "node_type": "input"}, "messages": [], "meta": {}},
-                {"type": "input", "group": "passkey", "attributes": {"name": "passkey_login_trigger", "type": "button", "disabled": false, "onclick": "window.__oryPasskeyLogin()", "onclickTrigger": "oryPasskeyLogin", "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1010008, "text": "Sign in with a passkey", "type": "info"}}},
+                {"type": "input", "group": "passkey", "attributes": {"name": "passkey_login_trigger", "type": "button", "disabled": false, "onclick": "window.__oryPasskeyLogin()", "onclickTrigger": "oryPasskeyLogin", "node_type": "input"}, "messages": [], "meta": {"label": {"id": 1010021, "text": "Sign in with passkey", "type": "info"}}},
                 {"type": "script", "group": "webauthn", "attributes": {"src": "http://login.test/.well-known/ory/webauthn.js", "async": true, "referrerpolicy": "no-referrer", "crossorigin": "anonymous", "integrity": "sha512-INTEGRITY", "type": "text/javascript", "id": "webauthn_script", "nonce": "kratos-nonce", "node_type": "script"}, "messages": [], "meta": {}}
             ],
             "messages": []
@@ -325,6 +325,14 @@ pub async fn get_with_cookie(app: &Router, uri: &str, cookie: &str) -> Reply {
         "127.0.0.1",
     )
     .await
+}
+
+pub async fn get_with_headers(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Reply {
+    let mut req = axum::http::Request::get(uri);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    send(app, req.body(Body::empty()).unwrap(), "127.0.0.1").await
 }
 
 pub async fn post_form(app: &Router, uri: &str, body: &str, ip: &str) -> Reply {

@@ -16,6 +16,9 @@ pub struct Config {
     /// (through bff's `/login`), when it carries no `redirect_uri` of its own. Must be on bff's
     /// allowlist. Unset: such a page is an error.
     pub default_redirect_uri: Option<String>,
+    /// The language (a file in `templates/locales`) used when the request names none that is
+    /// available, and for every text the requested language lacks.
+    pub default_locale: String,
     /// Kratos' public API, server to server: where flows are fetched from and what the
     /// `/self-service/*` and `/.well-known/ory/*` proxy forwards to.
     pub kratos_public_url: String,
@@ -50,6 +53,7 @@ impl Default for Config {
             bff_url: "http://localhost:8080".to_string(),
             own_origin: "http://localhost:8081".to_string(),
             default_redirect_uri: None,
+            default_locale: "en".to_string(),
             kratos_public_url: "http://localhost:4433".to_string(),
             hydra_admin_url: "http://localhost:4445".to_string(),
             bff_client_id: "bff".to_string(),
@@ -66,6 +70,7 @@ const ENV: EnvTable = &[
     ("WA_BFF_URL", "bff_url"),
     ("WA_LOGIN_PUBLIC_URL", "own_origin"),
     ("WA_DEFAULT_REDIRECT_URI", "default_redirect_uri"),
+    ("WA_DEFAULT_LOCALE", "default_locale"),
     ("WA_KRATOS_PUBLIC_URL", "kratos_public_url"),
     ("WA_HYDRA_ADMIN_URL", "hydra_admin_url"),
     ("WA_BFF_CLIENT_ID", "bff_client_id"),
@@ -236,6 +241,7 @@ mod tests {
             assert_eq!(config.hydra_admin_url, "http://localhost:4445");
             assert_eq!(config.bff_client_id, "bff");
             assert_eq!(config.default_redirect_uri, None);
+            assert_eq!(config.default_locale, "en");
             assert_eq!(config.kratos_session_cookie, "ory_kratos_session");
             Ok(())
         });
@@ -321,6 +327,16 @@ mod tests {
             set_internal_urls(jail);
             let prod = Config::load().unwrap();
             assert_eq!(prod.rate_limit_proxy_max_attempts, 600);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_default_locale_is_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            jail.set_env("WA_PROFILE", "dev");
+            jail.set_env("WA_DEFAULT_LOCALE", "sv");
+            assert_eq!(Config::load().unwrap().default_locale, "sv");
             Ok(())
         });
     }

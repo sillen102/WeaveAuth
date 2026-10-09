@@ -34,10 +34,12 @@ official images.
   registration, recovery, verification, settings, error) and for Hydra's login, consent and logout
   challenges. It is the **only** way anything public reaches Kratos (`/self-service/*`,
   `/.well-known/ory/*`): it applies per-client rate limits and a per-identifier throttle on password
-  submissions. Pages are templates in `templates/pages/`, and provider logo images in `templates/providers/`, that a deployer can replace; per
-  `login/AGENTS.md` they are plain HTML and CSS, scripts come only from the compiled-in layout and
-  from Kratos' own script nodes. Templates call `form`, `messages`, `continuing` (a social sign-up
-  missing traits) and `recovering` (settings right after a recovery); see `login/AGENTS.md`.
+  submissions. A deployer can replace the page templates (`templates/pages/`), the provider logos
+  (`templates/providers/`) and the translations of what Kratos says (`templates/locales/`); per
+  `login/AGENTS.md` the pages are plain HTML and CSS, and scripts come only from the compiled-in
+  layout and from Kratos' own script nodes. Templates call `form`, `messages`, `continuing` (a
+  social sign-up missing traits) and `recovering` (settings right after a recovery); see
+  `login/AGENTS.md`.
 - **`weaveauth-hooks`** (Axum) — `:1983`, **internal only**. The web hooks Kratos and Hydra call:
   the claims for every token, the registration handoff (with provider profile APIs), and the purge
   after a recovery or password change. Every route but `/health` needs
@@ -219,6 +221,7 @@ any parent directory is loaded first by `hooks` and `bff`; a malformed one stops
 | `WA_HYDRA_REFRESH_TOKEN_TTL_SECS` | bff | `2592000` (30 days) | How long Hydra's refresh tokens live: set it to Hydra's `ttl.refresh_token` (`720h` in `ory/hydra/hydra.yml`). A session ends that long after the last refresh that rotated its refresh token (and never later than 30 days after its login, whatever that is set to). 1 to 315360000 |
 | `WA_REDIRECT_URI_ALLOWLIST` | bff | *(empty; required under `prod`)* | Comma-separated allowlist of `redirect_uri` values for `/login` and `/logout` (and `/logged-out`'s `state`): exact string match, so mind the trailing slash. Each an absolute http(s) URL (https under `prod`) without user info or a fragment |
 | `WA_DEFAULT_REDIRECT_URI` | bff, login | *(unset)* | bff: where `/login` goes when it names no `redirect_uri`, and where `/logged-out` goes when the logout named no allowlisted destination. login: where a page opened without a challenge or a flow goes, through bff's `/login`, so it must be on `WA_REDIRECT_URI_ALLOWLIST`. login also sends the browser here after a password is changed in settings (Kratos returns to login's `/login`, unless the flow carried a `return_to`, which wins); unset, that ends on an error page, so set it whenever settings are used. Empty counts as unset; https under `prod` |
+| `WA_DEFAULT_LOCALE` | login | `en` | The language of `templates/locales/<language>.json` used when a request names none that exists, and for every text the requested language lacks. A request names its language with a cookie named exactly `language` (no `__Host-` or `__Secure-` prefix; an application on the same domain sets it, with a `Domain` that covers login, to carry a visitor's choice over to the login pages; `sv-SE` and `sv_SE` both work) or, failing that, `Accept-Language`; a language that has no file is ignored. The default's file must have a text for every Kratos message and label login knows (`locales/en.json` does); a missing file or text, a file name over 35 characters, or a `{placeholder}` Kratos doesn't send for that text stops startup (`login/AGENTS.md`, "Languages") |
 | `WA_TRUSTED_ORIGINS` | bff | *(unset; bff's own origin is always trusted)* | Comma-separated origins allowed to `POST /logout` and to send state-changing proxied requests (checked against `Origin`, falling back to `Referer`), and to read proxied responses cross-origin with credentials (CORS) — so an XSS on any of them reads API data, not just writes it. Each a bare origin as the browser sends it (lowercase, no path, no default port, no `*`; a trailing `/` is dropped), https under `prod` |
 | `WA_KRATOS_SESSION_COOKIE` | login | `ory_kratos_session` | Name of Kratos' session cookie; must equal `session.cookie.name` in Kratos' config. A login answer that doesn't set it isn't a success for the per-identifier throttle |
 | `WA_SESSION_COOKIE_NAME` | bff | `wa_session` | Name of the HttpOnly session cookie, a cookie-name token (letters, digits, `-`, `_`, `.` and a few other symbols). Under https the browser sees it as `__Host-<name>` (and the login cookie as `__Host-wa_login`), which stops a sibling subdomain from planting one |

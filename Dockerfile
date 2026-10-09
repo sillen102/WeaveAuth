@@ -28,7 +28,7 @@ COPY --from=builder /app/target/release/weaveauth-hooks /usr/local/bin/weaveauth
 COPY --from=builder /app/target/release/weaveauth-bff /usr/local/bin/weaveauth-bff
 COPY --from=builder /app/target/release/weaveauth-login /usr/local/bin/weaveauth-login
 COPY --from=builder /app/target/release/weaveauth-launcher /usr/local/bin/weaveauth-launcher
-# login bakes these paths in at build time (<crate>/static, <crate>/../templates/{pages,providers}),
+# login bakes these paths in at build time (<crate>/static, <crate>/../templates/{pages,providers,locales}),
 # so they must sit at the same absolute paths they were built at.
 COPY --from=builder /app/login/static /app/login/static
 COPY --from=builder /app/templates /app/templates
