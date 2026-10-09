@@ -24,6 +24,7 @@ pub(crate) struct AppState {
     pub(crate) http_client: reqwest::Client,
     pub(crate) registration: Option<WebhookHandler>,
     pub(crate) login_claims: Option<WebhookHandler>,
+    pub(crate) verification: Option<WebhookHandler>,
     pub(crate) profile_apis: Arc<HashMap<String, Vec<ProfileApiConfig>>>,
     pub(crate) request_timeout: Duration,
     pub(crate) require_verified_email: bool,
@@ -48,6 +49,7 @@ impl AppState {
             http_client: upstream,
             registration: webhook(&config.registration_handler)?,
             login_claims: webhook(&config.login_claims_handler)?,
+            verification: webhook(&config.verification_handler)?,
             profile_apis: Arc::new(config.profile_apis.clone()),
             request_timeout: Duration::from_secs(config.request_timeout_secs),
             require_verified_email: config.require_verified_email,
@@ -62,6 +64,7 @@ pub async fn app_start(config: &Config) -> anyhow::Result<()> {
     tracing::info!(
         registration = config.registration_handler.is_some(),
         login_claims = config.login_claims_handler.is_some(),
+        verification = config.verification_handler.is_some(),
         profile_api_providers = ?config.profile_apis.keys().collect::<Vec<_>>(),
         "configured handlers"
     );

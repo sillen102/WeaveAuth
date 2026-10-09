@@ -453,7 +453,7 @@ impl Stack {
 
         // --- hooks, bff, login in this process
         note("bff client created; starting hooks, bff, login");
-        let stubs = Arc::new(stubs::Stubs::default());
+        let stubs = Arc::new(stubs::Stubs::new(kratos_admin.clone()));
         let webhook = |path: &str| {
             Some(weaveauth_hooks::config::WebhookConfig {
                 url: format!("{stubs_url}{path}"),
@@ -470,6 +470,7 @@ impl Stack {
             bff_internal_api_key: SecretString::from(BFF_INTERNAL_API_KEY),
             registration_handler: webhook("/registration"),
             login_claims_handler: webhook("/claims"),
+            verification_handler: webhook("/verification"),
             require_verified_email: !options.session_on_registration,
             ..Default::default()
         })?;

@@ -49,6 +49,10 @@ nothing that isn't a UUID may get that far.
   `TimeoutLayer` could cancel it. Hydra aborts the token exchange on any non-2xx and retries
   what isn't a 403, so a deterministic refusal (inactive identity, unverified email, reserved
   claim) is a 403.
+- `after-verification` tells the deployer's `verification_handler` that an address was verified. The
+  account is fine whatever the handler does, so unlike `after-registration` a failure never deletes the
+  identity: a refusal (`400`/`403`/`422`) is logged and answered `200` (an error would end the user's
+  flow on `/error`), anything else is `502` (Kratos retries). The endpoint must be idempotent.
 - `require_verified_email` (default `true`) makes the token hook refuse an identity whose email
   Kratos hasn't verified, whatever path got it to Hydra. A deployment that lets unverified
   identities sign in on purpose (the `session-on-registration.yml` overlay) sets it `false`.

@@ -17,6 +17,10 @@ registration_handler:
 login_claims_handler:
   url: http://localhost:10002/users/claims
   bearer_token: dev-user-service-token
+# {user_id, email} once the identity has verified its email; the handler decides whether to send a welcome mail.
+verification_handler:
+  url: http://localhost:10002/users/verified
+  bearer_token: dev-user-service-token
 # Per Kratos OIDC provider id. After a social sign-up hooks reads the access token Kratos stored for
 # the identity and calls these for claims the id_token doesn't carry. The fields reach the
 # registration handler next to the identity's traits.

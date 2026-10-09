@@ -2,11 +2,12 @@
 // (see hooks/config.yaml). Users are kept in memory and written to $USERS_FILE (default
 // users.json) so a restart keeps them; every route needs an Authorization header (401 without).
 //
-// POST /users         registration webhook `{user_id, email, email_verified, fields}`: stores `fields`
-//                     (first_name, last_name, phone_number) under `user_id`. Any other JSON object is
-//                     stored under a generated id. Answers 201 with the body and its `id`.
-// POST /users/claims  login-claims webhook `{user_id, ...}`: answers the stored `fields` as token
-//                     claims, 404 for a user it does not know (hooks then fails the login).
+// POST /users           registration webhook `{user_id, email, email_verified, fields}`: stores `fields`
+//                       (first_name, last_name, phone_number) under `user_id`. Any other JSON object is
+//                       stored under a generated id. Answers 201 with the body and its `id`.
+// POST /users/claims    login-claims webhook `{user_id, ...}`: answers the stored `fields` as token
+//                       claims, 404 for a user it does not know (hooks then fails the login).
+// POST /users/verified  verification webhook `{user_id, email}`: prints the user id and answers 204.
 //
 // Run: cargo run
 // Port: $PORT, default 10002.
@@ -49,7 +50,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/users", post(save_user))
-        .route("/users/claims", post(claims));
+        .route("/users/claims", post(claims))
+        .route("/users/verified", post(verified));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
@@ -96,4 +98,10 @@ async fn claims(headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<Valu
         .as_str()
         .and_then(|id| USERS.lock().unwrap().as_ref()?.get(id).cloned());
     user.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn verified(headers: HeaderMap, Json(body): Json<Value>) -> Result<StatusCode, StatusCode> {
+    authorized(&headers)?;
+    println!("email verified for user {}", body["user_id"]);
+    Ok(StatusCode::NO_CONTENT)
 }

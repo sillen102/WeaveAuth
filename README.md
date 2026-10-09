@@ -130,6 +130,7 @@ hooks (`WA_HOOKS_PORT`, default `1983`; internal only). Everything but `/health`
 | GET | `/health` | infra | `ok` |
 | POST | `/hydra/token-hook` | Hydra, on every token grant (code and refresh) | `{session: {access_token, id_token}}` claims: `email`, `email_verified` from Kratos plus what `login_claims_handler` returns. `403` for an unknown or inactive identity, an identity without an email, an unverified email (`require_verified_email`), or a webhook that returns a reserved claim name; `502` if Kratos or the webhook fails: no token is issued |
 | POST | `/kratos/after-registration` | Kratos, after an identity is created | Hands `{user_id, email, email_verified, fields}` to `registration_handler` (after the provider's `profile_apis` for a social sign-up). On failure a `4xx`/`502` and the identity is deleted |
+| POST | `/kratos/after-verification` | Kratos, after an email address is verified | Hands `{user_id, email}` to `verification_handler` (nothing happens without one). A refusal (`400`/`403`/`422`) is logged and answered `200`; anything else is a `502` (Kratos retries). The identity is kept either way. Not called for an address a provider verified at sign-up or a recovery code verified, see below |
 | POST | `/kratos/after-recovery` | Kratos, once a recovery code is accepted | Replaces the password with a random one, deletes the passkey/webauthn/totp/lookup credentials and every linked social login, revokes Kratos, Hydra and bff sessions. `502` if a step failed (Kratos retries) |
 | POST | `/kratos/after-password-change` | Kratos, after the settings flow changes a password | The same revocations except the current Kratos session, without the purge |
 
@@ -234,7 +235,7 @@ any parent directory is loaded first by `hooks` and `bff`; a malformed one stops
 YAML-only settings:
 
 - **bff** `routes` (below) and `rate_limit_proxy_max_attempts`.
-- **hooks** `registration_handler`, `login_claims_handler`
+- **hooks** `registration_handler`, `login_claims_handler`, `verification_handler`
   (`{url, timeout_secs, bearer_token?}`, 10 seconds default, above 0 and at most `request_timeout_secs / 2`; https unless the host is loopback, no
   redirects; `bearer_token`, when set, is sent as `Authorization: Bearer`),
   `profile_apis`, `request_timeout_secs` (30) and `upstream_timeout_secs` (10, each call to Kratos,
@@ -315,6 +316,9 @@ registration_handler:
 # {user_id, email, email_verified, client_id, scopes} on every token mint; the returned JSON object becomes claims in the access token.
 login_claims_handler:
   url: http://localhost:10002/users/claims
+# {user_id, email} once the identity has verified its email; the deployer decides what follows (a welcome mail, a queue message).
+verification_handler:
+  url: http://localhost:10002/users/verified
 ```
 
 - `registration_handler` gets the identity id (the future `sub`), the email, whether Kratos has
@@ -322,6 +326,18 @@ login_claims_handler:
   unless a provider vouched for it), and `fields`: every
   trait but `email` (add traits to `ory/kratos/identity.schema.json`), plus fields from
   `profile_apis`. A refusal (4xx) or failure aborts the registration and hooks deletes the identity. The webhook can be called again for an identity whose first attempt timed out or was cancelled (the deployer may already hold a record, and a retry can overlap the first attempt), so the endpoint must be idempotent per `user_id`.
+- `verification_handler` is told `{user_id, email}` when the code of a verification flow is accepted; it
+  may be called again for the same identity (a retry, or a changed address verified by code, which
+  arrives with the new `email`), so it must be idempotent per `user_id` and
+  `email`. It is **not** called for an address that was verified without
+  that flow: a provider that asserts `email_verified` at sign-up (`registration_handler` gets
+  `email_verified: true` instead) and a recovery code, which verifies the address too. Combine the two
+  handlers if every verified user must be seen. The address is verified whatever the handler does, so a
+  failure never deletes the identity, and a handler that refuses (`400`/`403`/`422`) is logged and
+  answered `200`: a refusal after the fact means nothing, and an error would end the user's flow on
+  `/error`. Any other failure (an unreachable endpoint, a `401`, a `404`, a `429`, a 5xx) is a `502`: Kratos
+  retries the hook, and once the retries are spent the user's flow ends on `/error` although the address
+  is verified.
 - `login_claims_handler` is called on every token mint, refresh included, with `email_verified`
   next to the email (a user can change their email in settings, and the new address is unverified:
   derive nothing from it unless it is `true`). An error fails the token

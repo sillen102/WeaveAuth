@@ -1,5 +1,5 @@
-//! The deployer's webhooks: claims on every token and the registration record.
-//! Both are plain JSON POSTs.
+//! The deployer's webhooks: claims on every token, the registration record and the
+//! verified-email notice. All are plain JSON POSTs.
 
 use crate::clients::http_client;
 use crate::config::WebhookConfig;
@@ -175,6 +175,16 @@ impl WebhookHandler {
             "fields": fields,
         });
         self.post("registration", &payload).await.map(|_| ())
+    }
+
+    /// Tells the deployer that `email` of `user_id` has been verified.
+    pub(crate) async fn email_verified(
+        &self,
+        user_id: Uuid,
+        email: &str,
+    ) -> Result<(), WebhookError> {
+        let payload = serde_json::json!({"user_id": user_id, "email": email});
+        self.post("verification", &payload).await.map(|_| ())
     }
 }
 

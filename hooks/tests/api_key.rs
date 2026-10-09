@@ -4,11 +4,12 @@ use axum::http::StatusCode;
 use serde_json::json;
 use support::{Harness, ID, send};
 
-const PROTECTED: [&str; 4] = [
+const PROTECTED: [&str; 5] = [
     "/hydra/token-hook",
     "/kratos/after-registration",
     "/kratos/after-recovery",
     "/kratos/after-password-change",
+    "/kratos/after-verification",
 ];
 
 fn recovery_body() -> serde_json::Value {

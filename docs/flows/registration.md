@@ -8,8 +8,10 @@ Relevant code:
 - `login/src/pages.rs` -- `/registration`, `/verification`
 - `hooks/src/server/api/after_registration.rs`, `hooks/src/profile_api.rs`,
   `hooks/src/webhook.rs` -- the registration hook
+- `hooks/src/server/api/after_verification.rs` -- the verification hook
 - `ory/kratos/kratos.yml` (verified-email-first), `ory/kratos/session-on-registration.yml`
-  (the overlay), `ory/kratos/hooks/after-registration.jsonnet`, `ory/kratos/oidc/*.jsonnet`,
+  (the overlay), `ory/kratos/hooks/after-registration.jsonnet`,
+  `ory/kratos/hooks/after-verification.jsonnet`, `ory/kratos/oidc/*.jsonnet`,
   `ory/kratos/courier-templates/`
 
 ## Verified-email-first
@@ -106,6 +108,21 @@ identity behind when the request is cancelled.
 
 The verification mail is Kratos' courier (`--watch-courier`) rendering
 `ory/kratos/courier-templates/`: a 6-digit code, valid 60 minutes, with Kratos' own attempt limits.
+
+Once the code is accepted, Kratos calls `POST /kratos/after-verification` (the address is already
+verified when it runs) and hooks tells the deployer's `verification_handler` `{user_id, email}`, if
+one is configured; whether to send a welcome mail is the deployer's call. It is the same for a
+verification a login started (see [login.md](login.md)) and for a new address set in settings and
+verified by code, which arrives as `email`. Kratos retries a 5xx, so the endpoint must be
+idempotent per `user_id` and `email`. A refusal (`400`, `403`, `422`) is logged and answered `200`;
+any other failure is a `502` that Kratos retries, and once its retries are spent the user's flow
+ends on `/error`. Neither deletes the identity: the address is verified already.
+
+The handler is **not** told about an address verified without a verification flow: a provider that
+asserts `email_verified` (the mapper sets the address verified at sign-up, so
+`registration_handler` already gets `email_verified: true`) and a recovery code (it verifies the
+address too, see [recovery.md](recovery.md)). A deployer that must see every verified user combines
+the two handlers.
 
 ## Logging in unverified
 

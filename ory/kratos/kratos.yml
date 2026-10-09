@@ -80,6 +80,17 @@ selfservice:
       enabled: true
       use: code
       ui_url: https://login.localhost:8443/verification
+      after:
+        hooks:
+          - hook: web_hook
+            config:
+              id: after-verification
+              url: http://weaveauth:1983/kratos/after-verification
+              method: POST
+              body: file:///etc/kratos/hooks/after-verification.jsonnet
+              auth:
+                type: api_key
+                config: {in: header, name: Authorization, value: "Bearer @WA_HOOKS_API_KEY@"}
     recovery:
       enabled: true
       use: code

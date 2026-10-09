@@ -155,6 +155,9 @@ class Handler(BaseHTTPRequestHandler):
             if "registration-500" in m:
                 return self.reply(500, {"error": "boom"})
             return self.reply(200, {})
+        if path == "/kratos/after-verification":
+            probe_verified(body)
+            return self.reply(200, {})
         if path == "/kratos/after-recovery" and "purge-sessions" in m:
             # What the real hook does: end every Kratos session of the identity. The recovery session does not exist yet.
             iid = body["identity_id"]
@@ -172,6 +175,26 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = handle_any
+
+
+def probe_verified(body):
+    """Reads the identity back from Kratos admin while the after-verification hook is running: is the address already verified?"""
+    try:
+        c = http.client.HTTPConnection("kratos", 4434, timeout=10)
+        c.request("GET", f"/admin/identities/{body['identity_id']}")
+        r = c.getresponse()
+        d = json.loads(r.read() or b"{}")
+        summary = {"admin_status": r.status, "verified_at_call": any(a.get("value") == body.get("email") and a.get("verified") for a in d.get("verifiable_addresses", []))}
+    except Exception as e:  # probe only
+        summary = {"probe_error": repr(e)}
+    with LOCK:
+        line = json.dumps({"t": round(time.time(), 3), "probe": "after-verification admin read", **summary})
+        print(line, flush=True)
+        try:
+            with open(f"{LOGS}/requests.jsonl", "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
 
 def probe_identity(body):

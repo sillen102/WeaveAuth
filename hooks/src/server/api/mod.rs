@@ -3,6 +3,7 @@ use serde::Serialize;
 pub(crate) mod after_password_change;
 pub(crate) mod after_recovery;
 pub(crate) mod after_registration;
+pub(crate) mod after_verification;
 pub(crate) mod health;
 mod revocation;
 pub(crate) mod token_hook;

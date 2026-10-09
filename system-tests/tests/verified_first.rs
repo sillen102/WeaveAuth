@@ -50,6 +50,18 @@ async fn password_registration_verifies_first_then_proxied_jwt_carries_claims() 
     let registrations = stack.stubs.registrations();
     let registered = registrations.iter().find(|r| r["email"] == email);
     assert_eq!(registered.map(|r| &r["user_id"]), Some(&json!(id)));
+
+    let verifications = stack.stubs.verifications();
+    let notified: Vec<_> = verifications
+        .iter()
+        .filter(|v| v["email"] == email)
+        .collect();
+    assert_eq!(notified.len(), 1, "{verifications:?}");
+    assert_eq!(notified[0]["user_id"], json!(id));
+    assert_eq!(
+        notified[0]["verified_at_call"], true,
+        "the hook ran before Kratos held the address as verified"
+    );
 }
 
 #[tokio::test]
@@ -99,8 +111,35 @@ async fn unverified_password_login_starts_verification_instead_of_a_session() {
     assert_eq!(resp.url.path(), "/verification", "ended at {}", resp.url);
     assert!(!has_session(stack, &b));
     assert_eq!(whoami(stack, &b).await.status, 401);
-    // Not the verification mail only: the code is mailed.
-    mail_code(stack, &email, "verification code", 1).await;
+    // The verification mail carries the code.
+    let code = mail_code(stack, &email, "verification code", 1).await;
+
+    // Entering the code verifies the address (the flow itself ends on /error, see docs/flows/login.md)
+    // and the verification hook still fires.
+    let vf = flow_of(stack, &b, "verification", &resp).await;
+    let ended = submit(
+        &b,
+        &vf,
+        "code",
+        &[("code", &code)],
+        Follow::Until(REDIRECT_URI),
+    )
+    .await;
+    assert_eq!(ended.url.path(), "/error", "ended at {}", ended.url);
+    assert_eq!(
+        stack.identity(&email).await["verifiable_addresses"][0]["verified"],
+        true
+    );
+    let id = stack.identity_id(&email).await;
+    let notified: Vec<_> = stack
+        .stubs
+        .verifications()
+        .into_iter()
+        .filter(|v| v["email"] == email)
+        .collect();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    assert_eq!(notified[0]["user_id"], json!(id));
+    assert_eq!(notified[0]["verified_at_call"], true);
 }
 
 #[tokio::test]
@@ -134,6 +173,16 @@ async fn google_sign_in_registers_a_verified_provider_email() {
     assert!(
         registered.iter().any(|r| r["user_id"] == json!(id)),
         "{registered:?}"
+    );
+    // The provider vouched for the address: no verification flow ran, so no notice either.
+    assert!(
+        stack
+            .stubs
+            .verifications()
+            .iter()
+            .all(|v| v["email"] != email),
+        "{:?}",
+        stack.stubs.verifications()
     );
 
     // A second sign-in finds the same identity.
@@ -520,6 +569,89 @@ async fn recovery_ends_every_old_session_and_purges_credentials_and_oidc_links()
     )
     .await;
     assert!(landed_on_app(&signed), "{} {}", signed.status, signed.body);
+}
+
+#[tokio::test]
+async fn recovering_an_unverified_identity_verifies_it_without_a_verification_notice() {
+    let stack = stack().await;
+    let email = unique_email("recover-unverified");
+    let credentials = json!({"password": {"config": {"password": PASSWORD}}});
+    stack.create_identity(&email, false, credentials).await;
+
+    let b = stack.browser();
+    let rf = new_flow(stack, &b, "recovery", None).await;
+    submit(&b, &rf, "code", &[("email", &email)], Follow::No).await;
+    let rf = flow(stack, &b, "recovery", rf["id"].as_str().expect("flow id")).await;
+    let code = mail_code(stack, &email, "Reset your password", 1).await;
+    let resp = submit(&b, &rf, "code", &[("code", &code)], Follow::No).await;
+    assert_eq!(resp.status, 303, "recovery answered {}", resp.status);
+
+    let identity = stack.identity(&email).await;
+    assert_eq!(
+        identity["verifiable_addresses"][0]["verified"], true,
+        "{identity}"
+    );
+    assert!(
+        stack
+            .stubs
+            .verifications()
+            .iter()
+            .all(|v| v["email"] != email),
+        "{:?}",
+        stack.stubs.verifications()
+    );
+}
+
+#[tokio::test]
+async fn a_changed_email_verified_by_code_notifies_the_handler_with_the_new_address() {
+    let stack = stack().await;
+    let old = unique_email("change-old");
+    let new = unique_email("change-new");
+    let id = stack
+        .create_identity(&old, true, password_credentials())
+        .await;
+    let b = session_for(stack, &old, PASSWORD).await;
+
+    let settings = new_flow(stack, &b, "settings", None).await;
+    submit(
+        &b,
+        &settings,
+        "profile",
+        &[("traits.email", &new)],
+        Follow::No,
+    )
+    .await;
+    let identity = stack.identity(&new).await;
+    assert_eq!(identity["id"], json!(id), "{identity}");
+
+    let started = new_flow(stack, &b, "verification", None).await;
+    submit(&b, &started, "code", &[("email", &new)], Follow::No).await;
+    let code = mail_code(stack, &new, "verification code", 1).await;
+    let vf = flow(
+        stack,
+        &b,
+        "verification",
+        started["id"].as_str().expect("flow id"),
+    )
+    .await;
+    let verified = submit(&b, &vf, "code", &[("code", &code)], Follow::No).await;
+    assert_eq!(
+        stack.identity(&new).await["verifiable_addresses"][0]["verified"],
+        true,
+        "code not accepted: {} {}",
+        verified.status,
+        verified.body
+    );
+
+    let notified: Vec<_> = stack
+        .stubs
+        .verifications()
+        .into_iter()
+        .filter(|v| v["email"] == new)
+        .collect();
+    assert_eq!(notified.len(), 1, "{:?}", stack.stubs.verifications());
+    assert_eq!(notified[0]["user_id"], json!(id));
+    assert_eq!(notified[0]["verified_at_call"], true);
 }
 
 #[tokio::test]

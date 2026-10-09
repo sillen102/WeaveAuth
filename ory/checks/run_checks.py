@@ -434,6 +434,10 @@ def hooks():
     email, sub, _ = make_verified_user("hk")
     h = hook_calls("/kratos/after-registration")[-1]
     say("-- after-registration (password registration):\n" + short(h["body"]))
+    v = hook_calls("/kratos/after-verification")[-1]
+    say("-- after-verification (code accepted; the context has the identity, no session):\n" + short(v["body"]))
+    probe = [e for e in stub_log() if e.get("probe") == "after-verification admin read"][-1]
+    say(f"   address already verified when the hook ran: {probe.get('verified_at_call')}")
     clear_mail()
     clear_log()
     set_mode("purge-sessions")

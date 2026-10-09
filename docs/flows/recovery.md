@@ -95,6 +95,9 @@ Any failed step makes the hook answer `502`; Kratos retries and then fails the f
 is safe to repeat. JWT access tokens already issued remain valid until they expire (15 minutes in
 the shipped Hydra config), which is why they are short.
 
+Accepting the code also marks the recovery address verified. That does not run the verification
+hooks, so `verification_handler` is not told (tested).
+
 **3. The settings flow.** Kratos gives the user the recovery session and sends them to `login`'s
 `/settings`. The user must set a new password there. A user who leaves without one has an account
 with no password, no passkeys and no social logins, so they recover again. The page shows only the

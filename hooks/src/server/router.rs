@@ -1,7 +1,8 @@
 use crate::server::AppState;
 use crate::server::api::{
     after_password_change::after_password_change, after_recovery::after_recovery,
-    after_registration::after_registration, health::health, token_hook::token_hook,
+    after_registration::after_registration, after_verification::after_verification, health::health,
+    token_hook::token_hook,
 };
 use crate::server::auth::require_api_key;
 use axum::Router;
@@ -17,6 +18,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/kratos/after-registration", post(after_registration))
         .route("/kratos/after-recovery", post(after_recovery))
         .route("/kratos/after-password-change", post(after_password_change))
+        .route("/kratos/after-verification", post(after_verification))
         .route_layer(from_fn_with_state(state.clone(), require_api_key));
 
     Router::new()

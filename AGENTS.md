@@ -262,7 +262,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   `POST /kratos/after-recovery` (replaces the password with a random one, deletes the passkey/webauthn/
   totp/lookup credentials and every OIDC link, revokes Kratos sessions, Hydra consent and login sessions and bff's sessions
   through `POST /internal/revoke`) and `POST /kratos/after-password-change` (the revocations
-  without the purge). See `hooks/AGENTS.md`.
+  without the purge) and `POST /kratos/after-verification` (tells the deployer's `verification_handler`
+  `{user_id, email}`; a refusal is answered `200`, any other failure `502`, and the identity is never
+  deleted). See `hooks/AGENTS.md`.
 - `launcher/` — `weaveauth-launcher` runs hooks, bff and login in one container and exits when
   one does.
 - `Dockerfile` — multi-stage: builds the three services and the launcher, runs them from a

@@ -128,7 +128,9 @@ verification-first behaviour is the default and can be switched off, see
 becomes verified but the flow ends on Kratos' `/error` page (rendered by `login`'s `/error`)
 instead of continuing to Hydra. The user signs in again from the application, and that second login
 passes. A verification started by a *registration* does continue (see
-[registration.md](registration.md)).
+[registration.md](registration.md)). Either way the verification hook runs once the code is
+accepted, so `verification_handler` is told about the address (see
+[registration.md](registration.md#verified-email-first)).
 
 **4. Accepting the login and consent.** On success Kratos (configured with
 `oauth2_provider.url` = Hydra's admin API) accepts Hydra's login request itself and redirects to

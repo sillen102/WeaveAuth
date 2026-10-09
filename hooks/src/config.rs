@@ -30,6 +30,10 @@ pub struct Config {
     /// refresh grants). `None`: no extra claims.
     #[serde(default)]
     pub login_claims_handler: Option<WebhookConfig>,
+    /// Receives `{user_id, email}` when an identity verifies its email address. The deployer
+    /// decides what to do (a welcome mail, a queue message). `None`: nobody is told.
+    #[serde(default)]
+    pub verification_handler: Option<WebhookConfig>,
     /// Per Kratos OIDC provider id (e.g. `google`): extra API calls made with
     /// the provider's access token on a user's first sign-up, for claims the
     /// id_token doesn't carry. Called concurrently; on a field-name clash the
@@ -101,6 +105,7 @@ impl Default for Config {
             bff_internal_api_key: SecretString::from(String::new()),
             registration_handler: None,
             login_claims_handler: None,
+            verification_handler: None,
             profile_apis: HashMap::new(),
             require_verified_email: true,
             request_timeout_secs: 30,
@@ -174,6 +179,7 @@ impl Config {
         for (what, handler) in [
             ("registration_handler", &self.registration_handler),
             ("login_claims_handler", &self.login_claims_handler),
+            ("verification_handler", &self.verification_handler),
         ] {
             if let Some(handler) = handler {
                 require_https_or_loopback(what, &handler.url)?;
@@ -195,6 +201,7 @@ impl Config {
         for (what, handler) in [
             ("registration_handler", &self.registration_handler),
             ("login_claims_handler", &self.login_claims_handler),
+            ("verification_handler", &self.verification_handler),
         ] {
             if let Some(handler) = handler {
                 // Every hook runs under at most half the request timeout (the registration hook gets
@@ -520,7 +527,11 @@ profile_apis:
 
     #[test]
     fn webhook_timeouts_must_be_positive_and_fit_in_half_the_request_timeout() {
-        for handler in ["registration_handler", "login_claims_handler"] {
+        for handler in [
+            "registration_handler",
+            "login_claims_handler",
+            "verification_handler",
+        ] {
             for (timeout, ok) in [(0, false), (16, false), (15, true)] {
                 let yaml = format!(
                     "profile: dev\n{handler}: {{url: \"http://localhost:1/x\", timeout_secs: {timeout}}}\n"
