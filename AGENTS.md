@@ -244,14 +244,16 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
   The routes sit inside a `tower-http` `CorsLayer` for the same trusted origins (credentials,
   `REQUEST_HEADERS` only), outermost (above the governor). `tower-http` answers every `OPTIONS`
   itself, so `OPTIONS` needs no session, isn't rate limited and is never proxied.
-- `login/src/lib.rs` — `app(Config)`, `app_with_pages`, `app_with_templates` (pages glob plus providers dir, for the logo tests), `serve`. Pages (`/login`,
+- `login/src/lib.rs` — `app(Config)`, `app_with_pages`, `app_with_templates` (pages glob plus providers dir, for the logo tests), `app_with_locales` (`app_with_templates` plus a locales dir, for the language tests), `serve`. Pages (`/login`,
   `/registration`, `/recovery`, `/verification`, `/settings`, `/error`), Hydra's `/logout` and
   `/consent` (`challenges.rs`), `/ui.js`, `/static/*`, `/providers/*` (logos), and the one proxy to Kratos public
   (`GET`/`POST /self-service/*`, `GET /.well-known/ory/*`; two per-client buckets from
   `common::rate_limit`, plus the per-identifier throttle on password submissions in
   `throttle.rs`). Templates in `templates/pages/*.html` extend the compiled-in
   `login/src/layout.html` and render Kratos' flow nodes through the Tera functions `form` and
-  `messages`; deployers supply no script (`login/AGENTS.md`).
+  `messages`; deployers supply no script (`login/AGENTS.md`). Kratos' messages, buttons and field
+  labels are shown from `templates/locales/<language>.json` by their Kratos id (`login/src/i18n.rs`;
+  see "Languages" in `login/AGENTS.md`).
 - `hooks/src/server/router.rs` — every route but `/health` behind `Authorization: Bearer
   <WA_HOOKS_API_KEY>` and a request timeout: `POST /hydra/token-hook` (claims: `email`,
   `email_verified` from Kratos plus the deployer's `login_claims_handler`; reserved names refused;
@@ -321,9 +323,9 @@ change gets; reach for `cargo-mutants` when the extra minutes are worth it:
 ## Gotchas
 
 - Docker must copy `/app/login/static` and `/app/templates` to the same absolute paths the
-  binaries were built with: login bakes `<crate>/static`, `<crate>/../templates/pages` and `<crate>/../templates/providers` at
-  compile time (`CARGO_MANIFEST_DIR`). Deployer-replaceable page templates and provider logos live in the top-level
-  `templates/pages/` and `templates/providers/`; never put them back under a crate directory.
+  binaries were built with: login bakes `<crate>/static`, `<crate>/../templates/pages`, `<crate>/../templates/providers` and `<crate>/../templates/locales` at
+  compile time (`CARGO_MANIFEST_DIR`). Deployer-replaceable page templates, provider logos and translations live in the top-level
+  `templates/pages/`, `templates/providers/` and `templates/locales/`; never put them back under a crate directory.
 - If a bff route or hooks route is added, update the route table in `README.md`; if a Kratos or
   Hydra setting changes, update `ory/README.md` and the matching `local-prod/` file.
 - hooks (1983) and bff's internal listener (8082) must never be publicly reachable: bff's

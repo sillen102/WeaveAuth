@@ -100,8 +100,9 @@ the shipped Hydra config), which is why they are short.
 with no password, no passkeys and no social logins, so they recover again. The page shows only the
 new-password form: `login` recognises the flow by its `request_url` (Kratos' recovery submission,
 kept after a rejected password, unlike the recovery message) and leaves out the profile, social
-and second-factor forms. It also shows its own text in place of Kratos' recovery message (id
-`1060001`), which offers social sign-in whether or not a provider is configured.
+and second-factor forms. Its recovery message (id `1060001`) is `login`'s own text (`templates/locales/en.json`, which a
+deployer can reword or translate), because Kratos' wording offers social sign-in whether or not a provider
+is configured.
 
 **4. `POST /kratos/after-password-change`.** Any password change in the settings flow, recovery's
 or not, calls this hook with the session that changed it. It revokes every *other* Kratos session

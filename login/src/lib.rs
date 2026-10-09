@@ -23,7 +23,7 @@ use axum::routing::get;
 use common::rate_limit::{Governor, build_governor};
 use config::RATE_LIMIT_WINDOW_SECS;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_governor::GovernorLayer;
@@ -33,6 +33,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 mod challenges;
 mod config;
 mod hydra;
+mod i18n;
 mod kratos;
 mod pages;
 mod proxy;
@@ -41,6 +42,20 @@ mod throttle;
 mod upstream;
 
 pub use config::Config;
+
+/// The `context` names each message or label text may use as `{name}`. For the system tests,
+/// which check that Kratos still sends them.
+#[doc(hidden)]
+pub fn context_names() -> &'static [(&'static str, &'static [&'static str])] {
+    i18n::context_names()
+}
+
+/// Every (`message` or `label`, Kratos id, key) login translates. For the system tests, which
+/// fail when a Kratos upgrade renumbers an id.
+#[doc(hidden)]
+pub fn translated_ids() -> Vec<(&'static str, u64, &'static str)> {
+    i18n::translated_ids()
+}
 
 const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
 
@@ -51,6 +66,9 @@ const PAGES_GLOB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../templates/page
 /// Deployer-replaceable provider logos, one image per provider id (`google.webp`), served at
 /// `/providers`.
 const PROVIDERS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../templates/providers");
+
+/// Deployer-replaceable translations of what Kratos says, one `<language>.json` each.
+const LOCALES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../templates/locales");
 
 /// Opened directly, a deployer's SVG or HTML must not run as this origin.
 const PROVIDER_LOGO_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
@@ -73,6 +91,7 @@ pub(crate) struct AppState {
     /// The proxy's client: no redirects (the browser follows them), bounded in time.
     pub(crate) http: reqwest::Client,
     pub(crate) renderer: Arc<render::Renderer>,
+    pub(crate) catalog: Arc<i18n::Catalog>,
     providers_dir: PathBuf,
     pub(crate) throttle: Arc<throttle::LoginThrottle>,
     limits: Limits,
@@ -86,7 +105,13 @@ struct Limits {
 }
 
 impl AppState {
-    fn new(config: Config, pages_glob: &str, providers_dir: PathBuf) -> anyhow::Result<Self> {
+    fn new(
+        config: Config,
+        pages_glob: &str,
+        providers_dir: PathBuf,
+        locales_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let catalog = Arc::new(i18n::Catalog::load(locales_dir, &config.default_locale)?);
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))
@@ -118,7 +143,9 @@ impl AppState {
                 &config.own_origin,
                 &kratos.origin(),
                 &providers_dir,
+                catalog.clone(),
             )?),
+            catalog,
             providers_dir,
             throttle: Arc::default(),
             kratos,
@@ -150,10 +177,21 @@ pub fn app_with_templates(
     pages_glob: &str,
     providers_dir: impl Into<PathBuf>,
 ) -> anyhow::Result<Router> {
+    app_with_locales(config, pages_glob, providers_dir, LOCALES_DIR)
+}
+
+/// Like [`app_with_templates`], loading translations from `locales_dir` as well.
+pub fn app_with_locales(
+    config: Config,
+    pages_glob: &str,
+    providers_dir: impl Into<PathBuf>,
+    locales_dir: impl AsRef<Path>,
+) -> anyhow::Result<Router> {
     Ok(router(AppState::new(
         config,
         pages_glob,
         providers_dir.into(),
+        locales_dir.as_ref(),
     )?))
 }
 
@@ -168,7 +206,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on 0.0.0.0:{}", config.port);
 
-    let state = AppState::new(config, PAGES_GLOB, PathBuf::from(PROVIDERS_DIR))?;
+    let state = AppState::new(
+        config,
+        PAGES_GLOB,
+        PathBuf::from(PROVIDERS_DIR),
+        Path::new(LOCALES_DIR),
+    )?;
     let sweeper = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(

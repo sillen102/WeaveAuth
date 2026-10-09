@@ -139,9 +139,17 @@ with Google"; without it Kratos shows the id), and login shows `templates/provid
 ### Kratos upgrades
 
 login finds the "Continue" step of a social sign-up that still needs traits by Kratos' message id
-`1040003` (`InfoSelfServiceRegistrationContinue`, `CONTINUE_LABEL_ID` in `login/src/render.rs`). Re-check it
+`1040003` (`LabelId::InfoSelfServiceRegistrationContinue` in `login/src/i18n.rs`). Re-check it
 when `oryd/kratos` is bumped: if it moved, that step renders as two forms and the user can't continue. The
 system test `google_sign_up_missing_a_trait_can_be_completed_on_the_form` catches it.
+
+login also translates Kratos' messages and labels by id (`login/AGENTS.md`, "Languages"). For the ids the
+flows in `system-tests/tests/kratos_ids.rs` can show (`PINNED`), that test fails when a bump renumbers or
+rewords one. The other ids login translates are listed there with the reason no flow shows them
+(`NOT_OBSERVABLE`), so a bump can change those unnoticed; re-read Kratos' `text/id.go` for them. The
+`{placeholder}` names in `templates/locales/en.json` must match the `context` keys Kratos sends
+(`CONTEXT_NAMES` in `login/src/i18n.rs`, from `text/message_*.go`; login refuses a locale file using another name); a wrong name makes login show the generic
+text, so re-check them on a bump as well.
 
 ## Hydra
 

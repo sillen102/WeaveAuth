@@ -257,6 +257,18 @@ pub(crate) struct UiText {
     /// `info`, `error` or `success`.
     #[serde(default, rename = "type")]
     pub kind: String,
+    /// The values Kratos filled its text with (`provider`, `min_length`, ...).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub context: serde_json::Map<String, Value>,
+}
+
+/// A `null` where a default will do, so one odd field doesn't fail the whole flow.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,4 +339,20 @@ pub(crate) struct ScriptAttributes {
 pub(crate) struct DivAttributes {
     #[serde(default)]
     pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_null_or_missing_context_is_empty() {
+        let null: UiText = serde_json::from_str(r#"{"id": 1, "context": null}"#).unwrap();
+        let missing: UiText = serde_json::from_str(r#"{"id": 1}"#).unwrap();
+        let given: UiText = serde_json::from_str(r#"{"id": 1, "context": {"a": 2}}"#).unwrap();
+
+        assert!(null.context.is_empty());
+        assert!(missing.context.is_empty());
+        assert_eq!(given.context["a"], 2);
+    }
 }

@@ -32,7 +32,7 @@ templates. A `layout.html` dropped into the pages directory is ignored.
     the settings flow Kratos opens after a recovery.
   - Context: `flow` (Kratos' JSON), `nonce`, `bff_url`, `login_url`, `registration_url`,
     `recovery_url` (these keep the Hydra challenge or `return_to` the flow started with).
-    `error.html` gets `error.message`.
+    `error.html` gets `error.message`; flow pages also get `lang` (the layout puts it on `<html>`).
 - Tera functions take keyword arguments only.
 - Everything a node contributes is escaped by hand in `render.rs` and returned as safe markup;
   autoescape stays on for the rest. Link and image URLs must be http(s) (https only when
@@ -57,6 +57,56 @@ no directory index. They are still on login's origin: don't put untrusted SVGs t
 
 Enforce the template rules with `grep -rn '<script\|on[a-z]*="\|style="' templates/pages/`,
 which should return nothing.
+
+## Languages
+
+Kratos sends every message, button and field label as English text with a numeric `id` and a
+`context`. `src/i18n.rs` keeps the ids login knows as two enums, `MessageId` (flow and field
+messages) and `LabelId` (buttons, input labels, links), named as in Kratos' `text/id.go`, and
+looks each up in `templates/locales/<language>.json`. `en.json` ships; a deployer can reword it
+or add languages. A file name is a tag of letters, digits and `-` (it is lowercased), anything
+else stops startup.
+
+- `messages` and `labels`: key = the variant name, value = the text. `{name}` is filled from the
+  message's `context` (a text whose value Kratos didn't send, or sent as an array, an object or
+  null, counts as missing); `{{` and `}}` are literal braces. A file naming a variant login doesn't
+  have stops startup, and the default language (`WA_DEFAULT_LOCALE`) must have every one. So does
+  a `{name}` Kratos doesn't send for that key (`CONTEXT_NAMES` in `i18n.rs`; a key not listed there
+  takes none; a `fields` text may use `{title}` and `{name}`) or a `{` that is never closed, in
+  any language's file.
+- `fields`: key = a trait's path (`traits.first_name`), for Kratos' generic trait label (`1070002`,
+  whose text is the schema's English `title`). The path is the `name` in the label's context,
+  else the field's own name. The sign-in `identifier` is such a label, for `traits.email`. No
+  entry: the schema `title` is shown. A deployer with other traits adds a key for each.
+- Language per request: the cookie named exactly `language` (a visitor's choice made in another
+  application on the same domain, e.g. `language=sv`; the name is fixed and takes no `__Host-` or
+  `__Secure-` prefix, and it must reach login, so it needs a `Domain` covering login's host), then
+  the best `Accept-Language` match (`q` weights), then the default. A tag loses its last subtag
+  until a language matches (`zh-Hant-TW`, `zh-Hant`, `zh`; `_` counts as `-`). A tag over 35
+  characters, and the entries of `Accept-Language` or `language` cookies after the 16th, are
+  ignored (a locale file name over 35 characters stops startup). The cookie is not authenticated,
+  so any client can send it; it only selects among the loaded languages. Per language, a missing
+  text falls back to the default language's.
+- An id with no variant: a *message* shows the `Unknown` text, never Kratos' wording (it can be
+  English, or carry what a crafted link put in it); a *label* keeps Kratos' text, so `Unknown` is
+  a message key only and a `labels.Unknown` entry stops startup. Each such id is logged once.
+  A web hook's rejection reason reaches the page as Kratos message `4000001`
+  (`ErrorValidationGeneric`), which shows the generic "This value is not valid." text: the hook's
+  own wording is never displayed, so a deployer who wants another text for it rewords that entry.
+- Flow pages carry `<html lang>` (the language chosen) and `Vary: Accept-Language, Cookie`.
+  Every other page (`error.html` and the challenge errors) is `lang="en"` with no `Vary`, because
+  its copy is not translated yet. The page templates' own words are the deployer's, in whatever
+  language they wrote them (the shipped ones are English). `lang` is in the page context, so
+  `{% if lang == "sv" %}` can pick words per language on a flow page; error pages are always `en`.
+
+A new Kratos id gets a variant in `i18n.rs`, a text in `en.json` and an entry in
+`system-tests/tests/kratos_ids.rs`: `PINNED` when a flow there can show it (the test then checks
+its id and English wording against the pinned Kratos), else `NOT_OBSERVABLE` with the reason. That
+test fails for an id in neither, and for a stale or doubled entry. It cannot see a change to an id
+that is only in `NOT_OBSERVABLE`. `CONTEXT_NAMES` in `i18n.rs` (copied from Kratos'
+`text/message_*.go`) lists the `context` names the placeholders may use; the system test checks
+Kratos still sends them for the texts it shows. Re-run it on every Kratos upgrade, and re-check
+those names against the new `text/message_*.go`.
 
 ## Pages
 
